@@ -1,12 +1,15 @@
 import os
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    ContextTypes
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from scraper import SignalScraper
+from ai_analyzer import AIAnalyzer
 from database import Database
-from betting import BettingManager
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -14,335 +17,385 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
+# ── Config ──────────────────────────────────────────────────────────────────────
+TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
+VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
 
-db = Database()
-bm = BettingManager(db)
+db       = Database()
+scraper  = SignalScraper()
+analyzer = AIAnalyzer()
 
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+def signal_text(s: dict, for_vip: bool = False) -> str:
+    type_icons = {
+        "winner":   "🏆",
+        "over":     "📈",
+        "under":    "📉",
+        "handicap": "⚖️",
+        "set":      "🎯",
+    }
+    icon = type_icons.get(s["signal_type"], "🏓")
+    stars = "⭐" * min(5, max(1, round(s["confidence"] / 20)))
+    value_str = f"+{s['value_pct']:.1f}%" if s["value_pct"] > 0 else f"{s['value_pct']:.1f}%"
 
-# ─── /start ────────────────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.username or user.first_name)
-
-    balance = db.get_balance(user.id)
     text = (
-        f"🏓 *Benvenuto nel PingPong Bet Bot*, {user.first_name}!\n\n"
-        f"💰 Il tuo saldo: *{balance:.2f} crediti*\n\n"
-        "Usa i comandi qui sotto per iniziare:"
+        f"🏓 *SEGNALE PING PONG*\n"
+        f"{'━' * 22}\n"
+        f"{icon} *{s['match']}*\n"
+        f"🎯 Giocata: *{s['pick']}*\n"
+        f"💰 Quota: *{s['odds']}*\n"
+        f"📊 Confidenza: *{s['confidence']}%* {stars}\n"
+        f"💡 Value edge: *{value_str}*\n"
+        f"📌 Stake: *{s['stake']}/5*\n"
+        f"⏰ Inizio: *{s['kickoff']}*\n"
+        f"🌍 Torneo: {s.get('tournament', 'Ping Pong')}\n"
     )
-    keyboard = [
-        [InlineKeyboardButton("📋 Partite disponibili", callback_data="matches")],
-        [InlineKeyboardButton("💰 Il mio saldo", callback_data="balance"),
-         InlineKeyboardButton("📊 Le mie scommesse", callback_data="mybets")],
-        [InlineKeyboardButton("🏆 Classifica", callback_data="leaderboard")],
-    ]
-    await update.message.reply_text(
-        text, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if not for_vip:
+        text += f"\n📝 _{s.get('reasoning', '')}_"
+    return text
 
 
-# ─── /saldo ────────────────────────────────────────────────────────────────────
-async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.username or user.first_name)
-    balance = db.get_balance(user.id)
-    await update.message.reply_text(
-        f"💰 Il tuo saldo attuale: *{balance:.2f} crediti*",
-        parse_mode="Markdown"
-    )
+def vip_signal_text(s: dict) -> str:
+    return signal_text(s, for_vip=True)
 
 
-# ─── /partite ──────────────────────────────────────────────────────────────────
-async def partite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    matches = db.get_open_matches()
-    if not matches:
-        await update.message.reply_text("⚠️ Nessuna partita disponibile al momento.")
-        return
-    keyboard = []
-    for m in matches:
-        label = f"🏓 {m['player1']} vs {m['player2']} | Q: {m['odds1']}x / {m['odds2']}x"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"bet_{m['id']}")])
-    await update.message.reply_text(
-        "📋 *Partite disponibili:*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ─── /classifica ───────────────────────────────────────────────────────────────
-async def classifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    top = db.get_leaderboard()
-    if not top:
-        await update.message.reply_text("🏆 Classifica vuota.")
-        return
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 *Top 10 Classifica*\n"]
-    for i, row in enumerate(top[:10]):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        lines.append(f"{medal} {row['username']} — {row['balance']:.2f} crediti")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ─── ADMIN: /aggiungi_partita ───────────────────────────────────────────────────
-async def aggiungi_partita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Non hai i permessi.")
-        return
-    # usage: /aggiungi_partita Tizio Caio 1.8 2.1
-    args = context.args
-    if len(args) != 4:
+# ── /start ──────────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == ADMIN_ID:
+        kb = [
+            [InlineKeyboardButton("🔍 Cerca segnali ora", callback_data="admin_scan")],
+            [InlineKeyboardButton("📋 Segnali pendenti", callback_data="admin_pending")],
+            [InlineKeyboardButton("📊 Statistiche", callback_data="admin_stats")],
+            [InlineKeyboardButton("⚙️ Impostazioni", callback_data="admin_settings")],
+        ]
         await update.message.reply_text(
-            "Uso: /aggiungi_partita <giocatore1> <giocatore2> <quota1> <quota2>\n"
-            "Esempio: /aggiungi_partita Tizio Caio 1.80 2.10"
+            "👋 *Admin Panel — PingPong Signals*\n\n"
+            "Il bot cerca segnali automaticamente ogni ora.\n"
+            "Usa i tasti per gestire i segnali.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
-        return
-    p1, p2 = args[0], args[1]
-    try:
-        o1, o2 = float(args[2]), float(args[3])
-    except ValueError:
-        await update.message.reply_text("❌ Le quote devono essere numeri decimali.")
-        return
-    match_id = db.add_match(p1, p2, o1, o2)
-    await update.message.reply_text(
-        f"✅ Partita aggiunta! ID: `{match_id}`\n"
-        f"🏓 {p1} (x{o1}) vs {p2} (x{o2})",
-        parse_mode="Markdown"
-    )
-
-
-# ─── ADMIN: /chiudi_partita ────────────────────────────────────────────────────
-async def chiudi_partita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Non hai i permessi.")
-        return
-    # usage: /chiudi_partita <match_id> <1|2>
-    args = context.args
-    if len(args) != 2:
+    else:
         await update.message.reply_text(
-            "Uso: /chiudi_partita <match_id> <1|2>\n"
-            "1 = vince giocatore 1, 2 = vince giocatore 2"
+            "🏓 *PingPong Signals Bot*\n\nQuesto bot è riservato agli admin.",
+            parse_mode="Markdown"
         )
+
+
+# ── /status ──────────────────────────────────────────────────────────────────────
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
-    try:
-        match_id = int(args[0])
-        winner = int(args[1])
-        assert winner in (1, 2)
-    except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Parametri non validi.")
-        return
-    results = bm.settle_match(match_id, winner)
-    if results is None:
-        await update.message.reply_text("❌ Partita non trovata o già chiusa.")
-        return
+    stats = db.get_stats()
     await update.message.reply_text(
-        f"✅ Partita {match_id} chiusa. Vince giocatore {winner}.\n"
-        f"💸 Scommesse risolte: {results['settled']} | Pagati: {results['paid_out']:.2f} crediti",
+        f"📊 *Statistiche Bot*\n\n"
+        f"✅ Segnali inviati al VIP: *{stats['sent_vip']}*\n"
+        f"⏳ Segnali pendenti: *{stats['pending']}*\n"
+        f"🏆 Win rate: *{stats['winrate']}%*\n"
+        f"💰 ROI medio: *{stats['roi']}%*\n"
+        f"🔄 Ultimo scan: *{stats['last_scan']}*",
         parse_mode="Markdown"
     )
 
 
-# ─── ADMIN: /recredita ─────────────────────────────────────────────────────────
-async def recredita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Non hai i permessi.")
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Uso: /recredita <user_id> <importo>")
-        return
-    try:
-        uid = int(args[0])
-        amount = float(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Parametri non validi.")
-        return
-    db.add_credits(uid, amount)
-    await update.message.reply_text(f"✅ Aggiunti {amount:.2f} crediti a user {uid}.")
-
-
-# ─── /mybets ───────────────────────────────────────────────────────────────────
-async def mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    bets = db.get_user_bets(user.id)
-    if not bets:
-        await update.message.reply_text("📭 Non hai ancora scommesse.")
-        return
-    lines = ["📊 *Le tue scommesse:*\n"]
-    for b in bets[-10:]:
-        status_icon = {"pending": "⏳", "won": "✅", "lost": "❌"}.get(b["status"], "❓")
-        lines.append(
-            f"{status_icon} {b['player1']} vs {b['player2']} → "
-            f"su *{b['chosen_player']}* | {b['amount']:.2f}cr | quota x{b['odds']}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ─── CALLBACK HANDLER ──────────────────────────────────────────────────────────
+# ── CALLBACK HANDLER ─────────────────────────────────────────────────────────────
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user = update.effective_user
-    data = query.data
+    uid   = update.effective_user.id
+    data  = query.data
 
-    if data == "matches":
-        matches = db.get_open_matches()
-        if not matches:
-            await query.edit_message_text("⚠️ Nessuna partita disponibile.")
-            return
-        keyboard = []
-        for m in matches:
-            label = f"🏓 {m['player1']} vs {m['player2']} | Q: {m['odds1']}x / {m['odds2']}x"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"bet_{m['id']}")])
-        keyboard.append([InlineKeyboardButton("🔙 Indietro", callback_data="back_home")])
-        await query.edit_message_text(
-            "📋 *Partite disponibili — clicca per scommettere:*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif data == "balance":
-        balance = db.get_balance(user.id)
-        await query.edit_message_text(
-            f"💰 Il tuo saldo: *{balance:.2f} crediti*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Indietro", callback_data="back_home")]])
-        )
-
-    elif data == "mybets":
-        bets = db.get_user_bets(user.id)
-        if not bets:
-            text = "📭 Non hai ancora scommesse."
-        else:
-            lines = ["📊 *Le tue ultime scommesse:*\n"]
-            for b in bets[-8:]:
-                status_icon = {"pending": "⏳", "won": "✅", "lost": "❌"}.get(b["status"], "❓")
-                lines.append(
-                    f"{status_icon} {b['player1']} vs {b['player2']} → "
-                    f"su *{b['chosen_player']}* | {b['amount']:.2f}cr x{b['odds']}"
-                )
-            text = "\n".join(lines)
-        await query.edit_message_text(
-            text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Indietro", callback_data="back_home")]])
-        )
-
-    elif data == "leaderboard":
-        top = db.get_leaderboard()
-        medals = ["🥇", "🥈", "🥉"]
-        lines = ["🏆 *Top 10 Classifica*\n"]
-        for i, row in enumerate(top[:10]):
-            medal = medals[i] if i < 3 else f"{i+1}."
-            lines.append(f"{medal} {row['username']} — {row['balance']:.2f} crediti")
-        await query.edit_message_text(
-            "\n".join(lines) if top else "🏆 Classifica vuota.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Indietro", callback_data="back_home")]])
-        )
-
-    elif data.startswith("bet_"):
-        match_id = int(data.split("_")[1])
-        match = db.get_match(match_id)
-        if not match:
-            await query.edit_message_text("❌ Partita non trovata.")
-            return
-        keyboard = [
-            [InlineKeyboardButton(f"🟢 {match['player1']} (x{match['odds1']})", callback_data=f"choose_{match_id}_1")],
-            [InlineKeyboardButton(f"🔵 {match['player2']} (x{match['odds2']})", callback_data=f"choose_{match_id}_2")],
-            [InlineKeyboardButton("🔙 Indietro", callback_data="matches")]
-        ]
-        await query.edit_message_text(
-            f"🏓 *{match['player1']}* vs *{match['player2']}*\n\nSu chi vuoi scommettere?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif data.startswith("choose_"):
-        _, match_id, player_num = data.split("_")
-        match_id, player_num = int(match_id), int(player_num)
-        # store pending bet choice in user_data
-        context.user_data["pending_bet"] = {"match_id": match_id, "player_num": player_num}
-        match = db.get_match(match_id)
-        chosen = match["player1"] if player_num == 1 else match["player2"]
-        odds = match["odds1"] if player_num == 1 else match["odds2"]
-        balance = db.get_balance(user.id)
-        await query.edit_message_text(
-            f"💸 Hai scelto *{chosen}* (x{odds})\n"
-            f"💰 Saldo disponibile: *{balance:.2f} crediti*\n\n"
-            f"Scrivi l'importo da scommettere (es. `50`):",
-            parse_mode="Markdown"
-        )
-
-    elif data == "back_home":
-        balance = db.get_balance(user.id)
-        keyboard = [
-            [InlineKeyboardButton("📋 Partite disponibili", callback_data="matches")],
-            [InlineKeyboardButton("💰 Il mio saldo", callback_data="balance"),
-             InlineKeyboardButton("📊 Le mie scommesse", callback_data="mybets")],
-            [InlineKeyboardButton("🏆 Classifica", callback_data="leaderboard")],
-        ]
-        await query.edit_message_text(
-            f"🏓 *PingPong Bet Bot*\n\n💰 Saldo: *{balance:.2f} crediti*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-
-# ─── AMOUNT INPUT ──────────────────────────────────────────────────────────────
-async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.username or user.first_name)
-    pending = context.user_data.get("pending_bet")
-    if not pending:
-        return  # not waiting for an amount
-
-    text = update.message.text.strip().replace(",", ".")
-    try:
-        amount = float(text)
-        assert amount > 0
-    except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Inserisci un importo valido (es. `50`).", parse_mode="Markdown")
+    if uid != ADMIN_ID:
+        await query.edit_message_text("⛔ Non autorizzato.")
         return
 
-    match_id = pending["match_id"]
-    player_num = pending["player_num"]
-    result = bm.place_bet(user.id, match_id, player_num, amount)
-
-    if result["ok"]:
-        context.user_data.pop("pending_bet", None)
-        await update.message.reply_text(
-            f"✅ *Scommessa piazzata!*\n\n"
-            f"🏓 {result['match']}\n"
-            f"🎯 Giocatore: *{result['chosen']}* (x{result['odds']})\n"
-            f"💸 Importo: *{amount:.2f} crediti*\n"
-            f"🏆 Vincita potenziale: *{result['potential']:.2f} crediti*\n"
-            f"💰 Saldo rimasto: *{result['balance']:.2f} crediti*",
-            parse_mode="Markdown"
+    # ── Admin home ──────────────────────────────────────────────────────────────
+    if data == "admin_home":
+        kb = [
+            [InlineKeyboardButton("🔍 Cerca segnali ora", callback_data="admin_scan")],
+            [InlineKeyboardButton("📋 Segnali pendenti", callback_data="admin_pending")],
+            [InlineKeyboardButton("📊 Statistiche",      callback_data="admin_stats")],
+            [InlineKeyboardButton("⚙️ Impostazioni",     callback_data="admin_settings")],
+        ]
+        await query.edit_message_text(
+            "👋 *Admin Panel — PingPong Signals*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
-    else:
-        await update.message.reply_text(f"❌ {result['error']}")
+
+    # ── Scan manuale ────────────────────────────────────────────────────────────
+    elif data == "admin_scan":
+        await query.edit_message_text("🔍 Scansione in corso... attendere.")
+        count = await run_signal_scan(context.application)
+        kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
+        await query.edit_message_text(
+            f"✅ Scan completato!\n🆕 Nuovi segnali trovati: *{count}*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    # ── Segnali pendenti ────────────────────────────────────────────────────────
+    elif data == "admin_pending":
+        signals = db.get_pending_signals()
+        if not signals:
+            kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
+            await query.edit_message_text(
+                "📭 Nessun segnale pendente.",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+        # Show first pending signal
+        s = signals[0]
+        text = signal_text(s)
+        kb = [
+            [
+                InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{s['id']}"),
+                InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{s['id']}"),
+            ],
+            [InlineKeyboardButton(f"📋 Altri pendenti: {len(signals)-1}", callback_data="admin_pending_list")],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ]
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+    # ── Lista pendenti ──────────────────────────────────────────────────────────
+    elif data == "admin_pending_list":
+        signals = db.get_pending_signals()
+        if not signals:
+            await query.edit_message_text("📭 Nessun segnale pendente.")
+            return
+        kb = []
+        for s in signals[:10]:
+            label = f"🏓 {s['match'][:25]} | {s['pick'][:15]} | x{s['odds']}"
+            kb.append([InlineKeyboardButton(label, callback_data=f"view_signal_{s['id']}")])
+        kb.append([InlineKeyboardButton("🔙 Home", callback_data="admin_home")])
+        await query.edit_message_text(
+            f"📋 *Segnali pendenti ({len(signals)}):*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    # ── Visualizza singolo segnale ──────────────────────────────────────────────
+    elif data.startswith("view_signal_"):
+        sig_id = int(data.split("_")[-1])
+        s = db.get_signal(sig_id)
+        if not s:
+            await query.edit_message_text("❌ Segnale non trovato.")
+            return
+        text = signal_text(s)
+        kb = [
+            [
+                InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
+                InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
+            ],
+            [InlineKeyboardButton("🔙 Lista", callback_data="admin_pending_list")],
+        ]
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+    # ── Invia al VIP ────────────────────────────────────────────────────────────
+    elif data.startswith("send_vip_"):
+        sig_id = int(data.split("_")[-1])
+        s = db.get_signal(sig_id)
+        if not s:
+            await query.edit_message_text("❌ Segnale non trovato.")
+            return
+        try:
+            await context.application.bot.send_message(
+                chat_id=VIP_GROUP_ID,
+                text=vip_signal_text(s),
+                parse_mode="Markdown"
+            )
+            db.update_signal_status(sig_id, "sent")
+            kb = [
+                [InlineKeyboardButton("📋 Altri segnali", callback_data="admin_pending")],
+                [InlineKeyboardButton("🔙 Home",          callback_data="admin_home")],
+            ]
+            await query.edit_message_text(
+                f"✅ *Segnale inviato al canale VIP!*\n\n{vip_signal_text(s)}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+        except Exception as e:
+            logger.error(f"Errore invio VIP: {e}")
+            await query.edit_message_text(f"❌ Errore invio: {e}")
+
+    # ── Scarta segnale ──────────────────────────────────────────────────────────
+    elif data.startswith("discard_"):
+        sig_id = int(data.split("_")[-1])
+        db.update_signal_status(sig_id, "discarded")
+        kb = [
+            [InlineKeyboardButton("📋 Altri segnali", callback_data="admin_pending")],
+            [InlineKeyboardButton("🔙 Home",          callback_data="admin_home")],
+        ]
+        await query.edit_message_text(
+            "🗑 Segnale scartato.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    # ── Statistiche ─────────────────────────────────────────────────────────────
+    elif data == "admin_stats":
+        stats = db.get_stats()
+        kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
+        await query.edit_message_text(
+            f"📊 *Statistiche*\n\n"
+            f"✅ Inviati al VIP: *{stats['sent_vip']}*\n"
+            f"⏳ Pendenti: *{stats['pending']}*\n"
+            f"🗑 Scartati: *{stats['discarded']}*\n"
+            f"🏆 Win rate: *{stats['winrate']}%*\n"
+            f"💰 ROI medio: *{stats['roi']}%*\n"
+            f"🔄 Ultimo scan: *{stats['last_scan']}*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    # ── Impostazioni ─────────────────────────────────────────────────────────────
+    elif data == "admin_settings":
+        settings = db.get_settings()
+        kb = [
+            [InlineKeyboardButton(
+                f"⏱ Scan ogni {settings['scan_interval']}h → cambia",
+                callback_data="toggle_interval"
+            )],
+            [InlineKeyboardButton(
+                f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}",
+                callback_data="toggle_autosend"
+            )],
+            [InlineKeyboardButton(
+                f"🎯 Min confidenza: {settings['min_confidence']}%",
+                callback_data="noop"
+            )],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ]
+        await query.edit_message_text(
+            "⚙️ *Impostazioni*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data == "toggle_autosend":
+        db.toggle_setting("auto_send")
+        settings = db.get_settings()
+        kb = [
+            [InlineKeyboardButton(
+                f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}",
+                callback_data="toggle_autosend"
+            )],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ]
+        await query.edit_message_text(
+            f"⚙️ Auto-invio VIP: {'✅ Attivato' if settings['auto_send'] else '❌ Disattivato'}",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data == "toggle_interval":
+        intervals = [1, 2, 4, 6, 12]
+        current = db.get_settings()["scan_interval"]
+        next_i  = intervals[(intervals.index(current) + 1) % len(intervals)] if current in intervals else 1
+        db.set_setting("scan_interval", next_i)
+        kb = [
+            [InlineKeyboardButton(f"⏱ Scan ogni {next_i}h → cambia", callback_data="toggle_interval")],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ]
+        await query.edit_message_text(
+            f"⏱ Intervallo scan impostato: ogni *{next_i} ore*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
+# ── CORE: scan automatico ────────────────────────────────────────────────────────
+async def run_signal_scan(app: Application) -> int:
+    """Scrape matches, analyze with AI, store new signals. Returns count of new signals."""
+    logger.info("🔍 Avvio scan segnali...")
+    db.set_setting("last_scan", __import__("datetime").datetime.now().strftime("%d/%m %H:%M"))
+
+    try:
+        matches = await scraper.fetch_matches()
+    except Exception as e:
+        logger.error(f"Errore scraping: {e}")
+        matches = scraper.get_fallback_matches()
+
+    new_signals = 0
+    settings    = db.get_settings()
+
+    for match in matches:
+        try:
+            signals = await analyzer.analyze(match)
+            for sig in signals:
+                if sig["confidence"] < settings["min_confidence"]:
+                    continue
+                if db.signal_exists(sig["match_key"]):
+                    continue
+                sig_id = db.save_signal(sig)
+                new_signals += 1
+
+                # Notifica admin
+                text = signal_text(sig)
+                kb = [
+                    [
+                        InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
+                        InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
+                    ]
+                ]
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"🆕 *Nuovo segnale trovato!*\n\n{text}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
+
+                # Auto-invio al VIP se attivato
+                if settings["auto_send"]:
+                    await app.bot.send_message(
+                        chat_id=VIP_GROUP_ID,
+                        text=vip_signal_text(sig),
+                        parse_mode="Markdown"
+                    )
+                    db.update_signal_status(sig_id, "sent")
+
+        except Exception as e:
+            logger.error(f"Errore analisi match {match.get('name','?')}: {e}")
+            continue
+
+    logger.info(f"✅ Scan completato: {new_signals} nuovi segnali")
+    return new_signals
+
+
+# ── SCHEDULER ────────────────────────────────────────────────────────────────────
+async def post_init(app: Application):
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        lambda: asyncio.ensure_future(run_signal_scan(app)),
+        trigger="interval",
+        hours=1,
+        id="signal_scan"
+    )
+    scheduler.start()
+    logger.info("⏰ Scheduler avviato — scan ogni ora")
+
+    # Scan iniziale al boot
+    await asyncio.sleep(5)
+    await run_signal_scan(app)
+
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────────
 def main():
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN non impostato!")
-    app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("saldo", saldo))
-    app.add_handler(CommandHandler("partite", partite))
-    app.add_handler(CommandHandler("classifica", classifica))
-    app.add_handler(CommandHandler("mybets", mybets))
-    app.add_handler(CommandHandler("aggiungi_partita", aggiungi_partita))
-    app.add_handler(CommandHandler("chiudi_partita", chiudi_partita))
-    app.add_handler(CommandHandler("recredita", recredita))
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount))
 
-    logger.info("Bot avviato...")
+    logger.info("🏓 PingPong Signals Bot avviato")
     app.run_polling(drop_pending_updates=True)
 
 

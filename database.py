@@ -1,8 +1,10 @@
 import sqlite3
 import os
+import json
+from datetime import datetime
 from typing import Optional
 
-DB_PATH = os.environ.get("DB_PATH", "pingpong.db")
+DB_PATH = os.environ.get("DB_PATH", "signals.db")
 
 
 class Database:
@@ -13,145 +15,138 @@ class Database:
 
     def _init_schema(self):
         self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY,
-                username TEXT,
-                balance  REAL NOT NULL DEFAULT 100.0
-            );
-
-            CREATE TABLE IF NOT EXISTS matches (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                player1  TEXT NOT NULL,
-                player2  TEXT NOT NULL,
-                odds1    REAL NOT NULL,
-                odds2    REAL NOT NULL,
-                status   TEXT NOT NULL DEFAULT 'open',   -- open | closed
-                winner   INTEGER                          -- 1 | 2 | NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS bets (
+            CREATE TABLE IF NOT EXISTS signals (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id      INTEGER NOT NULL,
-                match_id     INTEGER NOT NULL,
-                player_num   INTEGER NOT NULL,  -- 1 | 2
-                amount       REAL NOT NULL,
-                odds         REAL NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'pending',  -- pending | won | lost
-                FOREIGN KEY(user_id)  REFERENCES users(id),
-                FOREIGN KEY(match_id) REFERENCES matches(id)
+                match_key    TEXT UNIQUE,
+                match        TEXT,
+                player1      TEXT,
+                player2      TEXT,
+                tournament   TEXT,
+                kickoff      TEXT,
+                signal_type  TEXT,
+                pick         TEXT,
+                odds         REAL,
+                confidence   INTEGER,
+                value_pct    REAL,
+                stake        INTEGER,
+                reasoning    TEXT,
+                status       TEXT DEFAULT 'pending',
+                result       TEXT,
+                created_at   TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
             );
         """)
+
+        # Default settings
+        defaults = {
+            "scan_interval":  "1",
+            "auto_send":      "0",
+            "min_confidence": "60",
+            "last_scan":      "mai",
+        }
+        for k, v in defaults.items():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
+            )
         self.conn.commit()
 
-    # ── Users ──────────────────────────────────────────────────────────────────
-    def upsert_user(self, user_id: int, username: str):
-        self.conn.execute(
-            "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)",
-            (user_id, username)
-        )
-        self.conn.execute(
-            "UPDATE users SET username=? WHERE id=?",
-            (username, user_id)
-        )
-        self.conn.commit()
-
-    def get_balance(self, user_id: int) -> float:
-        row = self.conn.execute(
-            "SELECT balance FROM users WHERE id=?", (user_id,)
-        ).fetchone()
-        if row is None:
-            return 0.0
-        return row["balance"]
-
-    def deduct_credits(self, user_id: int, amount: float) -> bool:
-        """Returns True if deduction succeeded (enough balance)."""
-        row = self.conn.execute(
-            "SELECT balance FROM users WHERE id=?", (user_id,)
-        ).fetchone()
-        if row is None or row["balance"] < amount:
-            return False
-        self.conn.execute(
-            "UPDATE users SET balance = balance - ? WHERE id=?",
-            (amount, user_id)
-        )
-        self.conn.commit()
-        return True
-
-    def add_credits(self, user_id: int, amount: float):
-        self.conn.execute(
-            "UPDATE users SET balance = balance + ? WHERE id=?",
-            (amount, user_id)
-        )
-        self.conn.commit()
-
-    def get_leaderboard(self):
-        rows = self.conn.execute(
-            "SELECT username, balance FROM users ORDER BY balance DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    # ── Matches ────────────────────────────────────────────────────────────────
-    def add_match(self, p1: str, p2: str, o1: float, o2: float) -> int:
+    # ── Signals ────────────────────────────────────────────────────────────────
+    def save_signal(self, s: dict) -> int:
         cur = self.conn.execute(
-            "INSERT INTO matches (player1, player2, odds1, odds2) VALUES (?,?,?,?)",
-            (p1, p2, o1, o2)
+            """INSERT OR IGNORE INTO signals
+               (match_key, match, player1, player2, tournament, kickoff,
+                signal_type, pick, odds, confidence, value_pct, stake, reasoning, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                s["match_key"], s["match"], s["player1"], s["player2"],
+                s.get("tournament",""), s["kickoff"],
+                s["signal_type"], s["pick"], s["odds"],
+                s["confidence"], s["value_pct"], s["stake"],
+                s.get("reasoning",""), s.get("created_at", datetime.utcnow().isoformat())
+            )
         )
         self.conn.commit()
         return cur.lastrowid
 
-    def get_open_matches(self):
-        rows = self.conn.execute(
-            "SELECT * FROM matches WHERE status='open'"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_match(self, match_id: int) -> Optional[dict]:
+    def signal_exists(self, match_key: str) -> bool:
         row = self.conn.execute(
-            "SELECT * FROM matches WHERE id=?", (match_id,)
+            "SELECT id FROM signals WHERE match_key=?", (match_key,)
+        ).fetchone()
+        return row is not None
+
+    def get_signal(self, sig_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM signals WHERE id=?", (sig_id,)
         ).fetchone()
         return dict(row) if row else None
 
-    def close_match(self, match_id: int, winner: int):
-        self.conn.execute(
-            "UPDATE matches SET status='closed', winner=? WHERE id=?",
-            (winner, match_id)
-        )
-        self.conn.commit()
-
-    # ── Bets ───────────────────────────────────────────────────────────────────
-    def place_bet(self, user_id: int, match_id: int, player_num: int,
-                  amount: float, odds: float) -> int:
-        cur = self.conn.execute(
-            "INSERT INTO bets (user_id, match_id, player_num, amount, odds) VALUES (?,?,?,?,?)",
-            (user_id, match_id, player_num, amount, odds)
-        )
-        self.conn.commit()
-        return cur.lastrowid
-
-    def get_bets_for_match(self, match_id: int):
+    def get_pending_signals(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM bets WHERE match_id=? AND status='pending'",
-            (match_id,)
+            "SELECT * FROM signals WHERE status='pending' ORDER BY value_pct DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def settle_bet(self, bet_id: int, status: str):
+    def update_signal_status(self, sig_id: int, status: str, result: str = None):
         self.conn.execute(
-            "UPDATE bets SET status=? WHERE id=?",
-            (status, bet_id)
+            "UPDATE signals SET status=?, result=? WHERE id=?",
+            (status, result, sig_id)
         )
         self.conn.commit()
 
-    def get_user_bets(self, user_id: int):
-        rows = self.conn.execute(
-            """
-            SELECT b.*, m.player1, m.player2,
-                   CASE b.player_num WHEN 1 THEN m.player1 ELSE m.player2 END AS chosen_player
-            FROM bets b
-            JOIN matches m ON b.match_id = m.id
-            WHERE b.user_id = ?
-            ORDER BY b.id DESC
-            """,
-            (user_id,)
+    def get_stats(self) -> dict:
+        sent      = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='sent'").fetchone()[0]
+        pending   = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='pending'").fetchone()[0]
+        discarded = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='discarded'").fetchone()[0]
+        won       = self.conn.execute("SELECT COUNT(*) FROM signals WHERE result='won'").fetchone()[0]
+        lost      = self.conn.execute("SELECT COUNT(*) FROM signals WHERE result='lost'").fetchone()[0]
+
+        total_results = won + lost
+        winrate = round(won / total_results * 100, 1) if total_results > 0 else 0
+
+        # ROI semplificato
+        roi_rows = self.conn.execute(
+            "SELECT odds, stake FROM signals WHERE result='won'"
         ).fetchall()
-        return [dict(r) for r in rows]
+        total_won_profit = sum((r["odds"] - 1) * r["stake"] for r in roi_rows)
+        total_stake_all  = self.conn.execute(
+            "SELECT COALESCE(SUM(stake),0) FROM signals WHERE result IN ('won','lost')"
+        ).fetchone()[0]
+        roi = round(total_won_profit / total_stake_all * 100, 1) if total_stake_all > 0 else 0
+
+        return {
+            "sent_vip":  sent,
+            "pending":   pending,
+            "discarded": discarded,
+            "winrate":   winrate,
+            "roi":       roi,
+            "last_scan": self.get_settings()["last_scan"],
+        }
+
+    # ── Settings ───────────────────────────────────────────────────────────────
+    def get_settings(self) -> dict:
+        rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
+        raw  = {r["key"]: r["value"] for r in rows}
+        return {
+            "scan_interval":  int(raw.get("scan_interval", 1)),
+            "auto_send":      raw.get("auto_send", "0") == "1",
+            "min_confidence": int(raw.get("min_confidence", 60)),
+            "last_scan":      raw.get("last_scan", "mai"),
+        }
+
+    def set_setting(self, key: str, value):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(value))
+        )
+        self.conn.commit()
+
+    def toggle_setting(self, key: str):
+        current = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        new_val = "0" if (current and current["value"] == "1") else "1"
+        self.set_setting(key, new_val)

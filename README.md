@@ -1,43 +1,45 @@
-# 🏓 PingPong Bet Bot
+# 🏓 PingPong Signals Bot
 
-Bot Telegram per scommesse su partite di ping pong.  
-Stack: **Python** · **python-telegram-bot v21** · **SQLite** · **Railway**
-
----
-
-## 📋 Flow dell'applicazione
-
-```
-Utente → /start
-         │
-         ├─ Nuovo utente → creato con 100 crediti di benvenuto
-         │
-         └─ Menu principale (bottoni inline)
-              ├─ 📋 Partite disponibili → lista partite aperte
-              │        └─ Clicca partita → scegli giocatore
-              │                    └─ Scrivi importo → scommessa piazzata
-              ├─ 💰 Saldo
-              ├─ 📊 Le mie scommesse
-              └─ 🏆 Classifica
-
-Admin → /aggiungi_partita <p1> <p2> <quota1> <quota2>
-      → /chiudi_partita <match_id> <1|2>
-      → /recredita <user_id> <importo>
-```
+Bot Telegram per segnali automatici su scommesse di ping pong.  
+Genera segnali di tipo **Winner, Over/Under set, Handicap, Risultato esatto** con analisi AI.
 
 ---
 
-## 📁 Struttura del progetto
+## 📋 Flow completo
 
 ```
-pingpong-bot/
-├── bot.py            # Entry point, handlers Telegram
-├── betting.py        # Logica scommesse e liquidazione
-├── database.py       # Layer SQLite (users, matches, bets)
-├── requirements.txt  # Dipendenze Python
-├── Procfile          # Per Railway/Heroku
-├── railway.toml      # Config deploy Railway
-├── .env.example      # Variabili d'ambiente (template)
+Boot
+ └─ Scan automatico ogni ora
+      │
+      ├─ SofaScore API → partite live/programmate di ping pong
+      │       └─ fallback: dataset top player mondiali
+      │
+      ├─ AI Analyzer (Claude API o euristica)
+      │       └─ calcola value edge, Kelly stake, confidenza
+      │
+      └─ Segnale trovato (confidenza ≥ 60%, value ≥ 5%)
+              │
+              ├─ Notifica ADMIN con tasti:
+              │       ├─ [📤 Invia al VIP ✅]  → pubblica nel canale VIP
+              │       └─ [🗑 Scarta]            → archivia
+              │
+              └─ (opzionale) Auto-invio VIP attivabile dalle impostazioni
+```
+
+---
+
+## 📁 Struttura
+
+```
+pingpong-signals-bot/
+├── bot.py           # Entry point, handlers, scheduler
+├── scraper.py       # Fetching partite da SofaScore + fallback
+├── ai_analyzer.py   # Analisi AI (Claude API) + euristica
+├── database.py      # SQLite: segnali, impostazioni, stats
+├── requirements.txt
+├── Procfile
+├── railway.toml
+├── .env.example
 └── .gitignore
 ```
 
@@ -45,116 +47,94 @@ pingpong-bot/
 
 ## ⚙️ Variabili d'ambiente
 
-| Variabile | Descrizione |
-|-----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Token del bot (da @BotFather) |
-| `ADMIN_IDS` | ID Telegram admin, separati da virgola |
-| `DB_PATH` | Percorso file SQLite (default: `pingpong.db`) |
+| Variabile | Obbligatoria | Descrizione |
+|-----------|:---:|-------------|
+| `TELEGRAM_BOT_TOKEN` | ✅ | Token da @BotFather |
+| `ADMIN_ID` | ✅ | Tuo Telegram ID (858001417) |
+| `VIP_GROUP_ID` | ✅ | ID canale VIP (-1002950341972) |
+| `ANTHROPIC_API_KEY` | ❌ | Per analisi AI avanzata (fallback automatico senza) |
+| `DB_PATH` | ❌ | Percorso SQLite (default: `signals.db`) |
 
 ---
 
-## 🚀 Deploy su Railway (passo per passo)
+## 🚀 Deploy su Railway
 
 ### 1. Crea il bot su Telegram
-1. Apri Telegram e cerca **@BotFather**
-2. Scrivi `/newbot` e segui le istruzioni
-3. Copia il **token** (es. `123456789:AAxxxx...`)
-4. Per trovare il tuo **ADMIN_ID** scrivi a **@userinfobot**
+- @BotFather → `/newbot` → copia il token
+- **⚠️ Revoca e rigenera il token se lo hai già condiviso in chat**
 
-### 2. Carica su GitHub
+### 2. Aggiungi il bot al canale VIP come amministratore
+- Apri il canale VIP su Telegram
+- Impostazioni → Amministratori → Aggiungi amministratore
+- Cerca il tuo bot e aggiungilo con permesso di **Pubblicare messaggi**
+
+### 3. Carica su GitHub
 ```bash
 git init
 git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/TUO_USERNAME/pingpong-bot.git
+git commit -m "PingPong Signals Bot"
+git remote add origin https://github.com/TUO_USER/pingpong-signals-bot.git
 git push -u origin main
 ```
 
-### 3. Deploya su Railway
-1. Vai su [railway.app](https://railway.app) e registrati
-2. **New Project** → **Deploy from GitHub Repo**
-3. Seleziona il repo `pingpong-bot`
-4. Vai su **Variables** e aggiungi:
-   - `TELEGRAM_BOT_TOKEN` = il tuo token
-   - `ADMIN_IDS` = il tuo Telegram ID
-5. Railway detecta il `Procfile` e avvia automaticamente il bot
-
-> ⚠️ **Database persistente su Railway**: il filesystem è effimero.  
-> Per dati persistenti aggiungi un **Volume** in Railway e imposta `DB_PATH=/data/pingpong.db`,  
-> oppure migra su PostgreSQL (vedi sezione avanzata).
+### 4. Configura Railway
+1. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub Repo**
+2. Seleziona il repo
+3. **Variables** → aggiungi tutte le variabili da `.env.example`
+4. (Consigliato) **New Volume** → mount path `/data` → imposta `DB_PATH=/data/signals.db`
+5. Il bot si avvia automaticamente ✅
 
 ---
 
-## 🎮 Comandi disponibili
+## 🎮 Pannello Admin
 
-### Utenti
-| Comando | Descrizione |
-|---------|-------------|
-| `/start` | Menu principale + saldo |
-| `/partite` | Lista partite aperte |
-| `/saldo` | Mostra il tuo saldo |
-| `/mybets` | Ultimi 10 scommesse personali |
-| `/classifica` | Top 10 utenti per saldo |
+Scrivi `/start` al bot per aprire il pannello admin con:
 
-### Admin
-| Comando | Esempio |
-|---------|---------|
-| `/aggiungi_partita <p1> <p2> <q1> <q2>` | `/aggiungi_partita Rossi Bianchi 1.75 2.10` |
-| `/chiudi_partita <id> <1\|2>` | `/chiudi_partita 3 1` (vince giocatore 1) |
-| `/recredita <user_id> <importo>` | `/recredita 123456789 50` |
+| Tasto | Funzione |
+|-------|----------|
+| 🔍 Cerca segnali ora | Scan manuale immediato |
+| 📋 Segnali pendenti | Lista segnali da approvare/scartare |
+| 📊 Statistiche | Win rate, ROI, contatori |
+| ⚙️ Impostazioni | Intervallo scan, auto-invio VIP, min confidenza |
 
 ---
 
-## 💻 Sviluppo locale
+## 🏓 Tipi di segnali generati
 
-```bash
-# Clona il repo
-git clone https://github.com/TUO_USERNAME/pingpong-bot.git
-cd pingpong-bot
+| Tipo | Esempio |
+|------|---------|
+| 🏆 Winner | Vince Fan Zhendong @ 1.85 |
+| 📈 Over set | Over 3.5 set @ 1.90 |
+| 📉 Under set | Under 3.5 set @ 1.75 |
+| ⚖️ Handicap | Ma Long -1.5 set @ 2.10 |
+| 🎯 Risultato esatto | Fan Zhendong 3-1 @ 3.20 |
 
-# Crea virtual environment
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+---
 
-# Installa dipendenze
-pip install -r requirements.txt
+## 📊 Esempio segnale ricevuto
 
-# Crea il file .env
-cp .env.example .env
-# → modifica .env con il tuo token e admin ID
+```
+🆕 Nuovo segnale trovato!
 
-# Avvia il bot
-python bot.py
+🏓 SEGNALE PING PONG
+──────────────────────
+🏆 Fan Zhendong vs Wang Chuqin
+🎯 Giocata: Vince Fan Zhendong
+💰 Quota: 1.85
+📊 Confidenza: 76% ⭐⭐⭐⭐
+💡 Value edge: +14.2%
+📌 Stake: 3/5
+⏰ Inizio: 14/06 18:30
+🌍 Torneo: WTT Champions
+
+📝 Fan Zhendong dominante nelle ultime 8 partite WTT
 ```
 
 ---
 
-## 🗄️ Schema del database
+## 🔧 Note tecniche
 
-```sql
-users   (id, username, balance)
-matches (id, player1, player2, odds1, odds2, status, winner)
-bets    (id, user_id, match_id, player_num, amount, odds, status)
-```
-
-**Status partita:** `open` → `closed`  
-**Status scommessa:** `pending` → `won` / `lost`
-
----
-
-## 📈 Esempio di sessione
-
-```
-Admin:  /aggiungi_partita MaLong FanZhendong 1.65 2.30
-Bot:    ✅ Partita aggiunta! ID: 1
-
-Utente: /start → clicca "Partite disponibili"
-        → clicca "MaLong vs FanZhendong"
-        → clicca "🟢 MaLong (x1.65)"
-        → scrive: 100
-Bot:    ✅ Scommessa piazzata! Vincita potenziale: 165.00 crediti
-
-Admin:  /chiudi_partita 1 1
-Bot:    ✅ Partita chiusa. Vince giocatore 1.
-        💸 Scommesse risolte: 1 | Pagati: 165.00 crediti
-```
+- **SofaScore**: API pubblica non ufficiale, nessuna chiave necessaria
+- **Fallback**: se SofaScore non risponde, usa dataset interno di top 12 player mondiali
+- **AI**: con `ANTHROPIC_API_KEY` usa Claude per analisi reale; senza, usa l'analisi euristica (Kelly Criterion + probabilità implicite)
+- **Database**: SQLite locale; su Railway usa un Volume per la persistenza
