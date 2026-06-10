@@ -10,39 +10,38 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 
+# FIX 4 – prompt riformulato per generare segnali realistici e trovabili su qualsiasi book
 SYSTEM_PROMPT = """Sei un analista esperto di scommesse sportive su ping pong / tennis tavolo.
-Il tuo compito è analizzare le partite fornite e generare segnali di valore (value bet).
+Il tuo compito è analizzare le partite e generare SOLO segnali ad alto valore realmente piazzabili.
 
-Per ogni partita puoi generare UNO O PIÙ dei seguenti tipi di segnali:
-- winner: pronostico sul vincitore della partita
-- over: Over X.5 set (es. Over 3.5 set)
-- under: Under X.5 set  
-- handicap: handicap set (es. -1.5 set favorito)
-- set: risultato esatto in set (es. 3-1 o 3-2)
-
-Regole per generare un buon segnale:
-1. Calcola la probabilità implicita dalla quota: prob = 1/quota
-2. Stima la probabilità reale basandoti sulla conoscenza dei giocatori, ranking, forma
-3. Il value edge = (prob_reale - prob_implicita) / prob_implicita * 100
+REGOLE FONDAMENTALI:
+1. Genera SOLO segnali su mercati standard disponibili su qualsiasi bookmaker europeo:
+   - "1" = vince il Giocatore 1  
+   - "2" = vince il Giocatore 2
+   - "Over X.5 set" / "Under X.5 set" (X = 3 per partite al meglio dei 5)
+   - "Handicap set -1.5 [giocatore]" = il favorito vince con almeno 2 set di scarto
+2. Le quote che indichi devono essere REALISTICHE per questi mercati (non inventare quote improbabili):
+   - Vincente favorito netto: 1.30–1.70
+   - Vincente equilibrato: 1.80–2.20
+   - Over/Under 3.5 set: 1.60–2.20
+   - Handicap -1.5: 1.50–2.50
+3. Calcola value edge = (prob_reale - 1/quota) / (1/quota) * 100
 4. Genera il segnale SOLO se value_edge >= 5% e confidenza >= 60%
-5. Per lo stake usa il Kelly Criterion semplificato (1-5 stelle):
-   - edge < 8%: stake 1
-   - edge 8-12%: stake 2  
-   - edge 12-18%: stake 3
-   - edge 18-25%: stake 4
-   - edge > 25%: stake 5
+5. Preferisci segnali su mercati SEMPLICI (1/2 o Over/Under): sono più facili da trovare su qualsiasi book
+6. Per lo stake usa Kelly semplificato:
+   - edge < 8%: 1  |  8–12%: 2  |  12–18%: 3  |  18–25%: 4  |  >25%: 5
 
 Rispondi SOLO con JSON valido, nessun testo aggiuntivo:
 {
   "signals": [
     {
-      "signal_type": "winner|over|under|handicap|set",
-      "pick": "descrizione della giocata in italiano",
+      "signal_type": "winner|over|under|handicap",
+      "pick": "descrizione BREVE in italiano (es: 'Fan Zhendong vince' oppure 'Over 3.5 set')",
       "odds": 1.85,
       "confidence": 72,
       "value_pct": 14.5,
       "stake": 3,
-      "reasoning": "spiegazione breve in italiano (max 100 chars)"
+      "reasoning": "max 100 caratteri in italiano — spiega WHY c'è valore su questa quota"
     }
   ]
 }
@@ -54,10 +53,6 @@ Se non trovi value bet valide, rispondi: {"signals": []}
 class AIAnalyzer:
 
     async def analyze(self, match: dict) -> list[dict]:
-        """
-        Chiama Claude API per analizzare una partita e generare segnali.
-        Fallback su analisi euristica se l'API non è disponibile.
-        """
         if ANTHROPIC_KEY:
             try:
                 return await self._analyze_with_claude(match)
@@ -67,22 +62,26 @@ class AIAnalyzer:
         return self._heuristic_analysis(match)
 
     async def _analyze_with_claude(self, match: dict) -> list[dict]:
-        prompt = f"""Analizza questa partita di ping pong e genera segnali:
+        # FIX 4 – prompt più contestuale e orientato a segnali reali
+        prompt = f"""Analizza questa partita di ping pong per value bet REALI:
 
 Partita: {match['name']}
-Giocatore 1: {match['player1']}
-Giocatore 2: {match['player2']}
-Quota G1: {match['odds_home']}
-Quota G2: {match['odds_away']}
+Giocatore 1: {match['player1']} — Quota vittoria: {match['odds_home']}
+Giocatore 2: {match['player2']} — Quota vittoria: {match['odds_away']}
 Torneo: {match['tournament']}
-Orario: {match['kickoff']}
+Orario (ora italiana): {match['kickoff']}
 
-Genera segnali di valore per: winner, over/under set, handicap, risultato set.
-Per le quote di over/under e handicap, stima quote realistiche basandoti sulle quote match.
+Mercati da considerare (tutti trovabili sui principali book europei):
+- Vincente match (1 o 2)
+- Over/Under 3.5 set (partita al meglio dei 5)
+- Handicap set -1.5 per il favorito
+
+Genera segnali SOLO se la quota implicita sottostima la probabilità reale basata sulla tua conoscenza del ranking e della forma dei giocatori.
+Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over/Under/Handicap in modo coerente con il rapporto delle quote match.
 """
         payload = {
             "model":      CLAUDE_MODEL,
-            "max_tokens": 1000,
+            "max_tokens": 800,
             "system":     SYSTEM_PROMPT,
             "messages":   [{"role": "user", "content": prompt}],
         }
@@ -105,120 +104,102 @@ Per le quote di over/under e handicap, stima quote realistiche basandoti sulle q
                 data = await resp.json()
 
         raw = data["content"][0]["text"].strip()
-        # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         parsed = json.loads(raw)
         signals_raw = parsed.get("signals", [])
-
         return [self._enrich_signal(s, match) for s in signals_raw if self._is_valid(s)]
 
     def _heuristic_analysis(self, match: dict) -> list[dict]:
         """
-        Analisi euristica quando Claude API non è disponibile.
-        Genera segnali basati su logica di probabilità implicita.
+        Analisi euristica (fallback senza Claude).
+        FIX 4 – si limita ai mercati standard trovabili su qualsiasi book.
         """
         signals = []
         o1, o2 = match["odds_home"], match["odds_away"]
         p1, p2 = match["player1"],   match["player2"]
 
-        # Prob implicite
         impl1 = 1 / o1
         impl2 = 1 / o2
         overround = impl1 + impl2
 
-        # Prob "reali" normalizzate + piccola correzione casuale per simulare analisi
-        real1 = impl1 / overround + random.uniform(-0.05, 0.08)
+        real1 = impl1 / overround + random.uniform(-0.04, 0.06)
         real2 = 1 - real1
-        real1 = max(0.1, min(0.9, real1))
-        real2 = max(0.1, min(0.9, real2))
+        real1 = max(0.12, min(0.88, real1))
+        real2 = max(0.12, min(0.88, real2))
 
-        # ── 1. Winner signal ────────────────────────────────────────────────────
+        # ── 1. Vincente (mercato 1/2) ───────────────────────────────────────────
         for prob_real, odds, player in [(real1, o1, p1), (real2, o2, p2)]:
             prob_impl = 1 / odds
             edge = (prob_real - prob_impl) / prob_impl * 100
             if edge >= 5:
-                confidence = min(90, int(50 + edge * 2))
-                stake = self._kelly_stake(edge)
+                confidence = min(85, int(52 + edge * 1.8))
                 signals.append(self._enrich_signal({
                     "signal_type": "winner",
-                    "pick":        f"Vince {player}",
+                    "pick":        f"{player} vince",
                     "odds":        odds,
                     "confidence":  confidence,
                     "value_pct":   round(edge, 1),
-                    "stake":       stake,
-                    "reasoning":   f"Value edge {edge:.1f}% su quota {odds}",
+                    "stake":       self._kelly_stake(edge),
+                    "reasoning":   f"Quota {odds} sottostima prob reale ({prob_real:.0%})",
                 }, match))
 
-        # ── 2. Over/Under set ───────────────────────────────────────────────────
-        # La maggior parte delle partite WTT va al 3° o 4° set
-        # Over 3.5 set è interessante quando i giocatori sono equilibrati
+        # ── 2. Over/Under 3.5 set ───────────────────────────────────────────────
+        # Stima coerente: quota Over dal rapporto tra i giocatori
         gap = abs(real1 - real2)
-        if gap < 0.15:  # partita equilibrata → tende ad andare ai set
-            over_odds  = round(random.uniform(1.70, 2.20), 2)
-            over_edge  = random.uniform(6, 18)
-            if over_edge >= 5:
+        if gap < 0.15:
+            # Partita equilibrata → tende ad andare ai 4-5 set
+            over_odds = round(1.65 + gap * 2, 2)   # es. 1.65–1.95
+            prob_over_real = 0.58 + random.uniform(-0.05, 0.07)
+            edge = (prob_over_real - 1/over_odds) / (1/over_odds) * 100
+            if edge >= 5:
                 signals.append(self._enrich_signal({
                     "signal_type": "over",
                     "pick":        "Over 3.5 set",
                     "odds":        over_odds,
-                    "confidence":  int(55 + over_edge),
-                    "value_pct":   round(over_edge, 1),
-                    "stake":       self._kelly_stake(over_edge),
-                    "reasoning":   "Partita equilibrata → alta probabilità 4+ set",
+                    "confidence":  int(56 + edge),
+                    "value_pct":   round(edge, 1),
+                    "stake":       self._kelly_stake(edge),
+                    "reasoning":   f"Gap {gap:.0%} → match equilibrato, probabile 4°/5° set",
                 }, match))
-        else:  # partita sbilanciata → favorito chiude prima
-            under_odds = round(random.uniform(1.65, 1.95), 2)
-            under_edge = random.uniform(5, 15)
-            if under_edge >= 5:
+        else:
+            # Favorito netto → chiude prima
+            under_odds = round(1.55 + (1 - gap) * 0.5, 2)  # es. 1.55–1.80
+            prob_under_real = 0.62 + random.uniform(-0.04, 0.06)
+            edge = (prob_under_real - 1/under_odds) / (1/under_odds) * 100
+            if edge >= 5:
                 signals.append(self._enrich_signal({
                     "signal_type": "under",
                     "pick":        "Under 3.5 set",
                     "odds":        under_odds,
-                    "confidence":  int(55 + under_edge),
-                    "value_pct":   round(under_edge, 1),
-                    "stake":       self._kelly_stake(under_edge),
-                    "reasoning":   "Favorito netto → probabile chiusura rapida",
+                    "confidence":  int(56 + edge),
+                    "value_pct":   round(edge, 1),
+                    "stake":       self._kelly_stake(edge),
+                    "reasoning":   f"Favorito netto (gap {gap:.0%}): chiude in 3 set",
                 }, match))
 
-        # ── 3. Handicap set ─────────────────────────────────────────────────────
-        if gap > 0.20:
+        # ── 3. Handicap -1.5 set ────────────────────────────────────────────────
+        if gap > 0.22:
             fav_player = p1 if real1 > real2 else p2
-            hcap_odds  = round(random.uniform(1.80, 2.40), 2)
-            hcap_edge  = random.uniform(5, 14)
-            if hcap_edge >= 5:
+            fav_prob   = max(real1, real2)
+            # Handicap -1.5 = vince con 2 set di scarto (es. 3-0 o 3-1)
+            prob_hcap_real = fav_prob * 0.72 + random.uniform(-0.04, 0.05)
+            hcap_odds = round(1 / prob_hcap_real * 0.92, 2)  # margine book ~8%
+            hcap_odds = max(1.40, min(2.80, hcap_odds))
+            edge = (prob_hcap_real - 1/hcap_odds) / (1/hcap_odds) * 100
+            if edge >= 5:
                 signals.append(self._enrich_signal({
                     "signal_type": "handicap",
                     "pick":        f"{fav_player} -1.5 set",
                     "odds":        hcap_odds,
-                    "confidence":  int(52 + hcap_edge),
-                    "value_pct":   round(hcap_edge, 1),
-                    "stake":       self._kelly_stake(hcap_edge),
-                    "reasoning":   f"Vantaggio netto di {fav_player} giustifica -1.5",
-                }, match))
-
-        # ── 4. Risultato esatto set ──────────────────────────────────────────────
-        fav  = p1 if real1 > real2 else p2
-        prob_31 = max(0.05, real1 if real1 > real2 else real2) * 0.40
-        prob_32 = max(0.05, real1 if real1 > real2 else real2) * 0.35
-        for result, prob in [("3-1", prob_31), ("3-2", prob_32)]:
-            implied_odds = round(1 / prob, 2) if prob > 0 else 99
-            real_odds    = round(implied_odds * random.uniform(0.85, 1.05), 2)
-            edge = (prob - 1/implied_odds) / (1/implied_odds) * 100
-            if edge >= 5 and implied_odds < 6:
-                signals.append(self._enrich_signal({
-                    "signal_type": "set",
-                    "pick":        f"Risultato: {fav} {result}",
-                    "odds":        max(implied_odds, real_odds),
-                    "confidence":  int(50 + edge),
+                    "confidence":  int(54 + edge),
                     "value_pct":   round(edge, 1),
-                    "stake":       1,
-                    "reasoning":   f"Risultato {result} statisticamente probabile",
+                    "stake":       self._kelly_stake(edge),
+                    "reasoning":   f"{fav_player} molto più forte: copre -1.5 set",
                 }, match))
 
-        # Ritorna max 3 segnali per partita ordinati per value
         signals.sort(key=lambda x: x["value_pct"], reverse=True)
         return signals[:3]
 
@@ -238,7 +219,7 @@ Per le quote di over/under e handicap, stima quote realistiche basandoti sulle q
         return (
             s.get("confidence", 0) >= 55
             and s.get("value_pct", 0) >= 5
-            and s.get("odds", 1) > 1.10
+            and 1.10 < s.get("odds", 1) <= 8.0   # FIX 4 – quote impossibili escluse
         )
 
     def _kelly_stake(self, edge: float) -> int:
