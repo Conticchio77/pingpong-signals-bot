@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 
-# FIX 4 – prompt riformulato per generare segnali realistici e trovabili su qualsiasi book
 SYSTEM_PROMPT = """Sei un analista esperto di scommesse sportive su ping pong / tennis tavolo.
 Il tuo compito è analizzare le partite e generare SOLO segnali ad alto valore realmente piazzabili.
 
@@ -31,6 +30,13 @@ REGOLE FONDAMENTALI:
 6. Per lo stake usa Kelly semplificato:
    - edge < 8%: 1  |  8–12%: 2  |  12–18%: 3  |  18–25%: 4  |  >25%: 5
 
+IMPORTANTE — TROVABILITÀ DEL SEGNALE:
+Questa partita viene da un torneo noto (WTT, Mondiali, Europei, Bundesliga, Liga Pro).
+Indica nel campo "book_note" il mercato ESATTO da cercare sul book, ad esempio:
+- "Vincente match → cerca '1X2' o 'Match Winner'"
+- "Over 3.5 set → cerca 'Totale set' o 'Set totali'"
+- "Handicap -1.5 → cerca 'Handicap set' o 'Set handicap'"
+
 Rispondi SOLO con JSON valido, nessun testo aggiuntivo:
 {
   "signals": [
@@ -41,7 +47,8 @@ Rispondi SOLO con JSON valido, nessun testo aggiuntivo:
       "confidence": 72,
       "value_pct": 14.5,
       "stake": 3,
-      "reasoning": "max 100 caratteri in italiano — spiega WHY c'è valore su questa quota"
+      "reasoning": "max 100 caratteri in italiano — spiega WHY c'è valore su questa quota",
+      "book_note": "come trovarlo sul book (max 60 caratteri)"
     }
   ]
 }
@@ -62,7 +69,6 @@ class AIAnalyzer:
         return self._heuristic_analysis(match)
 
     async def _analyze_with_claude(self, match: dict) -> list[dict]:
-        # FIX 4 – prompt più contestuale e orientato a segnali reali
         prompt = f"""Analizza questa partita di ping pong per value bet REALI:
 
 Partita: {match['name']}
@@ -71,13 +77,15 @@ Giocatore 2: {match['player2']} — Quota vittoria: {match['odds_away']}
 Torneo: {match['tournament']}
 Orario (ora italiana): {match['kickoff']}
 
-Mercati da considerare (tutti trovabili sui principali book europei):
+NOTA: questo torneo ({match['tournament']}) è quotato dai principali book italiani/europei.
+I segnali che generi DEVONO essere trovabili su Snai, Sisal, Goldbet, Betfair o Bet365.
+
+Mercati da considerare:
 - Vincente match (1 o 2)
 - Over/Under 3.5 set (partita al meglio dei 5)
 - Handicap set -1.5 per il favorito
 
 Genera segnali SOLO se la quota implicita sottostima la probabilità reale basata sulla tua conoscenza del ranking e della forma dei giocatori.
-Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over/Under/Handicap in modo coerente con il rapporto delle quote match.
 """
         payload = {
             "model":      CLAUDE_MODEL,
@@ -113,10 +121,6 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
         return [self._enrich_signal(s, match) for s in signals_raw if self._is_valid(s)]
 
     def _heuristic_analysis(self, match: dict) -> list[dict]:
-        """
-        Analisi euristica (fallback senza Claude).
-        FIX 4 – si limita ai mercati standard trovabili su qualsiasi book.
-        """
         signals = []
         o1, o2 = match["odds_home"], match["odds_away"]
         p1, p2 = match["player1"],   match["player2"]
@@ -130,7 +134,7 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
         real1 = max(0.12, min(0.88, real1))
         real2 = max(0.12, min(0.88, real2))
 
-        # ── 1. Vincente (mercato 1/2) ───────────────────────────────────────────
+        # ── 1. Vincente ─────────────────────────────────────────────────────────
         for prob_real, odds, player in [(real1, o1, p1), (real2, o2, p2)]:
             prob_impl = 1 / odds
             edge = (prob_real - prob_impl) / prob_impl * 100
@@ -144,14 +148,13 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
                     "value_pct":   round(edge, 1),
                     "stake":       self._kelly_stake(edge),
                     "reasoning":   f"Quota {odds} sottostima prob reale ({prob_real:.0%})",
+                    "book_note":   "Cerca 'Match Winner' o '1X2' sul book",
                 }, match))
 
-        # ── 2. Over/Under 3.5 set ───────────────────────────────────────────────
-        # Stima coerente: quota Over dal rapporto tra i giocatori
+        # ── 2. Over/Under 3.5 set ────────────────────────────────────────────────
         gap = abs(real1 - real2)
         if gap < 0.15:
-            # Partita equilibrata → tende ad andare ai 4-5 set
-            over_odds = round(1.65 + gap * 2, 2)   # es. 1.65–1.95
+            over_odds = round(1.65 + gap * 2, 2)
             prob_over_real = 0.58 + random.uniform(-0.05, 0.07)
             edge = (prob_over_real - 1/over_odds) / (1/over_odds) * 100
             if edge >= 5:
@@ -163,10 +166,10 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
                     "value_pct":   round(edge, 1),
                     "stake":       self._kelly_stake(edge),
                     "reasoning":   f"Gap {gap:.0%} → match equilibrato, probabile 4°/5° set",
+                    "book_note":   "Cerca 'Totale set' → Over 3.5",
                 }, match))
         else:
-            # Favorito netto → chiude prima
-            under_odds = round(1.55 + (1 - gap) * 0.5, 2)  # es. 1.55–1.80
+            under_odds = round(1.55 + (1 - gap) * 0.5, 2)
             prob_under_real = 0.62 + random.uniform(-0.04, 0.06)
             edge = (prob_under_real - 1/under_odds) / (1/under_odds) * 100
             if edge >= 5:
@@ -178,15 +181,15 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
                     "value_pct":   round(edge, 1),
                     "stake":       self._kelly_stake(edge),
                     "reasoning":   f"Favorito netto (gap {gap:.0%}): chiude in 3 set",
+                    "book_note":   "Cerca 'Totale set' → Under 3.5",
                 }, match))
 
-        # ── 3. Handicap -1.5 set ────────────────────────────────────────────────
+        # ── 3. Handicap -1.5 set ─────────────────────────────────────────────────
         if gap > 0.22:
             fav_player = p1 if real1 > real2 else p2
             fav_prob   = max(real1, real2)
-            # Handicap -1.5 = vince con 2 set di scarto (es. 3-0 o 3-1)
             prob_hcap_real = fav_prob * 0.72 + random.uniform(-0.04, 0.05)
-            hcap_odds = round(1 / prob_hcap_real * 0.92, 2)  # margine book ~8%
+            hcap_odds = round(1 / prob_hcap_real * 0.92, 2)
             hcap_odds = max(1.40, min(2.80, hcap_odds))
             edge = (prob_hcap_real - 1/hcap_odds) / (1/hcap_odds) * 100
             if edge >= 5:
@@ -198,6 +201,7 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
                     "value_pct":   round(edge, 1),
                     "stake":       self._kelly_stake(edge),
                     "reasoning":   f"{fav_player} molto più forte: copre -1.5 set",
+                    "book_note":   "Cerca 'Handicap set' o 'Set handicap'",
                 }, match))
 
         signals.sort(key=lambda x: x["value_pct"], reverse=True)
@@ -219,7 +223,7 @@ Ricorda: le quote fornite sopra sono il riferimento principale. Stima quote Over
         return (
             s.get("confidence", 0) >= 55
             and s.get("value_pct", 0) >= 5
-            and 1.10 < s.get("odds", 1) <= 8.0   # FIX 4 – quote impossibili escluse
+            and 1.10 < s.get("odds", 1) <= 8.0
         )
 
     def _kelly_stake(self, edge: float) -> int:

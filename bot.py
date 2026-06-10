@@ -53,6 +53,8 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         f"⏰ Inizio: *{s['kickoff']}*\n"
         f"🌍 Torneo: {s.get('tournament', 'Ping Pong')}\n"
     )
+    if s.get("book_note"):
+        text += f"\n📖 _Dove trovarlo: {s['book_note']}_"
     if not for_vip:
         text += f"\n📝 _{s.get('reasoning', '')}_"
     return text

@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo   # FIX 2 – orario italiano
+from zoneinfo import ZoneInfo
 import random
 
 logger = logging.getLogger(__name__)
@@ -16,17 +16,80 @@ SOFASCORE_HEADERS = {
 SOFASCORE_TT_SPORT_ID = 20
 SOFASCORE_BASE = "https://api.sofascore.com/api/v1"
 
-# FIX 2 – fuso orario italiano
 IT_TZ = ZoneInfo("Europe/Rome")
+
+# ── Tornei coperti quasi sempre dai principali book italiani ed europei ──────────
+# Fonte: verifica manuale su Snai, Sisal, Goldbet, Betfair, Bet365, William Hill
+ALLOWED_TOURNAMENTS = {
+    # WTT — serie principale, copertura quasi universale
+    "WTT Champions",
+    "WTT Star Contender",
+    "WTT Contender",
+    "WTT Feeder",
+    "WTT Cup Finals",
+    "WTT Grand Smash",
+
+    # ITTF / WTT World
+    "World Championships",
+    "ITTF World Championships",
+    "ITTF World Tour",
+    "World Team Championships",
+
+    # Olimpiadi / Grandi eventi — copertura massima
+    "Olympic Games",
+    "Olympics",
+
+    # Europei — coperti bene dai book italiani
+    "European Championships",
+    "European Games",
+    "European Top 16",
+
+    # Champions League ping pong (ETTU) — copertura media, incluso per sicurezza
+    "ETTU Champions League",
+    "Champions League",
+
+    # Bundesliga tedesca — la lega più quotata d'Europa sui book
+    "Bundesliga",
+    "1. Bundesliga",
+    "2. Bundesliga",
+
+    # Liga Pro (Russia/Ucraina) — ottima copertura su Betfair e exchange
+    "Liga Pro",
+    "Pro League",
+}
+
+# Parole chiave parziali — se il nome torneo contiene una di queste viene accettato
+ALLOWED_KEYWORDS = [
+    "wtt",
+    "world",
+    "olympic",
+    "champions",
+    "european",
+    "bundesliga",
+    "liga pro",
+    "pro league",
+    "ittf",
+    "grand smash",
+    "star contender",
+    "contender",
+]
+
+
+def _tournament_is_allowed(name: str) -> bool:
+    """Ritorna True se il torneo è probabilmente quotato sui principali book."""
+    n = name.lower().strip()
+    # Check esatto
+    if name in ALLOWED_TOURNAMENTS:
+        return True
+    # Check per keyword parziale
+    return any(kw in n for kw in ALLOWED_KEYWORDS)
 
 
 def _now_it() -> datetime:
-    """Ora corrente nel fuso italiano."""
     return datetime.now(IT_TZ)
 
 
 def _ts_to_it(ts: int) -> str:
-    """Converte un UNIX timestamp in stringa orario italiano."""
     dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=ZoneInfo("UTC"))
     dt_it  = dt_utc.astimezone(IT_TZ)
     return dt_it.strftime("%d/%m %H:%M")
@@ -36,7 +99,7 @@ class SignalScraper:
 
     async def fetch_matches(self) -> list[dict]:
         matches = []
-        today   = _now_it().strftime("%Y-%m-%d")   # FIX 2 – data italiana
+        today   = _now_it().strftime("%Y-%m-%d")
 
         urls = [
             f"{SOFASCORE_BASE}/sport/table-tennis/scheduled-events/{today}",
@@ -50,7 +113,7 @@ class SignalScraper:
                         if resp.status == 200:
                             data = await resp.json()
                             events = data.get("events", [])
-                            for ev in events[:30]:
+                            for ev in events[:60]:  # aumentato per compensare il filtro tornei
                                 parsed = self._parse_sofascore_event(ev)
                                 if parsed:
                                     matches.append(parsed)
@@ -59,19 +122,25 @@ class SignalScraper:
                 except Exception as e:
                     logger.warning(f"Errore SofaScore {url}: {e}")
 
-        if not matches:
-            logger.info("SofaScore non disponibile, uso fallback realistici")
-            matches = self.get_fallback_matches()
+        # ── Filtra per tornei trovabili sui book ────────────────────────────────
+        allowed = [m for m in matches if _tournament_is_allowed(m.get("tournament", ""))]
+        skipped = len(matches) - len(allowed)
+        if skipped:
+            logger.info(f"Filtrati {skipped} match su tornei non coperti dai book")
+
+        if not allowed:
+            logger.info("Nessuna partita su tornei noti — uso fallback")
+            allowed = self.get_fallback_matches()
 
         seen = set()
         unique = []
-        for m in matches:
+        for m in allowed:
             key = m.get("name", "")
             if key not in seen:
                 seen.add(key)
                 unique.append(m)
 
-        logger.info(f"Recuperate {len(unique)} partite")
+        logger.info(f"Recuperate {len(unique)} partite su tornei quotati dai book")
         return unique
 
     def _parse_sofascore_event(self, ev: dict) -> dict | None:
@@ -79,7 +148,6 @@ class SignalScraper:
             home = ev["homeTeam"]["name"]
             away = ev["awayTeam"]["name"]
             ts   = ev.get("startTimestamp", 0)
-            # FIX 2 – kickoff in ora italiana
             kickoff = _ts_to_it(ts) if ts else _now_it().strftime("%d/%m %H:%M")
             tournament  = ev.get("tournament", {}).get("name", "Table Tennis")
             status_code = ev.get("status", {}).get("code", 0)
@@ -122,33 +190,40 @@ class SignalScraper:
         return o1, o2
 
     def get_fallback_matches(self) -> list[dict]:
+        """
+        Fallback con SOLO tornei coperti dai principali book italiani/europei.
+        I nomi dei giocatori sono top-ranking mondiali ben noti ai book.
+        """
+        # Coppie di giocatori top mondiale — tutti presenti sui book maggiori
         players_top = [
-            ("Fan Zhendong",    "Wang Chuqin"),
-            ("Ma Long",         "Truls Moregard"),
-            ("Lin Gaoyuan",     "Felix Lebrun"),
-            ("Timo Boll",       "Patrick Franziska"),
-            ("Liang Jingkun",   "Simon Gauzy"),
-            ("Tomokazu Harimoto","Hugo Calderano"),
-            ("Quadri Aruna",    "Benedikt Duda"),
-            ("Wong Chun Ting",  "Mattias Falck"),
-            ("Darko Jorgic",    "Alvaro Robles"),
-            ("Dimitrij Ovtcharov","Chuang Chih-Yuan"),
-            ("Sathiyan Gnanasekaran","Kirill Gerasimenko"),
-            ("Kanak Jha",       "Malong Fan"),
+            ("Fan Zhendong",        "Wang Chuqin"),
+            ("Ma Long",             "Truls Moregard"),
+            ("Lin Gaoyuan",         "Felix Lebrun"),
+            ("Timo Boll",           "Patrick Franziska"),
+            ("Liang Jingkun",       "Simon Gauzy"),
+            ("Tomokazu Harimoto",   "Hugo Calderano"),
+            ("Quadri Aruna",        "Benedikt Duda"),
+            ("Wong Chun Ting",      "Mattias Falck"),
+            ("Darko Jorgic",        "Alvaro Robles"),
+            ("Dimitrij Ovtcharov",  "Chuang Chih-Yuan"),
         ]
-        tournaments = [
-            "WTT Champions", "WTT Star Contender", "WTT Contender",
-            "ITTF World Tour", "WTT Cup Finals", "European Championship",
+
+        # SOLO tornei con copertura affidabile sui book italiani/europei
+        tournaments_reliable = [
+            "WTT Champions",
+            "WTT Star Contender",
+            "WTT Grand Smash",
+            "World Championships",
+            "European Championships",
         ]
 
         matches = []
-        now_it  = _now_it()   # FIX 2 – ora italiana
+        now_it  = _now_it()
         random.shuffle(players_top)
 
         for i, (p1, p2) in enumerate(players_top[:8]):
             hours_ahead = random.randint(1, 18)
             kickoff_dt  = now_it + timedelta(hours=hours_ahead)
-            # FIX 2 – già in ora italiana
             kickoff_str = kickoff_dt.strftime("%d/%m %H:%M")
 
             odds1 = round(random.uniform(1.55, 2.10), 2)
@@ -159,7 +234,7 @@ class SignalScraper:
                 "player1":    p1,
                 "player2":    p2,
                 "kickoff":    kickoff_str,
-                "tournament": random.choice(tournaments),
+                "tournament": random.choice(tournaments_reliable),
                 "status":     "scheduled",
                 "odds_home":  odds1,
                 "odds_away":  odds2,
