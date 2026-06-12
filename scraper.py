@@ -1,244 +1,201 @@
 import aiohttp
-import asyncio
 import logging
+import os
+import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import random
 
-logger = logging.getLogger(__name__)
+logger  = logging.getLogger(__name__)
+IT_TZ   = ZoneInfo("Europe/Rome")
 
-SOFASCORE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.sofascore.com",
-}
+ODDS_KEY  = os.environ.get("ODDS_API_KEY", "")
+ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-SOFASCORE_TT_SPORT_ID = 20
-SOFASCORE_BASE = "https://api.sofascore.com/api/v1"
-
-IT_TZ = ZoneInfo("Europe/Rome")
-
-# ── Tornei coperti quasi sempre dai principali book italiani ed europei ──────────
-# Fonte: verifica manuale su Snai, Sisal, Goldbet, Betfair, Bet365, William Hill
-ALLOWED_TOURNAMENTS = {
-    # WTT — serie principale, copertura quasi universale
-    "WTT Champions",
-    "WTT Star Contender",
-    "WTT Contender",
-    "WTT Feeder",
-    "WTT Cup Finals",
-    "WTT Grand Smash",
-
-    # ITTF / WTT World
-    "World Championships",
-    "ITTF World Championships",
-    "ITTF World Tour",
-    "World Team Championships",
-
-    # Olimpiadi / Grandi eventi — copertura massima
-    "Olympic Games",
-    "Olympics",
-
-    # Europei — coperti bene dai book italiani
-    "European Championships",
-    "European Games",
-    "European Top 16",
-
-    # Champions League ping pong (ETTU) — copertura media, incluso per sicurezza
-    "ETTU Champions League",
-    "Champions League",
-
-    # Bundesliga tedesca — la lega più quotata d'Europa sui book
-    "Bundesliga",
-    "1. Bundesliga",
-    "2. Bundesliga",
-
-    # Liga Pro (Russia/Ucraina) — ottima copertura su Betfair e exchange
-    "Liga Pro",
-    "Pro League",
-}
-
-# Parole chiave parziali — se il nome torneo contiene una di queste viene accettato
-ALLOWED_KEYWORDS = [
-    "wtt",
-    "world",
-    "olympic",
-    "champions",
-    "european",
-    "bundesliga",
-    "liga pro",
-    "pro league",
-    "ittf",
-    "grand smash",
-    "star contender",
-    "contender",
-]
-
-
-def _tournament_is_allowed(name: str) -> bool:
-    """Ritorna True se il torneo è probabilmente quotato sui principali book."""
-    n = name.lower().strip()
-    # Check esatto
-    if name in ALLOWED_TOURNAMENTS:
-        return True
-    # Check per keyword parziale
-    return any(kw in n for kw in ALLOWED_KEYWORDS)
+# Sport key corretto per tennis tavolo su The Odds API
+TT_SPORT = "tabletennis"
 
 
 def _now_it() -> datetime:
     return datetime.now(IT_TZ)
 
 
-def _ts_to_it(ts: int) -> str:
-    dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=ZoneInfo("UTC"))
-    dt_it  = dt_utc.astimezone(IT_TZ)
-    return dt_it.strftime("%d/%m %H:%M")
+def _iso_to_it(iso: str) -> str:
+    """Converte ISO8601 UTC → ora italiana formattata dd/mm HH:MM."""
+    try:
+        iso = iso.replace("Z", "+00:00")
+        dt  = datetime.fromisoformat(iso).astimezone(IT_TZ)
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return _now_it().strftime("%d/%m %H:%M")
 
 
 class SignalScraper:
 
     async def fetch_matches(self) -> list[dict]:
+        if not ODDS_KEY:
+            logger.warning("ODDS_API_KEY non impostata — uso fallback interno")
+            return self._sort(self.get_fallback_matches())
+
+        matches = await self._fetch_odds_api()
+        if matches:
+            logger.info(f"The Odds API: {len(matches)} partite con quote reali")
+            return self._sort(matches)
+
+        logger.warning("The Odds API: nessuna partita disponibile — uso fallback")
+        return self._sort(self.get_fallback_matches())
+
+    # ── The Odds API ──────────────────────────────────────────────────────────
+    async def _fetch_odds_api(self) -> list[dict]:
         matches = []
-        today   = _now_it().strftime("%Y-%m-%d")
+        # Regioni EU + UK per avere book italiani/europei (Betfair, Bet365, Unibet ecc.)
+        url = (
+            f"{ODDS_BASE}/sports/{TT_SPORT}/odds/"
+            f"?apiKey={ODDS_KEY}"
+            f"&regions=eu,uk"
+            f"&markets=h2h,totals"
+            f"&oddsFormat=decimal"
+            f"&dateFormat=iso"
+        )
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    remaining = resp.headers.get("x-requests-remaining", "?")
+                    used      = resp.headers.get("x-requests-used", "?")
+                    logger.info(f"Odds API — usate:{used} rimaste:{remaining}")
 
-        urls = [
-            f"{SOFASCORE_BASE}/sport/table-tennis/scheduled-events/{today}",
-            f"{SOFASCORE_BASE}/sport/table-tennis/live",
-        ]
-
-        async with aiohttp.ClientSession(headers=SOFASCORE_HEADERS) as session:
-            for url in urls:
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            events = data.get("events", [])
-                            for ev in events[:60]:  # aumentato per compensare il filtro tornei
-                                parsed = self._parse_sofascore_event(ev)
-                                if parsed:
-                                    matches.append(parsed)
-                        else:
-                            logger.warning(f"SofaScore status {resp.status} per {url}")
-                except Exception as e:
-                    logger.warning(f"Errore SofaScore {url}: {e}")
-
-        # ── Filtra per tornei trovabili sui book ────────────────────────────────
-        allowed = [m for m in matches if _tournament_is_allowed(m.get("tournament", ""))]
-        skipped = len(matches) - len(allowed)
-        if skipped:
-            logger.info(f"Filtrati {skipped} match su tornei non coperti dai book")
-
-        if not allowed:
-            logger.info("Nessuna partita su tornei noti — uso fallback")
-            allowed = self.get_fallback_matches()
-
-        seen = set()
-        unique = []
-        for m in allowed:
-            key = m.get("name", "")
-            if key not in seen:
-                seen.add(key)
-                unique.append(m)
-
-        logger.info(f"Recuperate {len(unique)} partite su tornei quotati dai book")
-        return unique
-
-    def _parse_sofascore_event(self, ev: dict) -> dict | None:
-        try:
-            home = ev["homeTeam"]["name"]
-            away = ev["awayTeam"]["name"]
-            ts   = ev.get("startTimestamp", 0)
-            kickoff = _ts_to_it(ts) if ts else _now_it().strftime("%d/%m %H:%M")
-            tournament  = ev.get("tournament", {}).get("name", "Table Tennis")
-            status_code = ev.get("status", {}).get("code", 0)
-            status = "live" if status_code in (6, 7) else "scheduled"
-            odds1, odds2 = self._estimate_odds(ev)
-
-            return {
-                "name":       f"{home} vs {away}",
-                "player1":    home,
-                "player2":    away,
-                "kickoff":    kickoff,
-                "tournament": tournament,
-                "status":     status,
-                "odds_home":  odds1,
-                "odds_away":  odds2,
-                "source":     "sofascore",
-            }
-        except Exception as e:
-            logger.debug(f"Parse error: {e}")
-            return None
-
-    def _estimate_odds(self, ev: dict) -> tuple[float, float]:
-        home_rank = ev.get("homeTeam", {}).get("ranking", 0) or 0
-        away_rank = ev.get("awayTeam", {}).get("ranking", 0) or 0
-
-        if home_rank > 0 and away_rank > 0:
-            if home_rank < away_rank:
-                ratio = away_rank / home_rank
-                o1 = round(max(1.20, 2.0 / ratio), 2)
-                o2 = round(min(5.0,  2.0 * ratio), 2)
-            else:
-                ratio = home_rank / away_rank
-                o1 = round(min(5.0,  2.0 * ratio), 2)
-                o2 = round(max(1.20, 2.0 / ratio), 2)
-        else:
-            base = round(random.uniform(1.70, 2.20), 2)
-            o1   = base
-            o2   = round(random.uniform(1.65, 2.30), 2)
-
-        return o1, o2
-
-    def get_fallback_matches(self) -> list[dict]:
-        """
-        Fallback con SOLO tornei coperti dai principali book italiani/europei.
-        I nomi dei giocatori sono top-ranking mondiali ben noti ai book.
-        """
-        # Coppie di giocatori top mondiale — tutti presenti sui book maggiori
-        players_top = [
-            ("Fan Zhendong",        "Wang Chuqin"),
-            ("Ma Long",             "Truls Moregard"),
-            ("Lin Gaoyuan",         "Felix Lebrun"),
-            ("Timo Boll",           "Patrick Franziska"),
-            ("Liang Jingkun",       "Simon Gauzy"),
-            ("Tomokazu Harimoto",   "Hugo Calderano"),
-            ("Quadri Aruna",        "Benedikt Duda"),
-            ("Wong Chun Ting",      "Mattias Falck"),
-            ("Darko Jorgic",        "Alvaro Robles"),
-            ("Dimitrij Ovtcharov",  "Chuang Chih-Yuan"),
-        ]
-
-        # SOLO tornei con copertura affidabile sui book italiani/europei
-        tournaments_reliable = [
-            "WTT Champions",
-            "WTT Star Contender",
-            "WTT Grand Smash",
-            "World Championships",
-            "European Championships",
-        ]
-
-        matches = []
-        now_it  = _now_it()
-        random.shuffle(players_top)
-
-        for i, (p1, p2) in enumerate(players_top[:8]):
-            hours_ahead = random.randint(1, 18)
-            kickoff_dt  = now_it + timedelta(hours=hours_ahead)
-            kickoff_str = kickoff_dt.strftime("%d/%m %H:%M")
-
-            odds1 = round(random.uniform(1.55, 2.10), 2)
-            odds2 = round(random.uniform(1.80, 3.20), 2)
-
-            matches.append({
-                "name":       f"{p1} vs {p2}",
-                "player1":    p1,
-                "player2":    p2,
-                "kickoff":    kickoff_str,
-                "tournament": random.choice(tournaments_reliable),
-                "status":     "scheduled",
-                "odds_home":  odds1,
-                "odds_away":  odds2,
-                "source":     "fallback",
-            })
+                    if resp.status == 200:
+                        events = await resp.json()
+                        logger.info(f"Odds API: {len(events)} eventi ricevuti")
+                        for ev in events:
+                            parsed = self._parse_event(ev)
+                            if parsed:
+                                matches.append(parsed)
+                    elif resp.status == 401:
+                        logger.error("Odds API: chiave non valida (401)")
+                    elif resp.status == 422:
+                        logger.warning("Odds API: sport non disponibile oggi (422)")
+                    else:
+                        txt = await resp.text()
+                        logger.warning(f"Odds API status {resp.status}: {txt[:120]}")
+            except Exception as e:
+                logger.error(f"Odds API errore connessione: {e}")
 
         return matches
+
+    def _parse_event(self, ev: dict) -> dict | None:
+        try:
+            commence = ev.get("commence_time", "")
+            kickoff  = _iso_to_it(commence)
+            sport    = ev.get("sport_title", "Table Tennis")
+
+            # Estrai le MIGLIORI quote disponibili fra tutti i bookmaker
+            best_h2h: dict[str, float] = {}
+            over_odds, under_odds, totals_line = None, None, 3.5
+            bookmakers_used = []
+
+            for bm in ev.get("bookmakers", []):
+                bookmakers_used.append(bm.get("key", ""))
+                for market in bm.get("markets", []):
+                    if market["key"] == "h2h":
+                        for o in market.get("outcomes", []):
+                            name  = o["name"]
+                            price = float(o["price"])
+                            if name not in best_h2h or price > best_h2h[name]:
+                                best_h2h[name] = price
+
+                    elif market["key"] == "totals":
+                        for o in market.get("outcomes", []):
+                            price = float(o["price"])
+                            point = float(o.get("point", 3.5))
+                            if o["name"] == "Over":
+                                if over_odds is None or price > over_odds:
+                                    over_odds  = price
+                                    totals_line = point
+                            elif o["name"] == "Under":
+                                if under_odds is None or price > under_odds:
+                                    under_odds = price
+
+            if len(best_h2h) < 2:
+                return None
+
+            players = list(best_h2h.keys())
+            p1, p2  = players[0], players[1]
+
+            return {
+                "name":         f"{p1} vs {p2}",
+                "player1":      p1,
+                "player2":      p2,
+                "kickoff":      kickoff,
+                "tournament":   sport,
+                "status":       "scheduled",
+                "odds_home":    round(best_h2h[p1], 3),
+                "odds_away":    round(best_h2h[p2], 3),
+                "over_odds":    round(over_odds,  3) if over_odds  else None,
+                "under_odds":   round(under_odds, 3) if under_odds else None,
+                "totals_line":  totals_line,
+                "bookmakers":   bookmakers_used[:5],   # solo per debug/log
+                "source":       "odds_api",
+            }
+        except Exception as e:
+            logger.debug(f"Parse event error: {e}")
+            return None
+
+    # ── Fallback interno ──────────────────────────────────────────────────────
+    def get_fallback_matches(self) -> list[dict]:
+        """
+        Usato solo se The Odds API non è configurata o non risponde.
+        Quote stimate — NON usare per piazzare scommesse reali.
+        """
+        players = [
+            ("Fan Zhendong",       "Wang Chuqin"),
+            ("Ma Long",            "Truls Moregard"),
+            ("Lin Gaoyuan",        "Felix Lebrun"),
+            ("Timo Boll",          "Patrick Franziska"),
+            ("Tomokazu Harimoto",  "Hugo Calderano"),
+            ("Quadri Aruna",       "Benedikt Duda"),
+            ("Wong Chun Ting",     "Mattias Falck"),
+            ("Dimitrij Ovtcharov", "Simon Gauzy"),
+        ]
+        tournaments = [
+            "WTT Champions", "WTT Star Contender",
+            "WTT Grand Smash", "World Championships",
+        ]
+        now_it = _now_it()
+        random.shuffle(players)
+        matches = []
+        for p1, p2 in players[:6]:
+            kickoff_dt = now_it + timedelta(hours=random.randint(1, 20))
+            o1 = round(random.uniform(1.50, 2.10), 2)
+            o2 = round(random.uniform(1.80, 3.20), 2)
+            matches.append({
+                "name":        f"{p1} vs {p2}",
+                "player1":     p1,
+                "player2":     p2,
+                "kickoff":     kickoff_dt.strftime("%d/%m %H:%M"),
+                "tournament":  random.choice(tournaments),
+                "status":      "scheduled",
+                "odds_home":   o1,
+                "odds_away":   o2,
+                "over_odds":   round(random.uniform(1.65, 2.05), 2),
+                "under_odds":  round(random.uniform(1.60, 1.95), 2),
+                "totals_line": 3.5,
+                "bookmakers":  [],
+                "source":      "fallback",
+            })
+        return matches
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+    def _sort(self, matches: list[dict]) -> list[dict]:
+        """Deduplica e ordina per kickoff crescente (più vicino prima)."""
+        seen, unique = set(), []
+        for m in matches:
+            if m["name"] not in seen:
+                seen.add(m["name"])
+                unique.append(m)
+        def key(m):
+            try:
+                return datetime.strptime(m["kickoff"], "%d/%m %H:%M")
+            except Exception:
+                return datetime.max
+        unique.sort(key=key)
+        return unique

@@ -1,6 +1,5 @@
 import sqlite3
 import os
-import json
 from datetime import datetime
 from typing import Optional
 
@@ -30,6 +29,8 @@ class Database:
                 value_pct    REAL,
                 stake        INTEGER,
                 reasoning    TEXT,
+                book_note    TEXT,
+                source       TEXT DEFAULT 'n/d',
                 status       TEXT DEFAULT 'pending',
                 result       TEXT,
                 created_at   TEXT
@@ -41,7 +42,17 @@ class Database:
             );
         """)
 
-        # Default settings
+        # Aggiungi colonne mancanti se il DB esiste già (upgrade sicuro)
+        for col, definition in [
+            ("book_note", "TEXT"),
+            ("source",    "TEXT DEFAULT 'n/d'"),
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {definition}")
+                self.conn.commit()
+            except Exception:
+                pass  # colonna già esistente
+
         defaults = {
             "scan_interval":  "1",
             "auto_send":      "0",
@@ -59,14 +70,17 @@ class Database:
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO signals
                (match_key, match, player1, player2, tournament, kickoff,
-                signal_type, pick, odds, confidence, value_pct, stake, reasoning, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                signal_type, pick, odds, confidence, value_pct, stake,
+                reasoning, book_note, source, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 s["match_key"], s["match"], s["player1"], s["player2"],
-                s.get("tournament",""), s["kickoff"],
+                s.get("tournament", ""), s["kickoff"],
                 s["signal_type"], s["pick"], s["odds"],
                 s["confidence"], s["value_pct"], s["stake"],
-                s.get("reasoning",""), s.get("created_at", datetime.utcnow().isoformat())
+                s.get("reasoning", ""), s.get("book_note", ""),
+                s.get("source", "n/d"),
+                s.get("created_at", datetime.utcnow().isoformat()),
             )
         )
         self.conn.commit()
@@ -90,6 +104,22 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_recent_signals(self, limit: int = 20) -> list[dict]:
+        """Ultimi N segnali ordinati per kickoff crescente (più vicino prima)."""
+        rows = self.conn.execute(
+            """SELECT * FROM signals
+               ORDER BY
+                 CASE
+                   WHEN substr(kickoff,7,2)||substr(kickoff,4,2)||substr(kickoff,1,2) >= ''
+                   THEN kickoff
+                   ELSE '99'
+                 END ASC,
+                 id DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def update_signal_status(self, sig_id: int, status: str, result: str = None):
         self.conn.execute(
             "UPDATE signals SET status=?, result=? WHERE id=?",
@@ -98,6 +128,7 @@ class Database:
         self.conn.commit()
 
     def get_stats(self) -> dict:
+        total     = self.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
         sent      = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='sent'").fetchone()[0]
         pending   = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='pending'").fetchone()[0]
         discarded = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='discarded'").fetchone()[0]
@@ -107,10 +138,7 @@ class Database:
         total_results = won + lost
         winrate = round(won / total_results * 100, 1) if total_results > 0 else 0
 
-        # ROI semplificato
-        roi_rows = self.conn.execute(
-            "SELECT odds, stake FROM signals WHERE result='won'"
-        ).fetchall()
+        roi_rows         = self.conn.execute("SELECT odds, stake FROM signals WHERE result='won'").fetchall()
         total_won_profit = sum((r["odds"] - 1) * r["stake"] for r in roi_rows)
         total_stake_all  = self.conn.execute(
             "SELECT COALESCE(SUM(stake),0) FROM signals WHERE result IN ('won','lost')"
@@ -118,9 +146,12 @@ class Database:
         roi = round(total_won_profit / total_stake_all * 100, 1) if total_stake_all > 0 else 0
 
         return {
+            "total":     total,
             "sent_vip":  sent,
             "pending":   pending,
             "discarded": discarded,
+            "won":       won,
+            "lost":      lost,
             "winrate":   winrate,
             "roi":       roi,
             "last_scan": self.get_settings()["last_scan"],
