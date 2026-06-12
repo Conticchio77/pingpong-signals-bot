@@ -262,8 +262,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data="toggle_autosend"
             )],
             [InlineKeyboardButton(
-                f"🎯 Min confidenza: {settings['min_confidence']}%",
-                callback_data="noop"
+                f"🎯 Min confidenza: {settings['min_confidence']}%  → cambia",
+                callback_data="toggle_confidence"
             )],
             [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
         ]
@@ -299,6 +299,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(
             f"⏱ Intervallo scan impostato: ogni *{next_i} ore*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data == "toggle_confidence":
+        opts    = [55, 60, 65, 70, 75, 80]
+        current = db.get_settings()["min_confidence"]
+        nxt     = opts[(opts.index(current) + 1) % len(opts)] if current in opts else 60
+        db.set_setting("min_confidence", nxt)
+        settings = db.get_settings()
+        kb = [
+            [InlineKeyboardButton(f"⏱ Scan ogni {settings['scan_interval']}h → cambia", callback_data="toggle_interval")],
+            [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
+            [InlineKeyboardButton(f"🎯 Min confidenza: {nxt}%  → cambia", callback_data="toggle_confidence")],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ]
+        await query.edit_message_text(
+            f"⚙️ *Impostazioni*\n\n🎯 Confidenza minima impostata: *{nxt}%*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
