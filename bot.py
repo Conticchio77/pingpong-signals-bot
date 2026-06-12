@@ -1,12 +1,17 @@
 import os
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import datetime
+from zoneinfo import ZoneInfo
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes
+    MessageHandler, filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
 from scraper import SignalScraper
 from ai_analyzer import AIAnalyzer
 from database import Database
@@ -17,27 +22,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────────
+ROME         = ZoneInfo("Europe/Rome")
 TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
 VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
+ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
 db       = Database()
 scraper  = SignalScraper()
 analyzer = AIAnalyzer()
 
+# ── Tastiera persistente (sempre visibile in basso) ──────────────────────────────
+PERSISTENT_KB = ReplyKeyboardMarkup(
+    [["🔍 Scan", "📋 Segnali", "📊 Stats", "⚙️ Impostazioni"]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 def signal_text(s: dict, for_vip: bool = False) -> str:
-    type_icons = {
-        "winner":   "🏆",
-        "over":     "📈",
-        "under":    "📉",
-        "handicap": "⚖️",
-        "set":      "🎯",
-    }
-    icon = type_icons.get(s["signal_type"], "🏓")
-    stars = "⭐" * min(5, max(1, round(s["confidence"] / 20)))
-    value_str = f"+{s['value_pct']:.1f}%" if s["value_pct"] > 0 else f"{s['value_pct']:.1f}%"
+    icons  = {"winner": "🏆", "over": "📈", "under": "📉", "handicap": "⚖️", "set": "🎯"}
+    icon   = icons.get(s["signal_type"], "🏓")
+    stars  = "⭐" * min(5, max(1, round(s["confidence"] / 20)))
+    vsign  = f"+{s['value_pct']:.1f}%" if s["value_pct"] > 0 else f"{s['value_pct']:.1f}%"
+    src    = "📡 Quote reali" if s.get("source") == "odds_api" else "⚠️ Quote stimate"
 
     text = (
         f"🏓 *SEGNALE PING PONG*\n"
@@ -46,154 +54,202 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         f"🎯 Giocata: *{s['pick']}*\n"
         f"💰 Quota: *{s['odds']}*\n"
         f"📊 Confidenza: *{s['confidence']}%* {stars}\n"
-        f"💡 Value edge: *{value_str}*\n"
+        f"💡 Value edge: *{vsign}*\n"
         f"📌 Stake: *{s['stake']}/5*\n"
         f"⏰ Inizio: *{s['kickoff']}*\n"
         f"🌍 Torneo: {s.get('tournament', 'Ping Pong')}\n"
+        f"🔗 Fonte: {src}\n"
     )
     if not for_vip:
-        text += f"\n📝 _{s.get('reasoning', '')}_"
+        reasoning = s.get("reasoning", "")
+        book_note = s.get("book_note", "")
+        if reasoning:
+            text += f"\n📝 _{reasoning}_"
+        if book_note:
+            text += f"\n🔎 _{book_note}_"
     return text
-
 
 def vip_signal_text(s: dict) -> str:
     return signal_text(s, for_vip=True)
 
+def now_it_str() -> str:
+    return datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
+
+def admin_panel_text() -> str:
+    s       = db.get_settings()
+    stats   = db.get_stats()
+    src_tag = "📡 The Odds API (quote reali)" if ODDS_KEY else "⚠️ Fallback (quote stimate — imposta ODDS_API_KEY)"
+    return (
+        f"🏓 *PingPong Signals — Admin Panel*\n"
+        f"{'━' * 26}\n"
+        f"🕐 Ora: {now_it_str()}\n"
+        f"🔗 Fonte: {src_tag}\n\n"
+        f"📨 Segnali oggi: *{stats['total']}* | ⏳ Pendenti: *{stats['pending']}*\n"
+        f"✅ Vinti: *{stats['won']}* | ❌ Persi: *{stats['lost']}* | 🏆 Win%: *{stats['winrate']}%*\n"
+        f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
+        f"⚙️ Scan ogni *{s['scan_interval']}h* | "
+        f"Confidenza min: *{s['min_confidence']}%* | "
+        f"Auto-VIP: *{'✅' if s['auto_send'] else '❌'}*"
+    )
+
+def admin_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Cerca segnali ora", callback_data="admin_scan"),
+         InlineKeyboardButton("📋 Segnali",           callback_data="admin_list")],
+        [InlineKeyboardButton("📊 Statistiche",       callback_data="admin_stats"),
+         InlineKeyboardButton("⚙️ Impostazioni",      callback_data="admin_settings")],
+    ])
 
 # ── /start ──────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid == ADMIN_ID:
-        kb = [
-            [InlineKeyboardButton("🔍 Cerca segnali ora", callback_data="admin_scan")],
-            [InlineKeyboardButton("📋 Segnali pendenti", callback_data="admin_pending")],
-            [InlineKeyboardButton("📊 Statistiche", callback_data="admin_stats")],
-            [InlineKeyboardButton("⚙️ Impostazioni", callback_data="admin_settings")],
-        ]
-        await update.message.reply_text(
-            "👋 *Admin Panel — PingPong Signals*\n\n"
-            "Il bot cerca segnali automaticamente ogni ora.\n"
-            "Usa i tasti per gestire i segnali.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-    else:
-        await update.message.reply_text(
-            "🏓 *PingPong Signals Bot*\n\nQuesto bot è riservato agli admin.",
-            parse_mode="Markdown"
-        )
-
-
-# ── /status ──────────────────────────────────────────────────────────────────────
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("🏓 Bot riservato.")
         return
-    stats = db.get_stats()
     await update.message.reply_text(
-        f"📊 *Statistiche Bot*\n\n"
-        f"✅ Segnali inviati al VIP: *{stats['sent_vip']}*\n"
-        f"⏳ Segnali pendenti: *{stats['pending']}*\n"
-        f"🏆 Win rate: *{stats['winrate']}%*\n"
-        f"💰 ROI medio: *{stats['roi']}%*\n"
-        f"🔄 Ultimo scan: *{stats['last_scan']}*",
-        parse_mode="Markdown"
+        "🏓 Pannello sempre disponibile qui sotto 👇",
+        reply_markup=PERSISTENT_KB
+    )
+    await update.message.reply_text(
+        admin_panel_text(),
+        parse_mode="Markdown",
+        reply_markup=admin_panel_kb()
     )
 
+# ── Tastiera persistente → gestisce tasti fissi in basso ─────────────────────────
+async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    txt = update.message.text
+
+    if txt == "🔍 Scan":
+        msg = await update.message.reply_text("🔍 Scansione in corso...")
+        count = await run_signal_scan(context.application)
+        await msg.edit_text(f"✅ Scan completato! Nuovi segnali: *{count}*", parse_mode="Markdown")
+        await update.message.reply_text(admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb())
+
+    elif txt == "📋 Segnali":
+        await send_signals_list(update.message.reply_text)
+
+    elif txt == "📊 Stats":
+        await send_stats(update.message.reply_text)
+
+    elif txt == "⚙️ Impostazioni":
+        await send_settings(update.message.reply_text)
+
+# ── Funzioni pannello ────────────────────────────────────────────────────────────
+async def send_signals_list(fn):
+    signals = db.get_recent_signals(20)
+    if not signals:
+        await fn("📭 Nessun segnale ancora.")
+        return
+    status_icon = {"pending": "🆕", "seen": "👁", "sent": "📤",
+                   "discarded": "🗑", "won": "✅", "lost": "❌"}
+    src_icon    = {"odds_api": "📡", "fallback": "⚠️"}
+    kb = []
+    for s in signals:
+        si   = status_icon.get(s["status"], "•")
+        srci = src_icon.get(s.get("source", ""), "")
+        label = f"{si}{srci} {s['kickoff']} {s['match'][:16]} @{s['odds']}"
+        kb.append([InlineKeyboardButton(label, callback_data=f"view_signal_{s['id']}")])
+    await fn(
+        f"📋 *Segnali ({len(signals)}) — dal più vicino:*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def send_stats(fn):
+    stats = db.get_stats()
+    kb = [
+        [InlineKeyboardButton("🗑 Reset statistiche", callback_data="confirm_reset_stats")],
+        [InlineKeyboardButton("🔙 Home",              callback_data="admin_home")],
+    ]
+    await fn(
+        f"📊 *Statistiche*\n\n"
+        f"📨 Totali: *{stats['total']}*\n"
+        f"📤 Inviati VIP: *{stats['sent_vip']}*\n"
+        f"⏳ Pendenti: *{stats['pending']}*\n"
+        f"🗑 Scartati: *{stats['discarded']}*\n"
+        f"✅ Vinti: *{stats['won']}*\n"
+        f"❌ Persi: *{stats['lost']}*\n"
+        f"🏆 Win rate: *{stats['winrate']}%*\n"
+        f"💰 ROI: *{stats['roi']}%*\n"
+        f"🔄 Ultimo scan: *{stats['last_scan']}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def send_settings(fn):
+    s = db.get_settings()
+    conf = s['min_confidence']
+    # Descrizione leggibile della confidenza
+    conf_desc = {55: "Bassa (55%)", 60: "Media (60%)", 65: "Media-Alta (65%)",
+                 70: "Alta (70%)", 75: "Molto Alta (75%)", 80: "Massima (80%)"}
+    conf_label = conf_desc.get(conf, f"{conf}%")
+
+    kb = [
+        [InlineKeyboardButton(f"⏱ Scan: ogni {s['scan_interval']}h", callback_data="pick_interval")],
+        [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
+        [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
+        [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+    ]
+    await fn(
+        "⚙️ *Impostazioni*\n\n"
+        "Tocca un'opzione per modificarla:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 # ── CALLBACK HANDLER ─────────────────────────────────────────────────────────────
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid   = update.effective_user.id
-    data  = query.data
-
-    if uid != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         await query.edit_message_text("⛔ Non autorizzato.")
         return
+    data = query.data
 
-    # ── Admin home ──────────────────────────────────────────────────────────────
+    # ── Home ─────────────────────────────────────────────────────────────────────
     if data == "admin_home":
-        kb = [
-            [InlineKeyboardButton("🔍 Cerca segnali ora", callback_data="admin_scan")],
-            [InlineKeyboardButton("📋 Segnali pendenti", callback_data="admin_pending")],
-            [InlineKeyboardButton("📊 Statistiche",      callback_data="admin_stats")],
-            [InlineKeyboardButton("⚙️ Impostazioni",     callback_data="admin_settings")],
-        ]
         await query.edit_message_text(
-            "👋 *Admin Panel — PingPong Signals*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
+            admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb()
         )
 
-    # ── Scan manuale ────────────────────────────────────────────────────────────
+    # ── Scan ─────────────────────────────────────────────────────────────────────
     elif data == "admin_scan":
         await query.edit_message_text("🔍 Scansione in corso... attendere.")
         count = await run_signal_scan(context.application)
-        kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
         await query.edit_message_text(
-            f"✅ Scan completato!\n🆕 Nuovi segnali trovati: *{count}*",
+            f"✅ Scan completato!\n🆕 Nuovi segnali: *{count}*",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
         )
 
-    # ── Segnali pendenti ────────────────────────────────────────────────────────
-    elif data == "admin_pending":
-        signals = db.get_pending_signals()
-        if not signals:
-            kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
-            await query.edit_message_text(
-                "📭 Nessun segnale pendente.",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            return
-        # Show first pending signal
-        s = signals[0]
-        text = signal_text(s)
-        kb = [
-            [
-                InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{s['id']}"),
-                InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{s['id']}"),
-            ],
-            [InlineKeyboardButton(f"📋 Altri pendenti: {len(signals)-1}", callback_data="admin_pending_list")],
-            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
-        ]
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    # ── Lista segnali ─────────────────────────────────────────────────────────────
+    elif data == "admin_list":
+        await send_signals_list(query.edit_message_text)
 
-    # ── Lista pendenti ──────────────────────────────────────────────────────────
-    elif data == "admin_pending_list":
-        signals = db.get_pending_signals()
-        if not signals:
-            await query.edit_message_text("📭 Nessun segnale pendente.")
-            return
-        kb = []
-        for s in signals[:10]:
-            label = f"🏓 {s['match'][:25]} | {s['pick'][:15]} | x{s['odds']}"
-            kb.append([InlineKeyboardButton(label, callback_data=f"view_signal_{s['id']}")])
-        kb.append([InlineKeyboardButton("🔙 Home", callback_data="admin_home")])
-        await query.edit_message_text(
-            f"📋 *Segnali pendenti ({len(signals)}):*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-    # ── Visualizza singolo segnale ──────────────────────────────────────────────
+    # ── Singolo segnale ──────────────────────────────────────────────────────────
     elif data.startswith("view_signal_"):
         sig_id = int(data.split("_")[-1])
         s = db.get_signal(sig_id)
         if not s:
             await query.edit_message_text("❌ Segnale non trovato.")
             return
-        text = signal_text(s)
-        kb = [
-            [
+        db.update_signal_status(sig_id, "seen")
+        kb = []
+        if s["status"] not in ("won", "lost", "sent"):
+            kb.append([
                 InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
                 InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
-            ],
-            [InlineKeyboardButton("🔙 Lista", callback_data="admin_pending_list")],
-        ]
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+            ])
+        kb.append([
+            InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
+            InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
+        ])
+        kb.append([InlineKeyboardButton("🔙 Lista", callback_data="admin_list")])
+        await query.edit_message_text(signal_text(s), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    # ── Invia al VIP ────────────────────────────────────────────────────────────
+    # ── Invia VIP ────────────────────────────────────────────────────────────────
     elif data.startswith("send_vip_"):
         sig_id = int(data.split("_")[-1])
         s = db.get_signal(sig_id)
@@ -202,131 +258,153 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             await context.application.bot.send_message(
-                chat_id=VIP_GROUP_ID,
-                text=vip_signal_text(s),
-                parse_mode="Markdown"
+                chat_id=VIP_GROUP_ID, text=vip_signal_text(s), parse_mode="Markdown"
             )
             db.update_signal_status(sig_id, "sent")
-            kb = [
-                [InlineKeyboardButton("📋 Altri segnali", callback_data="admin_pending")],
-                [InlineKeyboardButton("🔙 Home",          callback_data="admin_home")],
-            ]
+            kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
+                   InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
             await query.edit_message_text(
-                f"✅ *Segnale inviato al canale VIP!*\n\n{vip_signal_text(s)}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb)
+                f"✅ Inviato al VIP!\n\n{vip_signal_text(s)}",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
             )
         except Exception as e:
-            logger.error(f"Errore invio VIP: {e}")
-            await query.edit_message_text(f"❌ Errore invio: {e}")
+            await query.edit_message_text(f"❌ Errore invio VIP: {e}")
 
-    # ── Scarta segnale ──────────────────────────────────────────────────────────
+    # ── Scarta ───────────────────────────────────────────────────────────────────
     elif data.startswith("discard_"):
         sig_id = int(data.split("_")[-1])
         db.update_signal_status(sig_id, "discarded")
+        await query.edit_message_text(
+            "🗑 Scartato.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Lista", callback_data="admin_list")]])
+        )
+
+    # ── Risultato vinto/perso ────────────────────────────────────────────────────
+    elif data.startswith("result_"):
+        parts  = data.split("_")
+        sig_id, result = int(parts[1]), parts[2]
+        db.update_signal_status(sig_id, result, result)
+        emoji = "✅ Segnato come VINTO!" if result == "won" else "❌ Segnato come PERSO."
+        await query.edit_message_text(
+            emoji,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Lista", callback_data="admin_list")]])
+        )
+
+    # ── Statistiche ──────────────────────────────────────────────────────────────
+    elif data == "admin_stats":
+        await send_stats(query.edit_message_text)
+
+    # ── Reset stats — chiedi conferma ────────────────────────────────────────────
+    elif data == "confirm_reset_stats":
         kb = [
-            [InlineKeyboardButton("📋 Altri segnali", callback_data="admin_pending")],
-            [InlineKeyboardButton("🔙 Home",          callback_data="admin_home")],
+            [InlineKeyboardButton("⚠️ SÌ, resetta tutto", callback_data="do_reset_stats")],
+            [InlineKeyboardButton("❌ Annulla",            callback_data="admin_stats")],
         ]
         await query.edit_message_text(
-            "🗑 Segnale scartato.",
+            "⚠️ *Sei sicuro?*\n\nVerranno azzerati tutti i risultati (vinti/persi).\nI segnali rimarranno in lista.",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    # ── Statistiche ─────────────────────────────────────────────────────────────
-    elif data == "admin_stats":
-        stats = db.get_stats()
-        kb = [[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]
+    elif data == "do_reset_stats":
+        db.reset_results()
         await query.edit_message_text(
-            f"📊 *Statistiche*\n\n"
-            f"✅ Inviati al VIP: *{stats['sent_vip']}*\n"
-            f"⏳ Pendenti: *{stats['pending']}*\n"
-            f"🗑 Scartati: *{stats['discarded']}*\n"
-            f"🏆 Win rate: *{stats['winrate']}%*\n"
-            f"💰 ROI medio: *{stats['roi']}%*\n"
-            f"🔄 Ultimo scan: *{stats['last_scan']}*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
+            "✅ Statistiche resettate.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
         )
 
     # ── Impostazioni ─────────────────────────────────────────────────────────────
     elif data == "admin_settings":
-        settings = db.get_settings()
-        kb = [
-            [InlineKeyboardButton(
-                f"⏱ Scan ogni {settings['scan_interval']}h → cambia",
-                callback_data="toggle_interval"
-            )],
-            [InlineKeyboardButton(
-                f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}",
-                callback_data="toggle_autosend"
-            )],
-            [InlineKeyboardButton(
-                f"🎯 Min confidenza: {settings['min_confidence']}%  → cambia",
-                callback_data="toggle_confidence"
-            )],
-            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
-        ]
-        await query.edit_message_text(
-            "⚙️ *Impostazioni*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await send_settings(query.edit_message_text)
 
     elif data == "toggle_autosend":
         db.toggle_setting("auto_send")
-        settings = db.get_settings()
-        kb = [
-            [InlineKeyboardButton(
-                f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}",
-                callback_data="toggle_autosend"
-            )],
-            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
-        ]
-        await query.edit_message_text(
-            f"⚙️ Auto-invio VIP: {'✅ Attivato' if settings['auto_send'] else '❌ Disattivato'}",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await send_settings(query.edit_message_text)
 
-    elif data == "toggle_interval":
-        intervals = [1, 2, 4, 6, 12]
+    # ── Scegli intervallo scan (picker visuale) ───────────────────────────────────
+    elif data == "pick_interval":
         current = db.get_settings()["scan_interval"]
-        next_i  = intervals[(intervals.index(current) + 1) % len(intervals)] if current in intervals else 1
-        db.set_setting("scan_interval", next_i)
-        kb = [
-            [InlineKeyboardButton(f"⏱ Scan ogni {next_i}h → cambia", callback_data="toggle_interval")],
-            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
-        ]
+        opts    = [1, 2, 4, 6, 12]
+        kb = []
+        row = []
+        for o in opts:
+            label = f"✅ {o}h" if o == current else f"{o}h"
+            row.append(InlineKeyboardButton(label, callback_data=f"set_interval_{o}"))
+        kb.append(row)
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(
-            f"⏱ Intervallo scan impostato: ogni *{next_i} ore*",
+            f"⏱ *Seleziona ogni quante ore fare lo scan*\n(attuale: ogni {current}h):",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif data == "toggle_confidence":
-        opts    = [55, 60, 65, 70, 75, 80]
+    elif data.startswith("set_interval_"):
+        nxt = int(data.split("_")[-1])
+        db.set_setting("scan_interval", nxt)
+        _restart_scheduler(context.application, nxt)
+        await send_settings(query.edit_message_text)
+
+    # ── Scegli confidenza (picker visuale con descrizioni) ────────────────────────
+    elif data == "pick_confidence":
         current = db.get_settings()["min_confidence"]
-        nxt     = opts[(opts.index(current) + 1) % len(opts)] if current in opts else 60
-        db.set_setting("min_confidence", nxt)
-        settings = db.get_settings()
-        kb = [
-            [InlineKeyboardButton(f"⏱ Scan ogni {settings['scan_interval']}h → cambia", callback_data="toggle_interval")],
-            [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if settings['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
-            [InlineKeyboardButton(f"🎯 Min confidenza: {nxt}%  → cambia", callback_data="toggle_confidence")],
-            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        opts = [
+            (55, "55% — Bassa\n(più segnali, meno precisi)"),
+            (60, "60% — Media\n(bilanciato ✓)"),
+            (65, "65% — Media-Alta"),
+            (70, "70% — Alta"),
+            (75, "75% — Molto Alta"),
+            (80, "80% — Massima\n(pochi segnali, più precisi)"),
         ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if val == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_conf_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(
-            f"⚙️ *Impostazioni*\n\n🎯 Confidenza minima impostata: *{nxt}%*",
+            "🎯 *Seleziona la confidenza minima dei segnali:*\n\n"
+            "Più alta = meno segnali ma più affidabili\n"
+            "Più bassa = più segnali ma meno selezionati",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
+    elif data.startswith("set_conf_"):
+        nxt = int(data.split("_")[-1])
+        db.set_setting("min_confidence", nxt)
+        await send_settings(query.edit_message_text)
 
-# ── CORE: scan automatico ────────────────────────────────────────────────────────
+
+# ── Scheduler ────────────────────────────────────────────────────────────────────
+_scheduler: AsyncIOScheduler | None = None
+
+def _restart_scheduler(app: Application, hours: int):
+    global _scheduler
+    if _scheduler:
+        _scheduler.add_job(
+            lambda: asyncio.ensure_future(run_signal_scan(app)),
+            trigger=IntervalTrigger(hours=hours),
+            id="signal_scan", replace_existing=True,
+        )
+        logger.info(f"⏰ Scheduler aggiornato: ogni {hours}h")
+
+async def post_init(app: Application):
+    global _scheduler
+    hours     = db.get_settings()["scan_interval"]
+    _scheduler = AsyncIOScheduler(timezone=ROME)
+    _scheduler.add_job(
+        lambda: asyncio.ensure_future(run_signal_scan(app)),
+        trigger=IntervalTrigger(hours=hours),
+        id="signal_scan",
+    )
+    _scheduler.start()
+    logger.info(f"⏰ Scheduler avviato — ogni {hours}h (ora IT)")
+    await asyncio.sleep(3)
+    await run_signal_scan(app)
+
+# ── Core scan ────────────────────────────────────────────────────────────────────
 async def run_signal_scan(app: Application) -> int:
-    """Scrape matches, analyze with AI, store new signals. Returns count of new signals."""
-    logger.info("🔍 Avvio scan segnali...")
-    db.set_setting("last_scan", __import__("datetime").datetime.now().strftime("%d/%m %H:%M"))
+    logger.info("🔍 Avvio scan...")
+    db.set_setting("last_scan", now_it_str())
 
     try:
         matches = await scraper.fetch_matches()
@@ -334,12 +412,17 @@ async def run_signal_scan(app: Application) -> int:
         logger.error(f"Errore scraping: {e}")
         matches = scraper.get_fallback_matches()
 
+    # Log fonte dati
+    sources = set(m.get("source", "?") for m in matches)
+    logger.info(f"Fonte dati: {sources} — {len(matches)} partite")
+
     new_signals = 0
     settings    = db.get_settings()
 
     for match in matches:
         try:
             signals = await analyzer.analyze(match)
+            signals.sort(key=lambda x: x["value_pct"], reverse=True)
             for sig in signals:
                 if sig["confidence"] < settings["min_confidence"]:
                     continue
@@ -348,56 +431,32 @@ async def run_signal_scan(app: Application) -> int:
                 sig_id = db.save_signal(sig)
                 new_signals += 1
 
-                # Notifica admin
-                text = signal_text(sig)
-                kb = [
-                    [
-                        InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
-                        InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
-                    ]
-                ]
+                kb = [[
+                    InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
+                    InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
+                ],[
+                    InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
+                    InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
+                ]]
                 await app.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"🆕 *Nuovo segnale trovato!*\n\n{text}",
+                    text=f"🆕 *Nuovo segnale!*\n\n{signal_text(sig)}",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
-
-                # Auto-invio al VIP se attivato
                 if settings["auto_send"]:
                     await app.bot.send_message(
-                        chat_id=VIP_GROUP_ID,
-                        text=vip_signal_text(sig),
-                        parse_mode="Markdown"
+                        chat_id=VIP_GROUP_ID, text=vip_signal_text(sig), parse_mode="Markdown"
                     )
                     db.update_signal_status(sig_id, "sent")
 
         except Exception as e:
-            logger.error(f"Errore analisi match {match.get('name','?')}: {e}")
-            continue
+            logger.error(f"Errore analisi {match.get('name','?')}: {e}")
 
-    logger.info(f"✅ Scan completato: {new_signals} nuovi segnali")
+    logger.info(f"✅ {new_signals} nuovi segnali")
     return new_signals
 
-
-# ── SCHEDULER ────────────────────────────────────────────────────────────────────
-async def post_init(app: Application):
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        lambda: asyncio.ensure_future(run_signal_scan(app)),
-        trigger="interval",
-        hours=1,
-        id="signal_scan"
-    )
-    scheduler.start()
-    logger.info("⏰ Scheduler avviato — scan ogni ora")
-
-    # Scan iniziale al boot
-    await asyncio.sleep(5)
-    await run_signal_scan(app)
-
-
-# ── MAIN ─────────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────────
 def main():
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN non impostato!")
@@ -408,14 +467,12 @@ def main():
         .post_init(post_init)
         .build()
     )
-
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kb_handler))
 
-    logger.info("🏓 PingPong Signals Bot avviato")
+    logger.info("🏓 Bot avviato")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()

@@ -157,6 +157,19 @@ class Database:
             "last_scan": self.get_settings()["last_scan"],
         }
 
+    def reset_results(self):
+        """Azzera tutti i risultati (vinto/perso) senza cancellare i segnali."""
+        self.conn.execute("UPDATE signals SET result=NULL WHERE result IN ('won','lost')")
+        self.conn.execute("UPDATE signals SET status='seen' WHERE status IN ('won','lost')")
+        self.conn.commit()
+
+    def get_recent_signals(self, limit: int = 20) -> list[dict]:
+        """Ultimi N segnali ordinati per kickoff crescente (più vicino prima)."""
+        rows = self.conn.execute(
+            "SELECT * FROM signals ORDER BY kickoff ASC, id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Settings ───────────────────────────────────────────────────────────────
     def get_settings(self) -> dict:
         rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
