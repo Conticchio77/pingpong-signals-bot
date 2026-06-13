@@ -34,7 +34,11 @@ analyzer = AIAnalyzer()
 
 # ── Tastiera persistente (sempre visibile in basso) ──────────────────────────────
 PERSISTENT_KB = ReplyKeyboardMarkup(
-    [["🔍 Scan", "📋 Segnali", "📊 Stats", "⚙️ Impostazioni"]],
+    [
+        ["🔍 Scan",  "📋 Segnali"],
+        ["📊 Stats", "⚙️ Impostazioni"],
+        ["🏠 Home"],
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -100,15 +104,25 @@ def admin_panel_kb():
          InlineKeyboardButton("⚙️ Impostazioni",      callback_data="admin_settings")],
     ])
 
-# ── /start ──────────────────────────────────────────────────────────────────────
+# ── /start e /menu ──────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("🏓 Bot riservato.")
         return
     await update.message.reply_text(
-        "🏓 Pannello sempre disponibile qui sotto 👇",
+        "🏓 Usa i tasti qui sotto per navigare:",
         reply_markup=PERSISTENT_KB
     )
+    await update.message.reply_text(
+        admin_panel_text(),
+        parse_mode="Markdown",
+        reply_markup=admin_panel_kb()
+    )
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias /menu — riporta sempre al pannello principale."""
+    if update.effective_user.id != ADMIN_ID:
+        return
     await update.message.reply_text(
         admin_panel_text(),
         parse_mode="Markdown",
@@ -135,6 +149,11 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif txt == "⚙️ Impostazioni":
         await send_settings(update.message.reply_text)
+
+    elif txt == "🏠 Home":
+        await update.message.reply_text(
+            admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb()
+        )
 
 # ── Funzioni pannello ────────────────────────────────────────────────────────────
 async def send_signals_list(fn):
@@ -599,6 +618,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu",  menu))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kb_handler))
 
