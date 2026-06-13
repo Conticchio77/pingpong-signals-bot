@@ -40,7 +40,6 @@ PERSISTENT_KB = ReplyKeyboardMarkup(
         ["🏠 Home"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
