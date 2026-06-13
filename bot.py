@@ -142,17 +142,24 @@ async def send_signals_list(fn):
     if not signals:
         await fn("📭 Nessun segnale ancora.")
         return
-    status_icon = {"pending": "🆕", "seen": "👁", "sent": "📤",
-                   "discarded": "🗑", "won": "✅", "lost": "❌"}
-    src_icon    = {"odds_api": "📡", "fallback": "⚠️"}
+    status_icon = {
+        "pending":   "🆕",   # nuovo, non ancora aperto
+        "seen":      "👁",    # aperto ma senza risultato
+        "sent":      "📤",   # inviato al VIP
+        "discarded": "🗑",   # scartato
+        "won":       "✅",   # vinto
+        "lost":      "❌",   # perso
+    }
     kb = []
     for s in signals:
-        si   = status_icon.get(s["status"], "•")
-        srci = src_icon.get(s.get("source", ""), "")
-        label = f"{si}{srci} {s['kickoff']} {s['match'][:16]} @{s['odds']}"
+        si    = status_icon.get(s["status"], "•")
+        label = f"{si} {s['kickoff']} | {s['match'][:18]} @{s['odds']}"
         kb.append([InlineKeyboardButton(label, callback_data=f"view_signal_{s['id']}")])
+    kb.append([InlineKeyboardButton("🗑 Cancella vecchi segnali", callback_data="confirm_purge")])
     await fn(
-        f"📋 *Segnali ({len(signals)}) — dal più vicino:*",
+        "📋 *Segnali — dal più vicino:*\n\n"
+        "🆕 Nuovo  👁 Visto  📤 Inviato VIP\n"
+        "✅ Vinto  ❌ Perso  🗑 Scartato",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -284,9 +291,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts  = data.split("_")
         sig_id, result = int(parts[1]), parts[2]
         db.update_signal_status(sig_id, result, result)
-        emoji = "✅ Segnato come VINTO!" if result == "won" else "❌ Segnato come PERSO."
+        emoji = "✅ *VINTO!* Ottimo segnale!" if result == "won" else "❌ *Perso.* Prossima volta!"
+        kb = [
+            [InlineKeyboardButton("📋 Torna alla lista", callback_data="admin_list")],
+            [InlineKeyboardButton("🔙 Home",             callback_data="admin_home")],
+        ]
+        await query.edit_message_text(emoji, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+    # ── Cancella vecchi segnali — conferma ──────────────────────────────────────
+    elif data == "confirm_purge":
+        kb = [
+            [InlineKeyboardButton("⚠️ SÌ, cancella vecchi", callback_data="do_purge")],
+            [InlineKeyboardButton("❌ Annulla",              callback_data="admin_list")],
+        ]
         await query.edit_message_text(
-            emoji,
+            "🗑 *Cancella segnali vecchi*\n\n"
+            "Verranno eliminati tutti i segnali con risultato (✅/❌) o scartati.\n"
+            "I segnali pendenti rimangono.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data == "do_purge":
+        count = db.purge_old_signals()
+        await query.edit_message_text(
+            f"✅ Eliminati *{count}* segnali vecchi.",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Lista", callback_data="admin_list")]])
         )
 
@@ -396,8 +426,14 @@ async def post_init(app: Application):
         trigger=IntervalTrigger(hours=hours),
         id="signal_scan",
     )
+    # Auto-aggiornamento risultati ogni 30 minuti
+    _scheduler.add_job(
+        lambda: asyncio.ensure_future(run_auto_results(app)),
+        trigger=IntervalTrigger(minutes=30),
+        id="auto_results",
+    )
     _scheduler.start()
-    logger.info(f"⏰ Scheduler avviato — ogni {hours}h (ora IT)")
+    logger.info(f"⏰ Scheduler avviato — scan ogni {hours}h | risultati ogni 30min")
     await asyncio.sleep(3)
     await run_signal_scan(app)
 
@@ -415,6 +451,17 @@ async def run_signal_scan(app: Application) -> int:
     # Log fonte dati
     sources = set(m.get("source", "?") for m in matches)
     logger.info(f"Fonte dati: {sources} — {len(matches)} partite")
+
+    # Con ODDS_API_KEY attiva: accetta SOLO quote reali, scarta il fallback
+    if ODDS_KEY:
+        matches = [m for m in matches if m.get("source") == "odds_api"]
+        if not matches:
+            logger.info("Nessuna partita reale disponibile oggi su The Odds API")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="ℹ️ Nessuna partita di ping pong trovata oggi su The Odds API.\nI book non quotano partite in questo momento.",
+            )
+            return 0
 
     new_signals = 0
     settings    = db.get_settings()
@@ -455,6 +502,90 @@ async def run_signal_scan(app: Application) -> int:
 
     logger.info(f"✅ {new_signals} nuovi segnali")
     return new_signals
+
+# ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
+async def run_auto_results(app: Application):
+    """
+    Controlla The Odds API per i risultati delle partite completate
+    e aggiorna automaticamente i segnali pendenti.
+    """
+    pending = db.get_signals_for_auto_result()
+    if not pending:
+        return
+
+    logger.info(f"🔄 Auto-risultati: controllo {len(pending)} segnali pendenti...")
+
+    try:
+        scores = await scraper.fetch_scores()
+    except Exception as e:
+        logger.warning(f"Auto-risultati errore fetch: {e}")
+        return
+
+    if not scores:
+        return
+
+    # Crea mappa veloce: "player1 vs player2" → winner
+    def normalize(name: str) -> str:
+        return name.lower().strip()
+
+    score_map = {}
+    for sc in scores:
+        key = f"{normalize(sc['home'])} vs {normalize(sc['away'])}"
+        score_map[key] = sc["winner"]
+        # anche reverse
+        key2 = f"{normalize(sc['away'])} vs {normalize(sc['home'])}"
+        score_map[key2] = sc["winner"]
+
+    updated = 0
+    for sig in pending:
+        match_key = normalize(sig["match"])  # "Fan Zhendong vs Wang Chuqin"
+        winner = score_map.get(match_key)
+        if not winner:
+            continue
+
+        # Determina se il segnale è vinto o perso
+        pick = sig.get("pick", "").lower()
+        sig_type = sig.get("signal_type", "")
+        result = None
+
+        if sig_type == "winner":
+            # "fan zhendong vince" → controlla se il vincitore corrisponde
+            if normalize(winner) in pick or any(
+                normalize(p) in pick
+                for p in [sig["player1"], sig["player2"]]
+                if normalize(p) in normalize(winner)
+            ):
+                result = "won"
+            else:
+                result = "lost"
+
+        elif sig_type in ("over", "under"):
+            # Per over/under non abbiamo il totale set — skip auto-update
+            continue
+
+        elif sig_type == "handicap":
+            # Per handicap serve il numero di set — skip auto-update
+            continue
+
+        if result and db.auto_update_result(sig["id"], result):
+            updated += 1
+            emoji = "✅" if result == "won" else "❌"
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"{emoji} *Risultato aggiornato automaticamente!*\n\n"
+                    f"🏓 {sig['match']}\n"
+                    f"🎯 {sig['pick']} @ {sig['odds']}\n"
+                    f"{'✅ VINTO!' if result == 'won' else '❌ Perso.'}"
+                ),
+                parse_mode="Markdown"
+            )
+
+    if updated:
+        logger.info(f"✅ Auto-risultati: {updated} segnali aggiornati")
+    else:
+        logger.info("Auto-risultati: nessun match completato trovato")
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────────
 def main():

@@ -157,6 +157,14 @@ class Database:
             "last_scan": self.get_settings()["last_scan"],
         }
 
+    def purge_old_signals(self) -> int:
+        """Cancella segnali già risolti (vinti/persi/scartati). Ritorna il numero eliminato."""
+        cur = self.conn.execute(
+            "DELETE FROM signals WHERE status IN ('won', 'lost', 'discarded')"
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def reset_results(self):
         """Azzera tutti i risultati (vinto/perso) senza cancellare i segnali."""
         self.conn.execute("UPDATE signals SET result=NULL WHERE result IN ('won','lost')")
@@ -194,3 +202,23 @@ class Database:
         ).fetchone()
         new_val = "0" if (current and current["value"] == "1") else "1"
         self.set_setting(key, new_val)
+
+    def get_signals_for_auto_result(self) -> list[dict]:
+        """Segnali pendenti/visti che potrebbero avere un risultato da aggiornare."""
+        rows = self.conn.execute(
+            """SELECT * FROM signals
+               WHERE status IN ('pending','seen','sent')
+               AND result IS NULL""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def auto_update_result(self, sig_id: int, result: str) -> bool:
+        """Aggiorna automaticamente il risultato. Ritorna True se aggiornato."""
+        self.conn.execute(
+            "UPDATE signals SET status=?, result=? WHERE id=? AND result IS NULL",
+            (result, result, sig_id)
+        )
+        self.conn.commit()
+        return self.conn.execute(
+            "SELECT changes()"
+        ).fetchone()[0] > 0
