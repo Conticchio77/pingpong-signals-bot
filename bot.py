@@ -470,18 +470,21 @@ async def run_signal_scan(app: Application) -> int:
     sources = set(m.get("source", "?") for m in matches)
     logger.info(f"Fonte dati: {sources} — {len(matches)} partite")
 
-    # Con ODDS_API_KEY attiva: preferisce quote reali, usa fallback se non disponibili
+    # Con ODDS_API_KEY attiva: usa SOLO quote reali, mai il fallback
     if ODDS_KEY:
-        real_matches = [m for m in matches if m.get("source") == "odds_api"]
-        if real_matches:
-            matches = real_matches
-        else:
-            logger.info("Nessuna partita reale su The Odds API — uso fallback")
+        matches = [m for m in matches if m.get("source") == "odds_api"]
+        if not matches:
+            logger.info("Nessuna partita reale su The Odds API in questo momento")
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
-                text="⚠️ Nessuna partita reale trovata su The Odds API.\nAnalisi su quote stimate (fallback).",
+                text=(
+                    "ℹ️ *Nessuna partita disponibile*\n\n"
+                    "The Odds API non quota partite di ping pong in questo momento.\n"
+                    "Il prossimo scan automatico riproverà tra poco."
+                ),
+                parse_mode="Markdown",
             )
-            matches = scraper.get_fallback_matches()
+            return 0
 
     new_signals = 0
     settings    = db.get_settings()
