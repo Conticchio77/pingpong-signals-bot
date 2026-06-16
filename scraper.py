@@ -92,6 +92,13 @@ class SignalScraper:
                     if resp.status == 200:
                         events = await resp.json()
                         logger.info(f"Odds API: {len(events)} eventi totali ricevuti")
+
+                        # ── LOG DIAGNOSTICO: mostra tutti i tornei ricevuti ──
+                        tornei_ricevuti = set()
+                        for ev in events:
+                            tornei_ricevuti.add(ev.get("sport_title", "N/D"))
+                        logger.info(f"[DIAG] Tornei ricevuti dall'API: {sorted(tornei_ricevuti)}")
+
                         for ev in events:
                             parsed = self._parse_event(ev)
                             if parsed:
@@ -99,7 +106,7 @@ class SignalScraper:
                                 if _tournament_ok(t):
                                     matches.append(parsed)
                                 else:
-                                    logger.debug(f"Torneo escluso: {t}")
+                                    logger.info(f"[DIAG] Torneo escluso: '{t}'")
                         logger.info(f"Dopo filtro tornei: {len(matches)} partite")
                     else:
                         txt = await resp.text()
