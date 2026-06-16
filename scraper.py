@@ -15,6 +15,8 @@ TT_SPORT  = "tabletennis"
 # ── Tornei ammessi (quelli visibili sul book dell'utente) ──────────────────────
 # Matching parziale: se il nome torneo dell'API CONTIENE una di queste stringhe → OK
 ALLOWED_TOURNAMENTS = [
+    # Categoria generica restituita da The Odds API come sport_title
+    "table tennis",
     # Virtuali/simulati — massima copertura sui book italiani
     "pro league",
     "setka cup",

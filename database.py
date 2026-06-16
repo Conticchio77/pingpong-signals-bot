@@ -56,7 +56,7 @@ class Database:
         defaults = {
             "scan_interval":  "1",
             "auto_send":      "0",
-            "min_confidence": "60",
+            "min_confidence": "55",
             "last_scan":      "mai",
         }
         for k, v in defaults.items():
@@ -101,22 +101,6 @@ class Database:
     def get_pending_signals(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM signals WHERE status='pending' ORDER BY value_pct DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_recent_signals(self, limit: int = 20) -> list[dict]:
-        """Ultimi N segnali ordinati per kickoff crescente (più vicino prima)."""
-        rows = self.conn.execute(
-            """SELECT * FROM signals
-               ORDER BY
-                 CASE
-                   WHEN substr(kickoff,7,2)||substr(kickoff,4,2)||substr(kickoff,1,2) >= ''
-                   THEN kickoff
-                   ELSE '99'
-                 END ASC,
-                 id DESC
-               LIMIT ?""",
-            (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
 
