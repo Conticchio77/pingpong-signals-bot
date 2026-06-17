@@ -26,7 +26,7 @@ ROME         = ZoneInfo("Europe/Rome")
 TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
 VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
-ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
+
 
 db       = Database()
 scraper  = SignalScraper()
@@ -48,7 +48,8 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
     icon   = icons.get(s["signal_type"], "🏓")
     stars  = "⭐" * min(5, max(1, round(s["confidence"] / 20)))
     vsign  = f"+{s['value_pct']:.1f}%" if s["value_pct"] > 0 else f"{s['value_pct']:.1f}%"
-    src    = "📡 Quote reali" if s.get("source") == "odds_api" else "⚠️ Quote stimate"
+    src_map = {"sofascore": "📊 WTT Reale (quote stimate)", "fallback": "⚠️ Demo"}
+    src     = src_map.get(s.get("source", ""), "📊 Quote stimate")
 
     text = (
         f"🏓 *SEGNALE PING PONG*\n"
@@ -81,7 +82,7 @@ def now_it_str() -> str:
 def admin_panel_text() -> str:
     s       = db.get_settings()
     stats   = db.get_stats()
-    src_tag = "📡 The Odds API (quote reali)" if ODDS_KEY else "⚠️ Fallback (quote stimate — imposta ODDS_API_KEY)"
+    src_tag = "📊 SofaScore — partite WTT reali (Bet365 Italia)"
     return (
         f"🏓 *PingPong Signals — Admin Panel*\n"
         f"{'━' * 26}\n"
@@ -469,22 +470,6 @@ async def run_signal_scan(app: Application) -> int:
     # Log fonte dati
     sources = set(m.get("source", "?") for m in matches)
     logger.info(f"Fonte dati: {sources} — {len(matches)} partite")
-
-    # Con ODDS_API_KEY attiva: usa SOLO quote reali, mai il fallback
-    if ODDS_KEY:
-        matches = [m for m in matches if m.get("source") == "odds_api"]
-        if not matches:
-            logger.info("Nessuna partita reale su The Odds API in questo momento")
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "ℹ️ *Nessuna partita disponibile*\n\n"
-                    "The Odds API non quota partite di ping pong in questo momento.\n"
-                    "Il prossimo scan automatico riproverà tra poco."
-                ),
-                parse_mode="Markdown",
-            )
-            return 0
 
     new_signals = 0
     settings    = db.get_settings()
