@@ -130,10 +130,10 @@ class SignalScraper:
                 async with session.get(
                     f"{ODDSPAPI_BASE}/fixtures",
                     params={
-                        "apiKey":   ODDSPAPI_KEY,
-                        "sportId":  sport_id,
-                        "fromDate": today,
-                        "toDate":   tomorrow,
+                        "apiKey":  ODDSPAPI_KEY,
+                        "sportId": sport_id,
+                        "from":    today,
+                        "to":      tomorrow,
                     },
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:

@@ -527,6 +527,15 @@ async def run_signal_scan(app: Application) -> int:
     sports  = set(m.get("sport", "?") for m in matches)
     logger.info(f"Fonti: {sources} | Sport: {sports} | Partite: {len(matches)}")
 
+    # Settings prima di tutto
+    settings = db.get_settings()
+
+    # Filtra per sport se impostato
+    sport_filter = settings.get("sport_filter", "both")
+    if sport_filter != "both":
+        matches = [m for m in matches if m.get("sport") == sport_filter]
+        logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
+
     # Se nessuna partita reale (solo fallback) avvisa l'admin
     real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
     if not real_matches and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
@@ -542,14 +551,7 @@ async def run_signal_scan(app: Application) -> int:
         )
         return 0
 
-    # Filtra per sport se impostato
-    sport_filter = settings.get("sport_filter", "both")
-    if sport_filter != "both":
-        matches = [m for m in matches if m.get("sport") == sport_filter]
-        logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
-
     new_signals = 0
-    settings    = db.get_settings()
 
     for match in matches:
         try:
