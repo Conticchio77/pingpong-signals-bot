@@ -62,6 +62,7 @@ class Database:
             "auto_send":      "0",
             "min_confidence": "55",
             "last_scan":      "mai",
+            "sport_filter":   "both",   # "both" | "tabletennis" | "tennis"
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -177,6 +178,7 @@ class Database:
             "auto_send":      raw.get("auto_send", "0") == "1",
             "min_confidence": int(raw.get("min_confidence", 60)),
             "last_scan":      raw.get("last_scan", "mai"),
+            "sport_filter":   raw.get("sport_filter", "both"),
         }
 
     def set_setting(self, key: str, value):

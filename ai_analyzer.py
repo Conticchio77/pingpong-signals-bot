@@ -1,20 +1,25 @@
 """
-ai_analyzer.py — Analizzatore segnali multi-sport
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Genera segnali di value bet per:
-  • 🏓 Ping Pong (tabletennis)
-  • 🎾 Tennis (tennis)
+ai_analyzer.py — Analisi con de-vig Pinnacle
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Metodo: Power De-vig su Pinnacle (o miglior sharp disponibile)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Per ogni partita analizza le quote disponibili e produce
-segnali con: pick, odds, confidence, value_pct, stake,
-reasoning, book_note, sport_label.
+Come funziona:
+  1. Dalla risposta OddsPapi/Odds API prende le quote di OGNI bookmaker
+  2. Identifica Pinnacle (o Singbet/SBOBet) come "sharp book"
+  3. Applica Power De-vig su Pinnacle → ottiene probabilità reale senza margine
+  4. Confronta probabilità reale con quote dei "soft book" (Bet365, Unibet, ecc.)
+  5. Se la quota soft è MAGGIORE del fair value → c'è value reale
+  6. Calcola Kelly fraction per lo stake
 
-Non usa AI esterna — logica statistica interna basata
-su quote di mercato (Kelly semplificato).
+Campi extra attesi nel dict match (provenienti da scraper.py):
+  raw_bookmakers: dict  → {"pinnacle": {"home": 1.85, "away": 2.10}, "bet365": {...}, ...}
+  Se assente usa le odds_home/odds_away già mediate come fallback.
 """
 
 import hashlib
 import logging
+import math
 import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -22,285 +27,318 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 IT_TZ  = ZoneInfo("Europe/Rome")
 
+# ── Bookmaker classificati per affidabilità ────────────────────────────────────
+SHARP_BOOKS = {
+    "pinnacle", "pinnaclesports", "pin",
+    "singbet", "crown",
+    "sbobet", "sbo",
+    "betfair_ex", "betfair", "matchbook",
+}
+
+SOFT_BOOKS = {
+    "bet365", "unibet", "bwin", "betway", "williamhill",
+    "william_hill", "1xbet", "betclic", "snai", "lottomatica",
+    "sisal", "goldbet", "eurobet", "planetwin365",
+}
+
+# ── Soglie value bet ───────────────────────────────────────────────────────────
+MIN_VALUE_PCT   = 2.5    # % minimo di edge per generare segnale
+MIN_ODDS        = 1.40   # quota minima accettata
+MAX_ODDS        = 5.00   # quota massima accettata
+MIN_SOFT_BOOKS  = 1      # almeno N soft book devono confermare la quota
+
 
 class AIAnalyzer:
 
-    # ── Entry point ────────────────────────────────────────────────────────────
     async def analyze(self, match: dict) -> list[dict]:
-        """
-        Riceve un dict partita dallo scraper e restituisce
-        una lista di segnali (può essere vuota).
-        """
         sport = match.get("sport", "tabletennis")
         try:
-            if sport == "tennis":
-                return self._analyze_tennis(match)
-            else:
-                return self._analyze_tabletennis(match)
+            return self._analyze(match, sport)
         except Exception as e:
             logger.error(f"Analyzer errore [{sport}] {match.get('name','?')}: {e}")
             return []
 
-    # ── Ping Pong ──────────────────────────────────────────────────────────────
-    def _analyze_tabletennis(self, match: dict) -> list[dict]:
-        signals = []
-        p1, p2   = match["player1"], match["player2"]
-        oh, oa   = match.get("odds_home"), match.get("odds_away")
-        ov, un   = match.get("over_odds"),  match.get("under_odds")
-        line     = match.get("totals_line", 3.5)
-        source   = match.get("source", "fallback")
-        sport_label = match.get("sport_label", "🏓 Ping Pong")
+    # ── Core ───────────────────────────────────────────────────────────────────
+    def _analyze(self, match: dict, sport: str) -> list[dict]:
+        signals   = []
+        raw_bm    = match.get("raw_bookmakers", {})   # da scraper arricchito
+        has_sharp = bool(raw_bm)
+
+        # ── Stima probabilità reale ──────────────────────────────────────────
+        if has_sharp:
+            fair_home, fair_away = self._devi_power(raw_bm, match)
+        else:
+            # Fallback: de-vig semplice sulle quote mediate già disponibili
+            oh = match.get("odds_home")
+            oa = match.get("odds_away")
+            if not oh or not oa:
+                return []
+            fair_home, fair_away = self._devi_simple(oh, oa)
+
+        if fair_home is None or fair_away is None:
+            return []
+
+        p1 = match["player1"]
+        p2 = match["player2"]
 
         # ── Winner ──────────────────────────────────────────────────────────
-        if oh and oa:
-            # Calcola probabilità implicita (rimuove margin bookmaker)
-            margin   = 1/oh + 1/oa
-            prob_h   = (1/oh) / margin
-            prob_a   = (1/oa) / margin
+        # Cerca la quota migliore nei soft book (o usa odds_home/away)
+        best_h, best_h_book = self._best_soft_odd(raw_bm, p1, match.get("odds_home"))
+        best_a, best_a_book = self._best_soft_odd(raw_bm, p2, match.get("odds_away"))
 
-            # Stima probabilità "reale" con piccolo edge casuale (simula modello)
-            edge_h   = random.uniform(-0.04, 0.08)
-            edge_a   = random.uniform(-0.04, 0.08)
-            real_h   = min(0.92, max(0.08, prob_h + edge_h))
-            real_a   = 1 - real_h
+        if best_h and MIN_ODDS <= best_h <= MAX_ODDS:
+            value_h = fair_home * best_h - 1
+            if value_h >= MIN_VALUE_PCT / 100:
+                conf = self._confidence(value_h, has_sharp, match.get("source",""))
+                signals.append(self._build(
+                    match     = match,
+                    sig_type  = "winner",
+                    pick      = f"{p1} vince",
+                    odds      = best_h,
+                    fair_prob = fair_home,
+                    value_pct = round(value_h * 100, 2),
+                    confidence= conf,
+                    reasoning = self._reasoning_winner(p1, fair_home, best_h, best_h_book, has_sharp),
+                    book_note = f"Quota trovata su: {best_h_book or 'media mercato'}",
+                ))
 
-            value_h  = real_h * oh - 1
-            value_a  = real_a * oa - 1
+        if best_a and MIN_ODDS <= best_a <= MAX_ODDS:
+            value_a = fair_away * best_a - 1
+            if value_a >= MIN_VALUE_PCT / 100:
+                conf = self._confidence(value_a, has_sharp, match.get("source",""))
+                signals.append(self._build(
+                    match     = match,
+                    sig_type  = "winner",
+                    pick      = f"{p2} vince",
+                    odds      = best_a,
+                    fair_prob = fair_away,
+                    value_pct = round(value_a * 100, 2),
+                    confidence= conf,
+                    reasoning = self._reasoning_winner(p2, fair_away, best_a, best_a_book, has_sharp),
+                    book_note = f"Quota trovata su: {best_a_book or 'media mercato'}",
+                ))
 
-            # Segnale su chi ha più value
-            if value_h >= 0.04:
-                conf = self._confidence(value_h, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "winner",
-                        pick      = f"{p1} vince",
-                        odds      = oh,
-                        confidence= conf,
-                        value_pct = round(value_h * 100, 1),
-                        reasoning = (
-                            f"Probabilità stimata {p1}: {real_h:.0%} vs quota implicita {prob_h:.0%}. "
-                            f"Edge: +{value_h*100:.1f}%"
-                        ),
-                        book_note = f"Quota migliore trovata: {oh} su {p1}",
-                    ))
+        # ── Over/Under ───────────────────────────────────────────────────────
+        ov   = match.get("over_odds")
+        un   = match.get("under_odds")
+        line = match.get("totals_line")
+        if ov and un and line and MIN_ODDS <= ov <= MAX_ODDS and MIN_ODDS <= un <= MAX_ODDS:
+            fair_ov, fair_un = self._devi_simple(ov, un)
+            if fair_ov and fair_un:
+                value_ov = fair_ov * ov - 1
+                value_un = fair_un * un - 1
 
-            elif value_a >= 0.04:
-                conf = self._confidence(value_a, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "winner",
-                        pick      = f"{p2} vince",
-                        odds      = oa,
-                        confidence= conf,
-                        value_pct = round(value_a * 100, 1),
-                        reasoning = (
-                            f"Probabilità stimata {p2}: {real_a:.0%} vs quota implicita {prob_a:.0%}. "
-                            f"Edge: +{value_a*100:.1f}%"
-                        ),
-                        book_note = f"Quota migliore trovata: {oa} su {p2}",
-                    ))
+                unit = "set" if sport == "tabletennis" else "games"
 
-        # ── Over/Under set ───────────────────────────────────────────────────
-        if ov and un and line:
-            margin_ou = 1/ov + 1/un
-            prob_ov   = (1/ov) / margin_ou
-
-            edge_ou   = random.uniform(-0.05, 0.07)
-            real_ov   = min(0.88, max(0.12, prob_ov + edge_ou))
-            value_ov  = real_ov * ov - 1
-            value_un  = (1 - real_ov) * un - 1
-
-            if value_ov >= 0.04:
-                conf = self._confidence(value_ov, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
+                if value_ov >= MIN_VALUE_PCT / 100:
+                    conf = self._confidence(value_ov, has_sharp, match.get("source",""))
+                    signals.append(self._build(
                         match     = match,
                         sig_type  = "over",
-                        pick      = f"Over {line} set",
+                        pick      = f"Over {line} {unit}",
                         odds      = ov,
+                        fair_prob = fair_ov,
+                        value_pct = round(value_ov * 100, 2),
                         confidence= conf,
-                        value_pct = round(value_ov * 100, 1),
                         reasoning = (
-                            f"Match equilibrato: entrambi i giocatori in forma. "
-                            f"Stima partita lunga (>{line} set): {real_ov:.0%}"
+                            f"De-vig Over {line} {unit}: probabilità fair {fair_ov:.1%} "
+                            f"vs quota {ov} (value +{value_ov*100:.1f}%)"
                         ),
-                        book_note = f"Totale linea: {line} set @ {ov}",
+                        book_note = f"Linea: {line} {unit}",
                     ))
 
-            elif value_un >= 0.04:
-                conf = self._confidence(value_un, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
+                elif value_un >= MIN_VALUE_PCT / 100:
+                    conf = self._confidence(value_un, has_sharp, match.get("source",""))
+                    signals.append(self._build(
                         match     = match,
                         sig_type  = "under",
-                        pick      = f"Under {line} set",
+                        pick      = f"Under {line} {unit}",
                         odds      = un,
+                        fair_prob = fair_un,
+                        value_pct = round(value_un * 100, 2),
                         confidence= conf,
-                        value_pct = round(value_un * 100, 1),
                         reasoning = (
-                            f"Favorito netto: probabile chiusura rapida sotto {line} set. "
-                            f"Stima: {(1-real_ov):.0%}"
+                            f"De-vig Under {line} {unit}: probabilità fair {fair_un:.1%} "
+                            f"vs quota {un} (value +{value_un*100:.1f}%)"
                         ),
-                        book_note = f"Totale linea: {line} set @ {un}",
+                        book_note = f"Linea: {line} {unit}",
                     ))
 
-        return signals
+        # Ordina per value decrescente, max 2 segnali per partita
+        signals.sort(key=lambda x: x["value_pct"], reverse=True)
+        return signals[:2]
 
-    # ── Tennis ────────────────────────────────────────────────────────────────
-    def _analyze_tennis(self, match: dict) -> list[dict]:
+    # ── De-vig Power (metodo professionale) ───────────────────────────────────
+    def _devi_power(self, raw_bm: dict, match: dict) -> tuple:
         """
-        Per il tennis abbiamo quasi sempre solo h2h (winner).
-        Raramente over/under games — gestiamo entrambi.
+        Power De-vig su Pinnacle.
+        Trova k tale che p1^k + p2^k = 1 (rimuove il margine non linearmente).
+        Molto più accurato del de-vig additivo semplice.
         """
-        signals = []
-        p1, p2   = match["player1"], match["player2"]
-        oh, oa   = match.get("odds_home"), match.get("odds_away")
-        ov, un   = match.get("over_odds"),  match.get("under_odds")
-        line     = match.get("totals_line")
-        source   = match.get("source", "fallback")
-        sport_label = match.get("sport_label", "🎾 Tennis")
+        # Cerca sharp book in ordine di priorità
+        sharp_odds = None
+        for book_name, odds in raw_bm.items():
+            if any(s in book_name.lower() for s in SHARP_BOOKS):
+                h = odds.get("home") or odds.get(match.get("player1",""), {})
+                a = odds.get("away") or odds.get(match.get("player2",""), {})
+                if h and a and h > 1.01 and a > 1.01:
+                    sharp_odds = (float(h), float(a))
+                    logger.info(f"Sharp book trovato: {book_name} → {h}/{a}")
+                    break
 
-        if oh and oa:
-            margin = 1/oh + 1/oa
-            prob_h = (1/oh) / margin
-            prob_a = (1/oa) / margin
+        if not sharp_odds:
+            # Nessun sharp book → de-vig semplice sulle quote migliori disponibili
+            oh = match.get("odds_home")
+            oa = match.get("odds_away")
+            if oh and oa:
+                return self._devi_simple(oh, oa)
+            return None, None
 
-            # Nel tennis le quote spesso riflettono ranking ATP/WTA abbastanza bene
-            # aggiungiamo un edge più conservativo
-            edge_h  = random.uniform(-0.03, 0.06)
-            real_h  = min(0.93, max(0.07, prob_h + edge_h))
-            real_a  = 1 - real_h
+        oh, oa = sharp_odds
+        p_raw_h = 1 / oh
+        p_raw_a = 1 / oa
 
-            value_h = real_h * oh - 1
-            value_a = real_a * oa - 1
+        # Risolvi k con Newton-Raphson: p_h^k + p_a^k = 1
+        k = self._solve_power_k(p_raw_h, p_raw_a)
 
-            if value_h >= 0.03:
-                conf = self._confidence(value_h, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "winner",
-                        pick      = f"{p1} vince il match",
-                        odds      = oh,
-                        confidence= conf,
-                        value_pct = round(value_h * 100, 1),
-                        reasoning = (
-                            f"Analisi h2h: {p1} stimato al {real_h:.0%} "
-                            f"contro quota book al {prob_h:.0%}. "
-                            f"Value edge: +{value_h*100:.1f}%"
-                        ),
-                        book_note = f"Best odd: {oh} su {p1} (eu/uk average)",
-                    ))
+        fair_h = p_raw_h ** k / (p_raw_h ** k + p_raw_a ** k)
+        fair_a = 1 - fair_h
 
-            elif value_a >= 0.03:
-                conf = self._confidence(value_a, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "winner",
-                        pick      = f"{p2} vince il match",
-                        odds      = oa,
-                        confidence= conf,
-                        value_pct = round(value_a * 100, 1),
-                        reasoning = (
-                            f"Analisi h2h: {p2} stimato al {real_a:.0%} "
-                            f"contro quota book al {prob_a:.0%}. "
-                            f"Value edge: +{value_a*100:.1f}%"
-                        ),
-                        book_note = f"Best odd: {oa} su {p2} (eu/uk average)",
-                    ))
+        logger.debug(f"Power de-vig k={k:.4f}: fair_h={fair_h:.4f} fair_a={fair_a:.4f}")
+        return round(fair_h, 4), round(fair_a, 4)
 
-        # Over/under games (se disponibile)
-        if ov and un and line:
-            margin_ou = 1/ov + 1/un
-            prob_ov   = (1/ov) / margin_ou
-            edge_ou   = random.uniform(-0.04, 0.06)
-            real_ov   = min(0.88, max(0.12, prob_ov + edge_ou))
-            value_ov  = real_ov * ov - 1
-            value_un  = (1 - real_ov) * un - 1
+    def _solve_power_k(self, p1: float, p2: float, iterations: int = 20) -> float:
+        """Newton-Raphson per trovare k in p1^k + p2^k = 1."""
+        k = 1.0
+        for _ in range(iterations):
+            f  = p1**k + p2**k - 1
+            df = p1**k * math.log(p1) + p2**k * math.log(p2)
+            if abs(df) < 1e-10:
+                break
+            k -= f / df
+            k  = max(0.5, min(2.0, k))   # clamp sicurezza
+        return k
 
-            if value_ov >= 0.03:
-                conf = self._confidence(value_ov, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "over",
-                        pick      = f"Over {line} games",
-                        odds      = ov,
-                        confidence= conf,
-                        value_pct = round(value_ov * 100, 1),
-                        reasoning = f"Entrambi i giocatori tendono a partite lunghe. Stima: {real_ov:.0%}",
-                        book_note = f"Linea: {line} games @ {ov}",
-                    ))
+    def _devi_simple(self, oh: float, oa: float) -> tuple:
+        """De-vig additivo semplice (fallback se no sharp book)."""
+        if not oh or not oa or oh <= 1 or oa <= 1:
+            return None, None
+        margin = 1/oh + 1/oa
+        return round((1/oh) / margin, 4), round((1/oa) / margin, 4)
 
-            elif value_un >= 0.03:
-                conf = self._confidence(value_un, source)
-                if conf >= 50:
-                    signals.append(self._build_signal(
-                        match     = match,
-                        sig_type  = "under",
-                        pick      = f"Under {line} games",
-                        odds      = un,
-                        confidence= conf,
-                        value_pct = round(value_un * 100, 1),
-                        reasoning = f"Differenza ranking significativa, match rapido probabile. Stima: {(1-real_ov):.0%}",
-                        book_note = f"Linea: {line} games @ {un}",
-                    ))
-
-        return signals
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def _confidence(self, value: float, source: str) -> int:
+    # ── Miglior quota soft book ────────────────────────────────────────────────
+    def _best_soft_odd(self, raw_bm: dict, player: str, fallback: float) -> tuple:
         """
-        Calcola la confidenza in % basandosi sul value edge e sulla fonte.
-        Quote reali → confidenza più alta. Fallback → più bassa.
+        Cerca la quota migliore per un giocatore tra i soft book.
+        Ritorna (quota, nome_book).
         """
-        base = 45 + int(value * 200)   # da 45% (edge=0) a ~65% (edge=10%)
-        base = min(88, base)
+        if not raw_bm:
+            return fallback, None
 
+        best_price = 0.0
+        best_book  = None
+
+        for book_name, odds in raw_bm.items():
+            # Salta sharp book per la ricerca della quota "da giocare"
+            if any(s in book_name.lower() for s in SHARP_BOOKS):
+                continue
+            # Cerca la quota per il giocatore nel dict del bookmaker
+            price = None
+            for key, val in odds.items():
+                if isinstance(val, (int, float)) and player.lower() in key.lower():
+                    price = float(val)
+                    break
+                # Struttura alternativa: {"home": x, "away": y}
+                if key in ("home", "away") and isinstance(val, (int, float)):
+                    if key == "home" and "home" in odds:
+                        price = float(val)
+                        break
+
+            if price and price > best_price:
+                best_price = price
+                best_book  = book_name
+
+        # Se non trovato tra soft, usa il fallback (media mercato)
+        if not best_price and fallback:
+            return float(fallback), "media mercato"
+
+        return (round(best_price, 3), best_book) if best_price else (fallback, None)
+
+    # ── Confidenza ────────────────────────────────────────────────────────────
+    def _confidence(self, value: float, has_sharp: bool, source: str) -> int:
+        """
+        Confidenza basata su:
+        - Entità del value edge
+        - Se abbiamo usato Pinnacle (più affidabile) o de-vig semplice
+        - Fonte dati (API reale vs fallback)
+        """
+        # Base: da 50% (edge=2.5%) a 82% (edge=15%+)
+        base = 50 + int(min(value * 200, 32))
+
+        # Bonus se abbiamo dati Pinnacle reali
+        if has_sharp:
+            base += 8
         # Penalità per fonte meno affidabile
         if source == "fallback":
-            base -= 12
+            base -= 15
         elif source == "oddspapi_noodds":
-            base -= 6
+            base -= 8
 
-        # Piccola variazione realistica
-        base += random.randint(-3, 3)
-        return max(40, min(88, base))
+        # Piccola variazione (±2%) per evitare confidenze sempre identiche
+        base += random.randint(-2, 2)
+        return max(45, min(90, base))
 
-    def _stake(self, confidence: int, value_pct: float) -> int:
-        """Stake 1-5 basato su confidenza e value."""
-        if confidence >= 78 and value_pct >= 8:
-            return 5
-        elif confidence >= 72 and value_pct >= 6:
-            return 4
-        elif confidence >= 65 and value_pct >= 4:
-            return 3
-        elif confidence >= 58:
-            return 2
-        else:
-            return 1
+    # ── Stake Kelly semplificato ───────────────────────────────────────────────
+    def _stake(self, fair_prob: float, odds: float, confidence: int) -> int:
+        """
+        Kelly fraction: f = (p*b - q) / b  dove b = odds-1, p=fair_prob, q=1-p
+        Usiamo Kelly/4 (quarter Kelly) per sicurezza, mappato su scala 1-5.
+        """
+        b = odds - 1
+        q = 1 - fair_prob
+        kelly = (fair_prob * b - q) / b if b > 0 else 0
+        kelly = max(0, kelly)
+        quarter_kelly = kelly / 4
 
-    def _build_signal(
+        # Mappa su 1-5 (ogni 2% di Kelly = 1 punto stake)
+        stake = max(1, min(5, int(quarter_kelly * 200) + 1))
+
+        # Confidenza bassa → taglia stake
+        if confidence < 58:
+            stake = max(1, stake - 1)
+
+        return stake
+
+    # ── Reasoning leggibile ───────────────────────────────────────────────────
+    def _reasoning_winner(
+        self, player: str, fair_prob: float,
+        best_odd: float, book: str, has_sharp: bool
+    ) -> str:
+        method = "de-vig Pinnacle" if has_sharp else "de-vig mercato"
+        fair_odd = round(1 / fair_prob, 2) if fair_prob > 0 else "?"
+        return (
+            f"Probabilità fair ({method}): {fair_prob:.1%} → quota fair {fair_odd}. "
+            f"Quota disponibile: {best_odd} ({book or 'media'}) — "
+            f"edge reale: +{(fair_prob * best_odd - 1)*100:.1f}%"
+        )
+
+    # ── Build segnale ─────────────────────────────────────────────────────────
+    def _build(
         self,
         match:      dict,
         sig_type:   str,
         pick:       str,
         odds:       float,
-        confidence: int,
+        fair_prob:  float,
         value_pct:  float,
+        confidence: int,
         reasoning:  str = "",
         book_note:  str = "",
     ) -> dict:
-        """Costruisce il dict segnale nel formato atteso da database.py e bot.py."""
-        now    = datetime.now(IT_TZ)
-        # match_key univoco: nome partita + tipo segnale + data
+        now     = datetime.now(IT_TZ)
         key_str = f"{match['name']}|{sig_type}|{pick}|{now.strftime('%Y%m%d')}"
         mk      = hashlib.md5(key_str.encode()).hexdigest()[:16]
-
-        stake = self._stake(confidence, value_pct)
+        stake   = self._stake(fair_prob, odds, confidence)
 
         return {
             "match_key":   mk,

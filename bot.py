@@ -107,6 +107,9 @@ def admin_panel_text() -> str:
         src_parts.append("⚠️ The Odds API non configurata")
     src_tag = " | ".join(src_parts)
 
+    sport_filter = s.get("sport_filter", "both")
+    sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sport_filter, "🏓🎾 Entrambi")
+
     return (
         f"🏓🎾 *Signals Bot — Admin Panel*\n"
         f"{'━' * 26}\n"
@@ -117,7 +120,8 @@ def admin_panel_text() -> str:
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
         f"⚙️ Scan ogni *{s['scan_interval']}h* | "
         f"Confidenza min: *{s['min_confidence']}%* | "
-        f"Auto-VIP: *{'✅' if s['auto_send'] else '❌'}*"
+        f"Auto-VIP: *{'✅' if s['auto_send'] else '❌'}* | "
+        f"Sport: *{sf_label}*"
     )
 
 def admin_panel_kb():
@@ -231,15 +235,18 @@ async def send_stats(fn):
 async def send_settings(fn):
     s = db.get_settings()
     conf = s['min_confidence']
-    # Descrizione leggibile della confidenza
     conf_desc = {55: "Bassa (55%)", 60: "Media (60%)", 65: "Media-Alta (65%)",
                  70: "Alta (70%)", 75: "Molto Alta (75%)", 80: "Massima (80%)"}
     conf_label = conf_desc.get(conf, f"{conf}%")
+
+    sf = s.get("sport_filter", "both")
+    sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sf, "🏓🎾 Entrambi")
 
     kb = [
         [InlineKeyboardButton(f"⏱ Scan: ogni {s['scan_interval']}h", callback_data="pick_interval")],
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
         [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
+        [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     await fn(
@@ -446,6 +453,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_setting("min_confidence", nxt)
         await send_settings(query.edit_message_text)
 
+    # ── Scegli filtro sport ───────────────────────────────────────────────────
+    elif data == "pick_sport_filter":
+        current = db.get_settings().get("sport_filter", "both")
+        opts = [
+            ("both",        "🏓🎾 Entrambi"),
+            ("tabletennis", "🏓 Solo Ping Pong"),
+            ("tennis",      "🎾 Solo Tennis"),
+        ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if val == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_sport_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "🏅 *Seleziona lo sport per i segnali:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_sport_"):
+        val = data.replace("set_sport_", "")
+        db.set_setting("sport_filter", val)
+        await send_settings(query.edit_message_text)
+
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
 _scheduler: AsyncIOScheduler | None = None
@@ -510,6 +541,12 @@ async def run_signal_scan(app: Application) -> int:
             parse_mode="Markdown",
         )
         return 0
+
+    # Filtra per sport se impostato
+    sport_filter = settings.get("sport_filter", "both")
+    if sport_filter != "both":
+        matches = [m for m in matches if m.get("sport") == sport_filter]
+        logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
 
     new_signals = 0
     settings    = db.get_settings()

@@ -183,6 +183,7 @@ class SignalScraper:
             # Recupera quote
             odds_home, odds_away, over_odds, under_odds, totals_line = \
                 None, None, None, None, 3.5
+            raw_bookmakers = {}
 
             if fid:
                 try:
@@ -199,6 +200,8 @@ class SignalScraper:
                             data = await r.json()
                             odds_home, odds_away, over_odds, under_odds, totals_line = \
                                 self._extract_oddspapi_odds(data, p1, p2)
+                            # Salva quote per bookmaker per de-vig Pinnacle
+                            raw_bookmakers = self._extract_raw_bookmakers(data, p1, p2)
                 except Exception as e:
                     logger.debug(f"OddsPapi odds errore fixture {fid}: {e}")
 
@@ -211,21 +214,22 @@ class SignalScraper:
                 source = "oddspapi"
 
             return {
-                "event_id":    str(fid),
-                "name":        f"{p1} vs {p2}",
-                "player1":     p1,
-                "player2":     p2,
-                "kickoff":     kickoff,
-                "tournament":  str(tourn),
-                "status":      "scheduled",
-                "odds_home":   round(odds_home, 3),
-                "odds_away":   round(odds_away, 3),
-                "over_odds":   round(over_odds,  3) if over_odds  else None,
-                "under_odds":  round(under_odds, 3) if under_odds else None,
-                "totals_line": totals_line,
-                "source":      source,
-                "sport":       "tabletennis",
-                "sport_label": "🏓 Ping Pong",
+                "event_id":        str(fid),
+                "name":            f"{p1} vs {p2}",
+                "player1":         p1,
+                "player2":         p2,
+                "kickoff":         kickoff,
+                "tournament":      str(tourn),
+                "status":          "scheduled",
+                "odds_home":       round(odds_home, 3),
+                "odds_away":       round(odds_away, 3),
+                "over_odds":       round(over_odds,  3) if over_odds  else None,
+                "under_odds":      round(under_odds, 3) if under_odds else None,
+                "totals_line":     totals_line,
+                "source":          source,
+                "sport":           "tabletennis",
+                "sport_label":     "🏓 Ping Pong",
+                "raw_bookmakers":  raw_bookmakers,
             }
         except Exception as e:
             logger.debug(f"OddsPapi parse errore: {e}")
@@ -264,8 +268,31 @@ class SignalScraper:
 
         return odds_home, odds_away, over_odds, under_odds, totals_line
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ── The Odds API: Tennis ───────────────────────────────────────────────────
+    def _extract_raw_bookmakers(self, data: dict, p1: str, p2: str) -> dict:
+        """
+        Estrae quote per ogni bookmaker nel formato:
+        {"pinnacle": {"home": 1.85, "away": 2.10}, "bet365": {...}, ...}
+        Usato dall'analyzer per il de-vig Pinnacle.
+        """
+        raw = {}
+        bm_odds = data.get("bookmakerOdds") or {}
+        for slug, bm_data in bm_odds.items():
+            outcomes = bm_data.get("outcomes") or []
+            entry = {}
+            for o in outcomes:
+                name  = (o.get("name") or o.get("participant") or "").lower()
+                price = float(o.get("price") or o.get("odds") or 0)
+                if not price:
+                    continue
+                if p1.lower() in name or name in p1.lower():
+                    entry["home"] = price
+                elif p2.lower() in name or name in p2.lower():
+                    entry["away"] = price
+            if "home" in entry and "away" in entry:
+                raw[slug.lower()] = entry
+        return raw
+
+
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _fetch_odds_api_tennis(self) -> list[dict]:
@@ -333,34 +360,45 @@ class SignalScraper:
             sport   = ev.get("sport_title", "Tennis")
 
             best: dict[str, float] = {}
+            raw_bookmakers: dict   = {}
+
             for bm in ev.get("bookmakers", []):
+                bm_slug = bm.get("key", "").lower()
                 for market in bm.get("markets", []):
                     if market["key"] == "h2h":
+                        entry = {}
                         for o in market.get("outcomes", []):
                             p = float(o["price"])
                             n = o["name"]
                             if n not in best or p > best[n]:
                                 best[n] = p
+                            if n == home:
+                                entry["home"] = p
+                            elif n == away:
+                                entry["away"] = p
+                        if "home" in entry and "away" in entry:
+                            raw_bookmakers[bm_slug] = entry
 
             if home not in best or away not in best:
                 return None
 
             return {
-                "event_id":    ev.get("id", ""),
-                "name":        f"{home} vs {away}",
-                "player1":     home,
-                "player2":     away,
-                "kickoff":     kickoff,
-                "tournament":  sport,
-                "status":      "scheduled",
-                "odds_home":   round(best[home], 3),
-                "odds_away":   round(best[away], 3),
-                "over_odds":   None,
-                "under_odds":  None,
-                "totals_line": None,
-                "source":      "odds_api",
-                "sport":       "tennis",
-                "sport_label": "🎾 Tennis",
+                "event_id":       ev.get("id", ""),
+                "name":           f"{home} vs {away}",
+                "player1":        home,
+                "player2":        away,
+                "kickoff":        kickoff,
+                "tournament":     sport,
+                "status":         "scheduled",
+                "odds_home":      round(best[home], 3),
+                "odds_away":      round(best[away], 3),
+                "over_odds":      None,
+                "under_odds":     None,
+                "totals_line":    None,
+                "source":         "odds_api",
+                "sport":          "tennis",
+                "sport_label":    "🎾 Tennis",
+                "raw_bookmakers": raw_bookmakers,
             }
         except Exception as e:
             logger.debug(f"Parse tennis errore: {e}")
