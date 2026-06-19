@@ -31,6 +31,8 @@ class Database:
                 reasoning    TEXT,
                 book_note    TEXT,
                 source       TEXT DEFAULT 'n/d',
+                sport        TEXT DEFAULT 'tabletennis',
+                sport_label  TEXT DEFAULT '🏓 Ping Pong',
                 status       TEXT DEFAULT 'pending',
                 result       TEXT,
                 created_at   TEXT
@@ -44,8 +46,10 @@ class Database:
 
         # Aggiungi colonne mancanti se il DB esiste già (upgrade sicuro)
         for col, definition in [
-            ("book_note", "TEXT"),
-            ("source",    "TEXT DEFAULT 'n/d'"),
+            ("book_note",   "TEXT"),
+            ("source",      "TEXT DEFAULT 'n/d'"),
+            ("sport",       "TEXT DEFAULT 'tabletennis'"),
+            ("sport_label", "TEXT DEFAULT '🏓 Ping Pong'"),
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {definition}")
@@ -71,8 +75,8 @@ class Database:
             """INSERT OR IGNORE INTO signals
                (match_key, match, player1, player2, tournament, kickoff,
                 signal_type, pick, odds, confidence, value_pct, stake,
-                reasoning, book_note, source, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                reasoning, book_note, source, sport, sport_label, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 s["match_key"], s["match"], s["player1"], s["player2"],
                 s.get("tournament", ""), s["kickoff"],
@@ -80,6 +84,8 @@ class Database:
                 s["confidence"], s["value_pct"], s["stake"],
                 s.get("reasoning", ""), s.get("book_note", ""),
                 s.get("source", "n/d"),
+                s.get("sport", "tabletennis"),
+                s.get("sport_label", "🏓 Ping Pong"),
                 s.get("created_at", datetime.utcnow().isoformat()),
             )
         )

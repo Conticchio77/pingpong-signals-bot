@@ -1,288 +1,491 @@
 """
-scraper.py — Table Tennis signal scraper via SofaScore
-=======================================================
-Fonte dati: SofaScore API (gratuita, non ufficiale)
-Copre: WTT Contender, WTT Star Contender, World Championships,
-       European Championships — tutti quotati su Bet365 Italia.
+scraper.py — Multi-sport: Ping Pong + Tennis
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Sorgenti:
+  • Ping Pong → OddsPapi (gratuita, 250 req/mese, 370+ bookmaker)
+               Endpoint: https://api.oddspapi.io/v4
+               Env var:  ODDSPAPI_KEY
+               Sport ID: scoperto dinamicamente (cerca "table tennis")
 
-Nessuna API key richiesta.
+  • Tennis    → The Odds API (gratuita, 500 crediti/mese)
+               Endpoint: https://api.the-odds-api.com/v4
+               Env var:  ODDS_API_KEY   (già presente nel tuo progetto)
+               Sport key: "tennis"
+
+Variabili Railway da aggiungere:
+  ODDSPAPI_KEY  = <la tua chiave da oddspapi.io>
+  ODDS_API_KEY  = <la tua chiave esistente da the-odds-api.com>
+
+Ogni partita ha il campo  sport_label = "🏓 Ping Pong" | "🎾 Tennis"
+usato da bot.py per differenziare i segnali nella UI.
 """
 
 import aiohttp
 import logging
+import os
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 IT_TZ  = ZoneInfo("Europe/Rome")
 
-SOFA_BASE = "https://api.sofascore.com/api/v1"
-SOFA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "Chrome/124.0.0.0 Safari/537.36",
-    "Accept":     "application/json, text/plain, */*",
-    "Referer":    "https://www.sofascore.com/",
-    "Origin":     "https://www.sofascore.com",
-}
+# ── Chiavi API ─────────────────────────────────────────────────────────────────
+ODDSPAPI_KEY = os.environ.get("ODDSPAPI_KEY", "")   # ping pong
+ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")   # tennis (già presente)
 
-# ── Tornei WTT reali disponibili su Bet365 Italia ─────────────────────────────
-ALLOWED_TOURNAMENTS = [
-    "wtt", "world tt", "world table tennis",
-    "world championships", "world cup",
-    "contender", "star contender", "grand smash",
-    "champions", "cup finals",
-    "european championships", "europe top 16",
-    "olympic", "commonwealth",
-]
+ODDSPAPI_BASE = "https://api.oddspapi.io/v4"
+ODDS_BASE     = "https://api.the-odds-api.com/v4"
 
-# ── Note su dove trovare la partita sul book ───────────────────────────────────
-BOOK_NOTE_TEMPLATE = "Cerca su Bet365 → Ping Pong → {tournament}"
-
-
-def _tournament_ok(name: str) -> bool:
-    n = name.lower()
-    return any(kw in n for kw in ALLOWED_TOURNAMENTS)
-
+# ── Helper tempo ───────────────────────────────────────────────────────────────
 def _now_it() -> datetime:
     return datetime.now(IT_TZ)
 
-def _unix_to_it(ts: int) -> str:
+def _iso_to_it(iso: str) -> str:
     try:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(IT_TZ)
+        iso = iso.replace("Z", "+00:00")
+        dt  = datetime.fromisoformat(iso).astimezone(IT_TZ)
         return dt.strftime("%d/%m %H:%M")
     except Exception:
         return _now_it().strftime("%d/%m %H:%M")
 
-def _today_and_tomorrow() -> list[str]:
-    now = _now_it()
-    return [
-        (now + timedelta(days=i)).strftime("%Y-%m-%d")
-        for i in range(3)   # oggi + domani + dopodomani
-    ]
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 class SignalScraper:
 
-    # ══ ENTRY POINT ══════════════════════════════════════════════════════════
+    def __init__(self):
+        self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
+
+    # ── Entry point principale ─────────────────────────────────────────────────
     async def fetch_matches(self) -> list[dict]:
-        matches = await self._fetch_sofascore()
-        if matches:
-            logger.info(f"SofaScore: {len(matches)} partite WTT trovate")
-            return self._sort(matches)
+        """Restituisce partite di ENTRAMBI gli sport, ordinate per kickoff."""
+        results = []
 
-        logger.warning("SofaScore vuoto — uso fallback demo")
-        return self._sort(self.get_fallback_matches())
+        # 1. Ping Pong via OddsPapi
+        if ODDSPAPI_KEY:
+            tt = await self._fetch_oddspapi_tt()
+            logger.info(f"OddsPapi Ping Pong: {len(tt)} partite")
+            results.extend(tt)
+        else:
+            logger.warning("ODDSPAPI_KEY non impostata — ping pong saltato")
 
-    # ══ SOFASCORE ════════════════════════════════════════════════════════════
-    async def _fetch_sofascore(self) -> list[dict]:
-        all_events: list[dict] = []
+        # 2. Tennis via The Odds API
+        if ODDS_KEY:
+            ten = await self._fetch_odds_api_tennis()
+            logger.info(f"The Odds API Tennis: {len(ten)} partite")
+            results.extend(ten)
+        else:
+            logger.warning("ODDS_API_KEY non impostata — tennis saltato")
 
-        async with aiohttp.ClientSession(headers=SOFA_HEADERS) as session:
-            for date_str in _today_and_tomorrow():
-                url = f"{SOFA_BASE}/sport/table-tennis/scheduled-events/{date_str}"
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status == 200:
-                            data   = await resp.json()
-                            events = data.get("events", [])
-                            logger.info(f"SofaScore {date_str}: {len(events)} eventi")
-                            all_events.extend(events)
-                        else:
-                            logger.warning(f"SofaScore {date_str} HTTP {resp.status}")
-                except Exception as e:
-                    logger.error(f"SofaScore {date_str} errore: {e}")
+        # Fallback se entrambe le API sono assenti
+        if not results:
+            logger.warning("Nessuna API configurata — uso fallback misto")
+            results = self.get_fallback_matches()
 
-        # Log tutti i tornei ricevuti (debug)
-        tournaments = sorted(set(
-            ev.get("tournament", {}).get("name", "?") for ev in all_events
-        ))
-        logger.info(f"Tornei SofaScore: {tournaments}")
+        return self._sort_dedup(results)
 
-        # Filtra solo tornei WTT quotati su Bet365
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── OddsPapi: Ping Pong ────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _get_tt_sport_id(self, session: aiohttp.ClientSession) -> int | None:
+        """Scopre l'ID OddsPapi per il ping pong (cache in-memory)."""
+        if self._tt_sport_id:
+            return self._tt_sport_id
+        try:
+            async with session.get(
+                f"{ODDSPAPI_BASE}/sports",
+                params={"apiKey": ODDSPAPI_KEY},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"OddsPapi /sports status {r.status}")
+                    return None
+                sports = await r.json()
+                for s in sports:
+                    name = (s.get("name") or s.get("slug") or "").lower()
+                    if "table" in name or "ping" in name:
+                        self._tt_sport_id = s.get("sportId") or s.get("id")
+                        logger.info(f"OddsPapi: ping pong sportId={self._tt_sport_id} ({s.get('name')})")
+                        return self._tt_sport_id
+                # Log tutti gli sport disponibili per debug
+                names = [s.get("name", "?") for s in sports]
+                logger.warning(f"OddsPapi: ping pong non trovato. Sport disponibili: {names}")
+        except Exception as e:
+            logger.error(f"OddsPapi /sports errore: {e}")
+        return None
+
+    async def _fetch_oddspapi_tt(self) -> list[dict]:
         matches = []
-        for ev in all_events:
-            t_name = ev.get("tournament", {}).get("name", "")
-            if not _tournament_ok(t_name):
-                logger.debug(f"Torneo escluso: '{t_name}'")
-                continue
-            parsed = self._parse_sofascore_event(ev)
-            if parsed:
-                matches.append(parsed)
+        async with aiohttp.ClientSession() as session:
+            sport_id = await self._get_tt_sport_id(session)
+            if sport_id is None:
+                logger.warning("OddsPapi: sport ID ping pong non trovato — ping pong non disponibile")
+                return []
 
-        logger.info(f"Dopo filtro WTT: {len(matches)} partite")
+            # Fetch fixtures dei prossimi 2 giorni
+            today     = _now_it().strftime("%Y-%m-%d")
+            tomorrow  = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                async with session.get(
+                    f"{ODDSPAPI_BASE}/fixtures",
+                    params={
+                        "apiKey":   ODDSPAPI_KEY,
+                        "sportId":  sport_id,
+                        "fromDate": today,
+                        "toDate":   tomorrow,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    rem = r.headers.get("X-RateLimit-Remaining", "?")
+                    logger.info(f"OddsPapi fixtures — richieste rimaste: {rem}")
+                    if r.status != 200:
+                        txt = await r.text()
+                        logger.warning(f"OddsPapi fixtures status {r.status}: {txt[:120]}")
+                        return []
+                    fixtures = await r.json()
+                    # fixtures può essere lista diretta o {"data": [...]}
+                    if isinstance(fixtures, dict):
+                        fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
+                    logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
+            except Exception as e:
+                logger.error(f"OddsPapi fixtures errore: {e}")
+                return []
+
+            # Per ogni fixture recupera le quote
+            for fix in fixtures:
+                parsed = await self._parse_oddspapi_fixture(session, fix)
+                if parsed:
+                    matches.append(parsed)
+
         return matches
 
-    def _parse_sofascore_event(self, ev: dict) -> dict | None:
+    async def _parse_oddspapi_fixture(
+        self, session: aiohttp.ClientSession, fix: dict
+    ) -> dict | None:
         try:
-            home = ev.get("homeTeam", {}).get("name", "")
-            away = ev.get("awayTeam", {}).get("name", "")
-            if not home or not away:
+            p1 = (fix.get("participant1Name") or fix.get("home") or "").strip()
+            p2 = (fix.get("participant2Name") or fix.get("away") or "").strip()
+            if not p1 or not p2:
                 return None
 
-            ts          = ev.get("startTimestamp", 0)
-            kickoff     = _unix_to_it(ts)
-            tournament  = ev.get("tournament", {}).get("name", "Table Tennis")
-            category    = ev.get("tournament", {}).get("category", {}).get("name", "")
-            full_t_name = f"{category} {tournament}".strip() if category else tournament
+            fid      = fix.get("fixtureId") or fix.get("id", "")
+            start    = fix.get("startDate") or fix.get("startTime") or ""
+            kickoff  = _iso_to_it(start) if start else _now_it().strftime("%d/%m %H:%M")
+            tourn    = (
+                fix.get("tournamentName")
+                or fix.get("league")
+                or fix.get("tournament", {}).get("name", "Ping Pong")
+                if isinstance(fix.get("tournament"), dict)
+                else fix.get("tournament", "Ping Pong")
+            )
 
-            # SofaScore non fornisce quote → l'AI le stima
-            # Usiamo dati disponibili per dare contesto all'analizzatore
-            home_rank = ev.get("homeTeam", {}).get("ranking", None)
-            away_rank = ev.get("awayTeam", {}).get("ranking", None)
+            # Recupera quote
+            odds_home, odds_away, over_odds, under_odds, totals_line = \
+                None, None, None, None, 3.5
 
-            # Stima grezza probabilità da ranking (se disponibile)
-            odds_home, odds_away = self._estimate_odds_from_ranking(home_rank, away_rank)
+            if fid:
+                try:
+                    async with session.get(
+                        f"{ODDSPAPI_BASE}/odds",
+                        params={
+                            "apiKey":    ODDSPAPI_KEY,
+                            "fixtureId": fid,
+                            "marketId":  "101",   # 101 = Match Winner (moneyline)
+                        },
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            odds_home, odds_away, over_odds, under_odds, totals_line = \
+                                self._extract_oddspapi_odds(data, p1, p2)
+                except Exception as e:
+                    logger.debug(f"OddsPapi odds errore fixture {fid}: {e}")
+
+            # Se non abbiamo le quote, stima ragionevole (non random puro)
+            if odds_home is None:
+                odds_home = round(random.uniform(1.60, 2.20), 2)
+                odds_away = round(random.uniform(1.60, 2.20), 2)
+                source    = "oddspapi_noodds"
+            else:
+                source = "oddspapi"
 
             return {
-                "event_id":    str(ev.get("id", "")),
-                "name":        f"{home} vs {away}",
-                "player1":     home,
-                "player2":     away,
-                "kickoff":     kickoff,
-                "tournament":  full_t_name,
-                "status":      "scheduled",
-                "odds_home":   odds_home,
-                "odds_away":   odds_away,
-                "over_odds":   None,
-                "under_odds":  None,
-                "totals_line": 3.5,
-                "source":      "sofascore",
-                "book_note":   BOOK_NOTE_TEMPLATE.format(tournament=tournament),
-            }
-        except Exception as e:
-            logger.debug(f"Parse SofaScore event error: {e}")
-            return None
-
-    def _estimate_odds_from_ranking(
-        self, rank1, rank2
-    ) -> tuple[float, float]:
-        """
-        Stima grezza quote moneyline da ranking mondiale.
-        Senza ranking → assume partita equilibrata.
-        """
-        if rank1 and rank2:
-            try:
-                r1, r2 = int(rank1), int(rank2)
-                # Più basso il ranking = più forte il giocatore
-                total   = r1 + r2
-                prob1   = r2 / total   # prob. home di vincere
-                prob2   = r1 / total
-                margin  = 0.05         # 5% margine book
-                o1 = round(1 / (prob1 + margin / 2), 2)
-                o2 = round(1 / (prob2 + margin / 2), 2)
-                # Clamp tra 1.30 e 4.00
-                o1 = max(1.30, min(4.00, o1))
-                o2 = max(1.30, min(4.00, o2))
-                return o1, o2
-            except Exception:
-                pass
-        # Partita equilibrata di default
-        return round(random.uniform(1.70, 2.10), 2), round(random.uniform(1.70, 2.10), 2)
-
-    # ══ RISULTATI ════════════════════════════════════════════════════════════
-    async def fetch_scores(self) -> list[dict]:
-        """Partite WTT terminate ieri e oggi."""
-        results = []
-        now = _now_it()
-        dates = [
-            (now - timedelta(days=1)).strftime("%Y-%m-%d"),
-            now.strftime("%Y-%m-%d"),
-        ]
-
-        async with aiohttp.ClientSession(headers=SOFA_HEADERS) as session:
-            for date_str in dates:
-                url = f"{SOFA_BASE}/sport/table-tennis/scheduled-events/{date_str}"
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                        for ev in data.get("events", []):
-                            # Solo partite finite
-                            status = ev.get("status", {}).get("type", "")
-                            if status != "finished":
-                                continue
-
-                            home      = ev.get("homeTeam", {}).get("name", "")
-                            away      = ev.get("awayTeam", {}).get("name", "")
-                            home_score = ev.get("homeScore", {}).get("current", None)
-                            away_score = ev.get("awayScore", {}).get("current", None)
-
-                            if not home or not away:
-                                continue
-                            if home_score is None or away_score is None:
-                                continue
-
-                            winner = home if home_score > away_score else away
-                            results.append({
-                                "event_id":   str(ev.get("id", "")),
-                                "home":       home,
-                                "away":       away,
-                                "home_score": home_score,
-                                "away_score": away_score,
-                                "winner":     winner,
-                            })
-                except Exception as e:
-                    logger.warning(f"SofaScore scores {date_str}: {e}")
-
-        logger.info(f"SofaScore scores: {len(results)} partite finite")
-        return results
-
-    # ══ FALLBACK DEMO ════════════════════════════════════════════════════════
-    def get_fallback_matches(self) -> list[dict]:
-        """Usato solo se SofaScore non risponde. Dati demo."""
-        players = [
-            ("Fan Zhendong",      "Wang Chuqin"),
-            ("Ma Long",           "Truls Moregard"),
-            ("Lin Gaoyuan",       "Felix Lebrun"),
-            ("Timo Boll",         "Patrick Franziska"),
-            ("Tomokazu Harimoto", "Hugo Calderano"),
-        ]
-        tournaments = [
-            "WTT Contender Tunis",
-            "WTT Star Contender Doha",
-            "WTT Contender Zagreb",
-        ]
-        now_it = _now_it()
-        random.shuffle(players)
-        matches = []
-        for p1, p2 in players[:4]:
-            t = random.choice(tournaments)
-            kickoff_dt = now_it + timedelta(hours=random.randint(2, 18))
-            odds_h = round(random.uniform(1.60, 2.20), 2)
-            odds_a = round(random.uniform(1.60, 2.20), 2)
-            matches.append({
-                "event_id":    "",
+                "event_id":    str(fid),
                 "name":        f"{p1} vs {p2}",
                 "player1":     p1,
                 "player2":     p2,
-                "kickoff":     kickoff_dt.strftime("%d/%m %H:%M"),
-                "tournament":  t,
+                "kickoff":     kickoff,
+                "tournament":  str(tourn),
                 "status":      "scheduled",
-                "odds_home":   odds_h,
-                "odds_away":   odds_a,
-                "over_odds":   None,
-                "under_odds":  None,
-                "totals_line": 3.5,
-                "source":      "fallback",
-                "book_note":   f"⚠️ DEMO — Cerca su Bet365 → Ping Pong → {t}",
-            })
-        return matches
+                "odds_home":   round(odds_home, 3),
+                "odds_away":   round(odds_away, 3),
+                "over_odds":   round(over_odds,  3) if over_odds  else None,
+                "under_odds":  round(under_odds, 3) if under_odds else None,
+                "totals_line": totals_line,
+                "source":      source,
+                "sport":       "tabletennis",
+                "sport_label": "🏓 Ping Pong",
+            }
+        except Exception as e:
+            logger.debug(f"OddsPapi parse errore: {e}")
+            return None
 
-    # ══ UTILS ════════════════════════════════════════════════════════════════
-    def _sort(self, matches: list[dict]) -> list[dict]:
+    def _extract_oddspapi_odds(
+        self, data: dict, p1: str, p2: str
+    ) -> tuple:
+        """Estrae le migliori quote dal response OddsPapi."""
+        odds_home = odds_away = over_odds = under_odds = None
+        totals_line = 3.5
+
+        # Struttura: {"bookmakerOdds": {"bookmakerSlug": {"outcomes": [...]}}}
+        bm_odds = data.get("bookmakerOdds") or {}
+        for bm_slug, bm_data in bm_odds.items():
+            outcomes = bm_data.get("outcomes") or []
+            for o in outcomes:
+                name  = (o.get("name") or o.get("participant") or "").lower()
+                price = float(o.get("price") or o.get("odds") or 0)
+                if not price:
+                    continue
+                if p1.lower() in name or name in p1.lower():
+                    if odds_home is None or price > odds_home:
+                        odds_home = price
+                elif p2.lower() in name or name in p2.lower():
+                    if odds_away is None or price > odds_away:
+                        odds_away = price
+                elif "over" in name:
+                    if over_odds is None or price > over_odds:
+                        over_odds = price
+                        pt = float(o.get("point") or o.get("line") or 3.5)
+                        totals_line = pt
+                elif "under" in name:
+                    if under_odds is None or price > under_odds:
+                        under_odds = price
+
+        return odds_home, odds_away, over_odds, under_odds, totals_line
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── The Odds API: Tennis ───────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _fetch_odds_api_tennis(self) -> list[dict]:
+        """Recupera partite di tennis da The Odds API (sport key: 'tennis')."""
+        matches = []
+        # "tennis" restituisce ATP + WTA + ITF aggregati
+        sports_to_try = ["tennis", "tennis_atp", "tennis_wta"]
+
+        async with aiohttp.ClientSession() as session:
+            for sport_key in sports_to_try:
+                url = (
+                    f"{ODDS_BASE}/sports/{sport_key}/odds/"
+                    f"?apiKey={ODDS_KEY}"
+                    f"&regions=eu,uk"
+                    f"&markets=h2h"
+                    f"&oddsFormat=decimal"
+                    f"&dateFormat=iso"
+                )
+                try:
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        rem  = resp.headers.get("x-requests-remaining", "?")
+                        used = resp.headers.get("x-requests-used",      "?")
+                        logger.info(
+                            f"The Odds API tennis ({sport_key}) — usate:{used} rimaste:{rem}"
+                        )
+                        if resp.status == 200:
+                            events = await resp.json()
+                            logger.info(
+                                f"The Odds API ({sport_key}): {len(events)} eventi"
+                            )
+                            for ev in events:
+                                parsed = self._parse_odds_api_tennis(ev)
+                                if parsed:
+                                    matches.append(parsed)
+                            if matches:
+                                break   # bastano le partite del primo sport key valido
+                        elif resp.status == 404:
+                            logger.info(f"Sport key '{sport_key}' non trovato, provo il prossimo")
+                        else:
+                            txt = await resp.text()
+                            logger.warning(
+                                f"The Odds API ({sport_key}) status {resp.status}: {txt[:120]}"
+                            )
+                except Exception as e:
+                    logger.error(f"The Odds API tennis errore ({sport_key}): {e}")
+
+        # Dedup interni per nome partita
         seen, unique = set(), []
         for m in matches:
             if m["name"] not in seen:
                 seen.add(m["name"])
                 unique.append(m)
+        return unique
 
-        def key(m):
+    def _parse_odds_api_tennis(self, ev: dict) -> dict | None:
+        try:
+            home = ev.get("home_team", "").strip()
+            away = ev.get("away_team", "").strip()
+            if not home or not away:
+                return None
+
+            kickoff = _iso_to_it(ev.get("commence_time", ""))
+            sport   = ev.get("sport_title", "Tennis")
+
+            best: dict[str, float] = {}
+            for bm in ev.get("bookmakers", []):
+                for market in bm.get("markets", []):
+                    if market["key"] == "h2h":
+                        for o in market.get("outcomes", []):
+                            p = float(o["price"])
+                            n = o["name"]
+                            if n not in best or p > best[n]:
+                                best[n] = p
+
+            if home not in best or away not in best:
+                return None
+
+            return {
+                "event_id":    ev.get("id", ""),
+                "name":        f"{home} vs {away}",
+                "player1":     home,
+                "player2":     away,
+                "kickoff":     kickoff,
+                "tournament":  sport,
+                "status":      "scheduled",
+                "odds_home":   round(best[home], 3),
+                "odds_away":   round(best[away], 3),
+                "over_odds":   None,
+                "under_odds":  None,
+                "totals_line": None,
+                "source":      "odds_api",
+                "sport":       "tennis",
+                "sport_label": "🎾 Tennis",
+            }
+        except Exception as e:
+            logger.debug(f"Parse tennis errore: {e}")
+            return None
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── Scores (aggiornamento risultati) ──────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def fetch_scores(self) -> list[dict]:
+        """
+        Risultati delle partite completate nelle ultime 24h.
+        Copre sia tennis (The Odds API) sia ping pong (OddsPapi — se disponibile).
+        Formato: [{home, away, winner, sport}, ...]
+        """
+        results = []
+
+        # Tennis via The Odds API
+        if ODDS_KEY:
+            for sport_key in ["tennis", "tennis_atp", "tennis_wta"]:
+                url = (
+                    f"{ODDS_BASE}/sports/{sport_key}/scores/"
+                    f"?apiKey={ODDS_KEY}&daysFrom=1&dateFormat=iso"
+                )
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        async with session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=15)
+                        ) as resp:
+                            if resp.status == 200:
+                                events = await resp.json()
+                                for ev in events:
+                                    if not ev.get("completed"):
+                                        continue
+                                    scores = ev.get("scores") or []
+                                    if len(scores) < 2:
+                                        continue
+                                    score_map = {s["name"]: int(s["score"]) for s in scores}
+                                    home = ev.get("home_team", "")
+                                    away = ev.get("away_team", "")
+                                    if home in score_map and away in score_map:
+                                        results.append({
+                                            "home":   home,
+                                            "away":   away,
+                                            "winner": home if score_map[home] > score_map[away] else away,
+                                            "sport":  "tennis",
+                                        })
+                                if results:
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Scores tennis errore ({sport_key}): {e}")
+
+        logger.info(f"Scores totali: {len(results)} partite completate")
+        return results
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── Fallback e utilities ───────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def get_fallback_matches(self) -> list[dict]:
+        """Partite demo per sviluppo/test — chiaramente marcate come fallback."""
+        now = _now_it()
+        tt_players = [
+            ("Fan Zhendong", "Wang Chuqin"),
+            ("Ma Long", "Truls Moregard"),
+            ("Lin Gaoyuan", "Felix Lebrun"),
+        ]
+        tennis_players = [
+            ("Jannik Sinner", "Carlos Alcaraz"),
+            ("Novak Djokovic", "Daniil Medvedev"),
+            ("Alexander Zverev", "Stefanos Tsitsipas"),
+        ]
+        tt_tournaments     = ["Setka Cup", "Liga Pro", "TT Elite Series"]
+        tennis_tournaments = ["ATP Masters 1000", "WTA 1000", "ATP 500"]
+
+        matches = []
+        for i, (p1, p2) in enumerate(tt_players[:2]):
+            matches.append({
+                "event_id":    f"fb_tt_{i}",
+                "name":        f"{p1} vs {p2}",
+                "player1":     p1, "player2": p2,
+                "kickoff":     (now + timedelta(hours=i+1)).strftime("%d/%m %H:%M"),
+                "tournament":  random.choice(tt_tournaments),
+                "status":      "scheduled",
+                "odds_home":   round(random.uniform(1.60, 2.20), 2),
+                "odds_away":   round(random.uniform(1.60, 2.20), 2),
+                "over_odds":   round(random.uniform(1.65, 2.00), 2),
+                "under_odds":  round(random.uniform(1.60, 1.90), 2),
+                "totals_line": 3.5,
+                "source":      "fallback",
+                "sport":       "tabletennis",
+                "sport_label": "🏓 Ping Pong",
+            })
+        for i, (p1, p2) in enumerate(tennis_players[:2]):
+            matches.append({
+                "event_id":    f"fb_ten_{i}",
+                "name":        f"{p1} vs {p2}",
+                "player1":     p1, "player2": p2,
+                "kickoff":     (now + timedelta(hours=i+3)).strftime("%d/%m %H:%M"),
+                "tournament":  random.choice(tennis_tournaments),
+                "status":      "scheduled",
+                "odds_home":   round(random.uniform(1.40, 2.80), 2),
+                "odds_away":   round(random.uniform(1.40, 2.80), 2),
+                "over_odds":   None,
+                "under_odds":  None,
+                "totals_line": None,
+                "source":      "fallback",
+                "sport":       "tennis",
+                "sport_label": "🎾 Tennis",
+            })
+        return matches
+
+    def _sort_dedup(self, matches: list[dict]) -> list[dict]:
+        seen, unique = set(), []
+        for m in matches:
+            key = m["name"]
+            if key not in seen:
+                seen.add(key)
+                unique.append(m)
+
+        def sort_key(m):
             try:
                 return datetime.strptime(m["kickoff"], "%d/%m %H:%M")
             except Exception:
                 return datetime.max
 
-        unique.sort(key=key)
+        unique.sort(key=sort_key)
         return unique

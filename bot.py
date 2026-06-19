@@ -26,7 +26,7 @@ ROME         = ZoneInfo("Europe/Rome")
 TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
 VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
-
+ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
 db       = Database()
 scraper  = SignalScraper()
@@ -45,14 +45,26 @@ PERSISTENT_KB = ReplyKeyboardMarkup(
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 def signal_text(s: dict, for_vip: bool = False) -> str:
     icons  = {"winner": "🏆", "over": "📈", "under": "📉", "handicap": "⚖️", "set": "🎯"}
-    icon   = icons.get(s["signal_type"], "🏓")
+    icon   = icons.get(s["signal_type"], "🎯")
     stars  = "⭐" * min(5, max(1, round(s["confidence"] / 20)))
     vsign  = f"+{s['value_pct']:.1f}%" if s["value_pct"] > 0 else f"{s['value_pct']:.1f}%"
-    src_map = {"sofascore": "📊 WTT Reale (quote stimate)", "fallback": "⚠️ Demo"}
-    src     = src_map.get(s.get("source", ""), "📊 Quote stimate")
+
+    # Determina sport e intestazione
+    sport_label = s.get("sport_label", "🏓 Ping Pong")
+    sport_name  = "PING PONG" if "Ping" in sport_label else "TENNIS"
+    default_tourn = "Ping Pong" if "Ping" in sport_label else "Tennis"
+
+    # Fonte dati
+    src_map = {
+        "odds_api":        "📡 The Odds API",
+        "oddspapi":        "📡 OddsPapi",
+        "oddspapi_noodds": "📡 OddsPapi (fixture only)",
+        "fallback":        "⚠️ Quote stimate",
+    }
+    src = src_map.get(s.get("source", ""), "⚠️ Quote stimate")
 
     text = (
-        f"🏓 *SEGNALE PING PONG*\n"
+        f"{sport_label} *SEGNALE {sport_name}*\n"
         f"{'━' * 22}\n"
         f"{icon} *{s['match']}*\n"
         f"🎯 Giocata: *{s['pick']}*\n"
@@ -61,7 +73,7 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         f"💡 Value edge: *{vsign}*\n"
         f"📌 Stake: *{s['stake']}/5*\n"
         f"⏰ Inizio: *{s['kickoff']}*\n"
-        f"🌍 Torneo: {s.get('tournament', 'Ping Pong')}\n"
+        f"🌍 Torneo: {s.get('tournament', default_tourn)}\n"
         f"🔗 Fonte: {src}\n"
     )
     if not for_vip:
@@ -80,15 +92,27 @@ def now_it_str() -> str:
     return datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
 
 def admin_panel_text() -> str:
-    s       = db.get_settings()
-    stats   = db.get_stats()
-    src_tag = "📊 SofaScore — partite WTT reali (Bet365 Italia)"
+    s     = db.get_settings()
+    stats = db.get_stats()
+
+    oddspapi_key = os.environ.get("ODDSPAPI_KEY", "")
+    src_parts = []
+    if oddspapi_key:
+        src_parts.append("📡 OddsPapi (🏓)")
+    else:
+        src_parts.append("⚠️ OddsPapi non configurata")
+    if ODDS_KEY:
+        src_parts.append("📡 The Odds API (🎾)")
+    else:
+        src_parts.append("⚠️ The Odds API non configurata")
+    src_tag = " | ".join(src_parts)
+
     return (
-        f"🏓 *PingPong Signals — Admin Panel*\n"
+        f"🏓🎾 *Signals Bot — Admin Panel*\n"
         f"{'━' * 26}\n"
         f"🕐 Ora: {now_it_str()}\n"
-        f"🔗 Fonte: {src_tag}\n\n"
-        f"📨 Segnali oggi: *{stats['total']}* | ⏳ Pendenti: *{stats['pending']}*\n"
+        f"🔗 {src_tag}\n\n"
+        f"📨 Segnali tot: *{stats['total']}* | ⏳ Pendenti: *{stats['pending']}*\n"
         f"✅ Vinti: *{stats['won']}* | ❌ Persi: *{stats['lost']}* | 🏆 Win%: *{stats['winrate']}%*\n"
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
         f"⚙️ Scan ogni *{s['scan_interval']}h* | "
@@ -467,9 +491,25 @@ async def run_signal_scan(app: Application) -> int:
         logger.error(f"Errore scraping: {e}")
         matches = scraper.get_fallback_matches()
 
-    # Log fonte dati
+    # Log fonti e sport
     sources = set(m.get("source", "?") for m in matches)
-    logger.info(f"Fonte dati: {sources} — {len(matches)} partite")
+    sports  = set(m.get("sport", "?") for m in matches)
+    logger.info(f"Fonti: {sources} | Sport: {sports} | Partite: {len(matches)}")
+
+    # Se nessuna partita reale (solo fallback) avvisa l'admin
+    real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
+    if not real_matches and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
+        logger.info("Nessuna partita reale disponibile in questo momento")
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "ℹ️ *Nessuna partita disponibile*\n\n"
+                "Le API non hanno partite quotate al momento.\n"
+                "Il prossimo scan automatico riproverà tra poco."
+            ),
+            parse_mode="Markdown",
+        )
+        return 0
 
     new_signals = 0
     settings    = db.get_settings()
@@ -490,6 +530,7 @@ async def run_signal_scan(app: Application) -> int:
                 sig_id = db.save_signal(sig)
                 new_signals += 1
 
+                sport_label = sig.get("sport_label", "🏓 Ping Pong")
                 kb = [[
                     InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
                     InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
@@ -499,7 +540,7 @@ async def run_signal_scan(app: Application) -> int:
                 ]]
                 await app.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"🆕 *Nuovo segnale!*\n\n{signal_text(sig)}",
+                    text=f"🆕 *Nuovo segnale {sport_label}!*\n\n{signal_text(sig)}",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
@@ -586,7 +627,7 @@ async def run_auto_results(app: Application):
                 chat_id=ADMIN_ID,
                 text=(
                     f"{emoji} *Risultato aggiornato automaticamente!*\n\n"
-                    f"🏓 {sig['match']}\n"
+                    f"{sig.get('sport_label', '🏓')} {sig['match']}\n"
                     f"🎯 {sig['pick']} @ {sig['odds']}\n"
                     f"{'✅ VINTO!' if result == 'won' else '❌ Perso.'}"
                 ),
