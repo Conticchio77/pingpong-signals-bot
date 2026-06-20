@@ -148,6 +148,17 @@ class SignalScraper:
                     if isinstance(fixtures, dict):
                         fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                     logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
+
+                    # Limita a 30 fixture più vicine nel tempo per evitare rate limit
+                    # (ogni fixture = 1 chiamata API per le quote)
+                    def _sort_key(f):
+                        s = f.get("startDate") or f.get("startTime") or ""
+                        try:
+                            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        except Exception:
+                            return datetime.max.replace(tzinfo=IT_TZ)
+                    fixtures = sorted(fixtures, key=_sort_key)[:30]
+                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture (evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []

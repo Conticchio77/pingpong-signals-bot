@@ -156,6 +156,12 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
+    def purge_all_signals(self) -> int:
+        """Cancella TUTTI i segnali e azzera le statistiche."""
+        cur = self.conn.execute("DELETE FROM signals")
+        self.conn.commit()
+        return cur.rowcount
+
     def reset_results(self):
         """Azzera tutti i risultati (vinto/perso) senza cancellare i segnali."""
         self.conn.execute("UPDATE signals SET result=NULL WHERE result IN ('won','lost')")

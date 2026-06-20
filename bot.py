@@ -214,8 +214,9 @@ async def send_signals_list(fn):
 async def send_stats(fn):
     stats = db.get_stats()
     kb = [
-        [InlineKeyboardButton("🗑 Reset statistiche", callback_data="confirm_reset_stats")],
-        [InlineKeyboardButton("🔙 Home",              callback_data="admin_home")],
+        [InlineKeyboardButton("🗑 Reset risultati (mantieni segnali)", callback_data="confirm_reset_stats")],
+        [InlineKeyboardButton("💣 Reset COMPLETO (cancella tutto)", callback_data="confirm_purge_all")],
+        [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     await fn(
         f"📊 *Statistiche*\n\n"
@@ -340,13 +341,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("result_"):
         parts  = data.split("_")
         sig_id, result = int(parts[1]), parts[2]
+        sig = db.get_signal(sig_id)
         db.update_signal_status(sig_id, result, result)
-        emoji = "✅ *VINTO!* Ottimo segnale!" if result == "won" else "❌ *Perso.* Prossima volta!"
+        emoji  = "✅" if result == "won" else "❌"
+        label  = "VINTO! 🎉" if result == "won" else "Perso."
         kb = [
             [InlineKeyboardButton("📋 Torna alla lista", callback_data="admin_list")],
             [InlineKeyboardButton("🔙 Home",             callback_data="admin_home")],
         ]
-        await query.edit_message_text(emoji, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(
+            f"{emoji} *{label}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
+        )
+        # Notifica separata con dettagli segnale
+        if sig:
+            sport_label = sig.get("sport_label", "🏓")
+            await query.message.reply_text(
+                f"{emoji} *Risultato aggiornato*\n"
+                f"{'━' * 20}\n"
+                f"{sport_label} {sig['match']}\n"
+                f"🎯 {sig['pick']} @ {sig['odds']}\n"
+                f"📊 Confidenza: {sig['confidence']}% | Value: +{sig['value_pct']}%\n"
+                f"📌 Stake: {sig['stake']}/5\n\n"
+                f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*",
+                parse_mode="Markdown"
+            )
 
     # ── Cancella vecchi segnali — conferma ──────────────────────────────────────
     elif data == "confirm_purge":
@@ -374,14 +392,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_stats":
         await send_stats(query.edit_message_text)
 
-    # ── Reset stats — chiedi conferma ────────────────────────────────────────────
+    # ── Reset risultati (mantieni segnali) ───────────────────────────────────────
     elif data == "confirm_reset_stats":
         kb = [
-            [InlineKeyboardButton("⚠️ SÌ, resetta tutto", callback_data="do_reset_stats")],
-            [InlineKeyboardButton("❌ Annulla",            callback_data="admin_stats")],
+            [InlineKeyboardButton("⚠️ SÌ, azzera risultati", callback_data="do_reset_stats")],
+            [InlineKeyboardButton("❌ Annulla",               callback_data="admin_stats")],
         ]
         await query.edit_message_text(
-            "⚠️ *Sei sicuro?*\n\nVerranno azzerati tutti i risultati (vinti/persi).\nI segnali rimarranno in lista.",
+            "⚠️ *Reset risultati*\n\nVengono azzerati vinti/persi. I segnali rimangono.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -389,7 +407,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "do_reset_stats":
         db.reset_results()
         await query.edit_message_text(
-            "✅ Statistiche resettate.",
+            "✅ Risultati azzerati. I segnali sono rimasti.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Stats", callback_data="admin_stats")]])
+        )
+
+    # ── Reset COMPLETO (cancella tutto) ──────────────────────────────────────────
+    elif data == "confirm_purge_all":
+        kb = [
+            [InlineKeyboardButton("💣 SÌ, cancella TUTTO", callback_data="do_purge_all")],
+            [InlineKeyboardButton("❌ Annulla",             callback_data="admin_stats")],
+        ]
+        await query.edit_message_text(
+            "💣 *Reset COMPLETO*\n\n"
+            "⚠️ Verranno cancellati TUTTI i segnali e le statistiche.\n"
+            "Questa azione è irreversibile!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data == "do_purge_all":
+        count = db.purge_all_signals()
+        await query.edit_message_text(
+            f"💣 Reset completato. *{count}* segnali eliminati.",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
         )
 
