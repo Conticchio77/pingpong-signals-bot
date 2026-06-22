@@ -71,12 +71,13 @@ class Database:
                 pass  # colonna già esistente
 
         defaults = {
-            "scan_interval":  "1",
+            "scan_interval":  "2",
             "auto_send":      "0",
             "min_confidence": "55",
             "last_scan":      "mai",
             "sport_filter":   "both",
             "unit_value":     "10",   # €10 per unità stake
+            "tt_sport_id":    "",     # cache persistente ID OddsPapi ping pong
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -215,6 +216,21 @@ class Database:
         ).fetchone()
         new_val = "0" if (current and current["value"] == "1") else "1"
         self.set_setting(key, new_val)
+
+    # ── Cache sport ID OddsPapi (evita richieste /sports ripetute) ──────────────
+    def get_tt_sport_id(self) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key='tt_sport_id'"
+        ).fetchone()
+        if row and row["value"]:
+            try:
+                return int(row["value"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def set_tt_sport_id(self, sport_id: int):
+        self.set_setting("tt_sport_id", str(sport_id))
 
     def get_signals_for_auto_result(self) -> list[dict]:
         """Segnali pendenti/visti che potrebbero avere un risultato da aggiornare."""

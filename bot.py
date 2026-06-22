@@ -30,7 +30,7 @@ VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
 ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
 db       = Database()
-scraper  = SignalScraper()
+scraper  = SignalScraper(db=db)
 analyzer = AIAnalyzer()
 
 # ── Tastiera persistente (sempre visibile in basso) ──────────────────────────────
@@ -171,6 +171,8 @@ def genera_grafico_bilancio() -> io.BytesIO | None:
     except Exception as e:
         logger.error(f"Errore grafico bilancio: {e}")
         return None
+
+def admin_panel_text() -> str:
     s     = db.get_settings()
     stats = db.get_stats()
 

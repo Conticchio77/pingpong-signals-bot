@@ -53,8 +53,9 @@ def _iso_to_it(iso: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 class SignalScraper:
 
-    def __init__(self):
+    def __init__(self, db=None):
         self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
+        self.db = db   # se presente, cache persistente su DB (evita 429 da troppe /sports)
 
     # ── Entry point principale ─────────────────────────────────────────────────
     async def fetch_matches(self) -> list[dict]:
@@ -89,9 +90,20 @@ class SignalScraper:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _get_tt_sport_id(self, session: aiohttp.ClientSession) -> int | None:
-        """Scopre l'ID OddsPapi per il ping pong (cache in-memory)."""
+        """Scopre l'ID OddsPapi per il ping pong. Cache in-memory + persistente su DB
+        per evitare di richiamare /sports ad ogni scan (consuma quota → 429)."""
         if self._tt_sport_id:
             return self._tt_sport_id
+
+        # 1. Prova la cache persistente sul DB (sopravvive a restart/redeploy)
+        if self.db is not None:
+            cached = self.db.get_tt_sport_id()
+            if cached:
+                self._tt_sport_id = cached
+                logger.info(f"OddsPapi: ping pong sportId={cached} (da cache DB)")
+                return cached
+
+        # 2. Cache assente: interroga /sports (consuma 1 richiesta)
         try:
             async with session.get(
                 f"{ODDSPAPI_BASE}/sports",
@@ -107,6 +119,8 @@ class SignalScraper:
                     if "table" in name or "ping" in name:
                         self._tt_sport_id = s.get("sportId") or s.get("id")
                         logger.info(f"OddsPapi: ping pong sportId={self._tt_sport_id} ({s.get('name')})")
+                        if self.db is not None and self._tt_sport_id:
+                            self.db.set_tt_sport_id(self._tt_sport_id)
                         return self._tt_sport_id
                 # Log tutti gli sport disponibili per debug
                 names = [s.get("name", "?") for s in sports]
@@ -149,15 +163,15 @@ class SignalScraper:
                         fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                     logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
 
-                    # Limita a 30 fixture più vicine nel tempo per evitare rate limit
-                    # (ogni fixture = 1 chiamata API per le quote)
+                    # Limita a 12 fixture più vicine nel tempo per evitare rate limit
+                    # (ogni fixture = 1 chiamata API per le quote — piano gratuito 250/mese)
                     def _sort_key(f):
                         s = f.get("startDate") or f.get("startTime") or ""
                         try:
                             return datetime.fromisoformat(s.replace("Z", "+00:00"))
                         except Exception:
                             return datetime.max.replace(tzinfo=IT_TZ)
-                    fixtures = sorted(fixtures, key=_sort_key)[:30]
+                    fixtures = sorted(fixtures, key=_sort_key)[:12]
                     logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture (evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
