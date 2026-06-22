@@ -1,4 +1,5 @@
 import os
+import io
 import logging
 import asyncio
 import datetime
@@ -91,7 +92,85 @@ def vip_signal_text(s: dict) -> str:
 def now_it_str() -> str:
     return datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
 
-def admin_panel_text() -> str:
+def genera_grafico_bilancio() -> io.BytesIO | None:
+    """Genera un grafico PNG del bilancio nel tempo. Ritorna BytesIO o None."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
+        history = db.get_balance_history()
+        if len(history) < 2:
+            return None
+
+        balances = [0.0] + [r["balance"] for r in history]
+        labels   = ["Start"] + [f"#{i+1}" for i in range(len(history))]
+        colors   = ["#2ecc71" if b >= 0 else "#e74c3c" for b in balances[1:]]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), facecolor="#1a1a2e")
+        fig.suptitle("📊 Bilancio Segnali", color="white", fontsize=16, fontweight="bold", y=0.98)
+
+        # ── Grafico linea bilancio ─────────────────────────────────────────
+        ax1.set_facecolor("#16213e")
+        ax1.plot(range(len(balances)), balances, color="#3498db", linewidth=2.5, zorder=3)
+        ax1.fill_between(
+            range(len(balances)), balances, 0,
+            where=[b >= 0 for b in balances],
+            alpha=0.3, color="#2ecc71", label="Profitto"
+        )
+        ax1.fill_between(
+            range(len(balances)), balances, 0,
+            where=[b < 0 for b in balances],
+            alpha=0.3, color="#e74c3c", label="Perdita"
+        )
+        ax1.axhline(0, color="white", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax1.set_ylabel("Profitto (€)", color="white")
+        ax1.tick_params(colors="white")
+        ax1.spines[:].set_color("#444")
+        ax1.set_xlim(0, len(balances) - 1)
+        ax1.grid(axis="y", color="#333", linestyle="--", alpha=0.5)
+
+        # Annotazione ultimo valore
+        last_val = balances[-1]
+        color_last = "#2ecc71" if last_val >= 0 else "#e74c3c"
+        ax1.annotate(
+            f"€{last_val:+.0f}",
+            xy=(len(balances)-1, last_val),
+            color=color_last, fontsize=12, fontweight="bold",
+            xytext=(-40, 10), textcoords="offset points"
+        )
+
+        # ── Grafico barre singole scommesse ───────────────────────────────
+        ax2.set_facecolor("#16213e")
+        profits = [r["profit"] for r in history]
+        bar_colors = ["#2ecc71" if p >= 0 else "#e74c3c" for p in profits]
+        ax2.bar(range(len(profits)), profits, color=bar_colors, alpha=0.85, width=0.7)
+        ax2.axhline(0, color="white", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax2.set_ylabel("Profitto per bet (€)", color="white")
+        ax2.set_xlabel("Numero scommessa", color="white")
+        ax2.tick_params(colors="white")
+        ax2.spines[:].set_color("#444")
+        ax2.grid(axis="y", color="#333", linestyle="--", alpha=0.5)
+
+        won_patch  = mpatches.Patch(color="#2ecc71", label="Vinto")
+        lost_patch = mpatches.Patch(color="#e74c3c", label="Perso")
+        ax2.legend(handles=[won_patch, lost_patch], facecolor="#1a1a2e", labelcolor="white")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor="#1a1a2e")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    except ImportError:
+        logger.warning("matplotlib non installato — grafico non disponibile")
+        return None
+    except Exception as e:
+        logger.error(f"Errore grafico bilancio: {e}")
+        return None
     s     = db.get_settings()
     stats = db.get_stats()
 
@@ -213,21 +292,31 @@ async def send_signals_list(fn):
 
 async def send_stats(fn):
     stats = db.get_stats()
+    bal   = db.get_balance_stats()
+    bal_str = f"€{bal['current_balance']:+.0f}" if bal["total_bets"] > 0 else "n/d"
+    roi_str = f"{bal['roi']:+.1f}%" if bal["total_bets"] > 0 else "n/d"
+
     kb = [
+        [InlineKeyboardButton("📈 Grafico bilancio", callback_data="show_balance_chart")],
         [InlineKeyboardButton("🗑 Reset risultati (mantieni segnali)", callback_data="confirm_reset_stats")],
         [InlineKeyboardButton("💣 Reset COMPLETO (cancella tutto)", callback_data="confirm_purge_all")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     await fn(
-        f"📊 *Statistiche*\n\n"
+        f"📊 *Statistiche*\n"
+        f"{'━' * 22}\n"
         f"📨 Totali: *{stats['total']}*\n"
         f"📤 Inviati VIP: *{stats['sent_vip']}*\n"
         f"⏳ Pendenti: *{stats['pending']}*\n"
-        f"🗑 Scartati: *{stats['discarded']}*\n"
         f"✅ Vinti: *{stats['won']}*\n"
         f"❌ Persi: *{stats['lost']}*\n"
-        f"🏆 Win rate: *{stats['winrate']}%*\n"
-        f"💰 ROI: *{stats['roi']}%*\n"
+        f"🏆 Win rate: *{stats['winrate']}%*\n\n"
+        f"💰 *Bilancio*\n"
+        f"{'━' * 22}\n"
+        f"💵 Bilancio attuale: *{bal_str}*\n"
+        f"📈 ROI: *{roi_str}*\n"
+        f"🏅 Migliore vincita: *€{bal['best_win']:+.0f}*\n"
+        f"📉 Peggiore perdita: *€{bal['worst_loss']:+.0f}*\n"
         f"🔄 Ultimo scan: *{stats['last_scan']}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
@@ -248,6 +337,7 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
         [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
+        [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     await fn(
@@ -343,6 +433,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sig_id, result = int(parts[1]), parts[2]
         sig = db.get_signal(sig_id)
         db.update_signal_status(sig_id, result, result)
+        # Registra nel bilancio
+        if sig:
+            db.record_balance_entry(sig, result)
         emoji  = "✅" if result == "won" else "❌"
         label  = "VINTO! 🎉" if result == "won" else "Perso."
         kb = [
@@ -352,17 +445,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{emoji} *{label}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
         )
-        # Notifica separata con dettagli segnale
         if sig:
             sport_label = sig.get("sport_label", "🏓")
+            bal = db.get_balance_stats()
+            bal_str = f"€{bal['current_balance']:+.0f}" if bal["total_bets"] > 0 else "n/d"
             await query.message.reply_text(
                 f"{emoji} *Risultato aggiornato*\n"
                 f"{'━' * 20}\n"
                 f"{sport_label} {sig['match']}\n"
                 f"🎯 {sig['pick']} @ {sig['odds']}\n"
-                f"📊 Confidenza: {sig['confidence']}% | Value: +{sig['value_pct']}%\n"
                 f"📌 Stake: {sig['stake']}/5\n\n"
-                f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*",
+                f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*\n\n"
+                f"💰 Bilancio: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*",
                 parse_mode="Markdown"
             )
 
@@ -391,6 +485,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Statistiche ──────────────────────────────────────────────────────────────
     elif data == "admin_stats":
         await send_stats(query.edit_message_text)
+
+    elif data == "show_balance_chart":
+        bal = db.get_balance_stats()
+        if bal["total_bets"] < 2:
+            await query.answer("⚠️ Servono almeno 2 risultati per il grafico.", show_alert=True)
+            return
+        await query.answer("📈 Generazione grafico...")
+        buf = genera_grafico_bilancio()
+        kb = [[InlineKeyboardButton("🔙 Statistiche", callback_data="admin_stats")]]
+        if buf:
+            await query.message.reply_photo(
+                photo=buf,
+                caption=(
+                    f"📊 *Bilancio segnali*\n"
+                    f"{'━'*20}\n"
+                    f"💵 Attuale: *€{bal['current_balance']:+.0f}*\n"
+                    f"📈 ROI: *{bal['roi']:+.1f}%*\n"
+                    f"✅ {bal['won']}V / ❌ {bal['lost']}P | "
+                    f"Win%: *{bal['winrate']}%*"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+        else:
+            await query.message.reply_text(
+                "⚠️ Grafico non disponibile (matplotlib non installato).\n"
+                "Aggiungi `matplotlib` al requirements.txt.",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
 
     # ── Reset risultati (mantieni segnali) ───────────────────────────────────────
     elif data == "confirm_reset_stats":
@@ -517,6 +640,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_setting("sport_filter", val)
         await send_settings(query.edit_message_text)
 
+    # ── Scegli valore unità stake ─────────────────────────────────────────────
+    elif data == "pick_unit_value":
+        current = db.get_settings().get("unit_value", 10.0)
+        opts = [1, 2, 5, 10, 20, 25, 50, 100]
+        kb = []
+        for v in opts:
+            prefix = "✅ " if float(v) == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}€{v} per unità", callback_data=f"set_unit_{v}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "💶 *Valore unità stake*\n\n"
+            "Ogni segnale ha uno stake da 1 a 5 unità.\n"
+            "Scegli quanto vale 1 unità in €:\n\n"
+            "_Es. €10 → stake 3 = €30 a rischio_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_unit_"):
+        val = float(data.replace("set_unit_", ""))
+        db.set_setting("unit_value", val)
+        await send_settings(query.edit_message_text)
+
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
 _scheduler: AsyncIOScheduler | None = None
@@ -524,32 +670,41 @@ _scheduler: AsyncIOScheduler | None = None
 def _restart_scheduler(app: Application, hours: int):
     global _scheduler
     if _scheduler:
+        next_run = datetime.datetime.now(ROME) + datetime.timedelta(hours=hours)
         _scheduler.add_job(
             lambda: asyncio.ensure_future(run_signal_scan(app)),
-            trigger=IntervalTrigger(hours=hours),
-            id="signal_scan", replace_existing=True,
+            trigger=IntervalTrigger(hours=hours, timezone=ROME),
+            id="signal_scan",
+            replace_existing=True,
+            next_run_time=next_run,
         )
-        logger.info(f"⏰ Scheduler aggiornato: ogni {hours}h")
+        logger.info(f"⏰ Scheduler aggiornato: ogni {hours}h | prossimo scan: {next_run.strftime('%H:%M')}")
 
 async def post_init(app: Application):
     global _scheduler
     hours     = db.get_settings()["scan_interval"]
+    now       = datetime.datetime.now(ROME)
+
     _scheduler = AsyncIOScheduler(timezone=ROME)
+
+    # Scan segnali: parte subito (next_run_time=now) poi ripete ogni X ore
     _scheduler.add_job(
         lambda: asyncio.ensure_future(run_signal_scan(app)),
-        trigger=IntervalTrigger(hours=hours),
+        trigger=IntervalTrigger(hours=hours, timezone=ROME),
         id="signal_scan",
+        next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
-    # Auto-aggiornamento risultati ogni 30 minuti
+
+    # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
     _scheduler.add_job(
         lambda: asyncio.ensure_future(run_auto_results(app)),
-        trigger=IntervalTrigger(minutes=30),
+        trigger=IntervalTrigger(minutes=30, timezone=ROME),
         id="auto_results",
+        next_run_time=now + datetime.timedelta(minutes=10),
     )
+
     _scheduler.start()
     logger.info(f"⏰ Scheduler avviato — scan ogni {hours}h | risultati ogni 30min")
-    await asyncio.sleep(3)
-    await run_signal_scan(app)
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
 async def run_signal_scan(app: Application) -> int:
@@ -638,14 +793,17 @@ async def run_signal_scan(app: Application) -> int:
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
 async def run_auto_results(app: Application):
     """
-    Controlla The Odds API per i risultati delle partite completate
-    e aggiorna automaticamente i segnali pendenti.
+    Controlla le API per i risultati delle partite completate
+    e aggiorna automaticamente i segnali winner pendenti.
+    Over/Under rimane manuale (no dati set dalle API gratuite).
     """
     pending = db.get_signals_for_auto_result()
+    # Considera solo segnali winner — over/under non aggiornabili automaticamente
+    pending = [s for s in pending if s.get("signal_type") == "winner"]
     if not pending:
         return
 
-    logger.info(f"🔄 Auto-risultati: controllo {len(pending)} segnali pendenti...")
+    logger.info(f"🔄 Auto-risultati: controllo {len(pending)} segnali winner pendenti...")
 
     try:
         scores = await scraper.fetch_scores()
@@ -654,61 +812,87 @@ async def run_auto_results(app: Application):
         return
 
     if not scores:
+        logger.info("Auto-risultati: nessun risultato disponibile dalle API")
         return
 
-    # Crea mappa veloce: "player1 vs player2" → winner
     def normalize(name: str) -> str:
-        return name.lower().strip()
+        """Normalizza nomi per matching flessibile (rimuove accenti, spazi extra, ecc.)"""
+        import unicodedata
+        name = unicodedata.normalize("NFKD", name.lower().strip())
+        return "".join(c for c in name if not unicodedata.combining(c))
 
-    score_map = {}
-    for sc in scores:
-        key = f"{normalize(sc['home'])} vs {normalize(sc['away'])}"
-        score_map[key] = sc["winner"]
-        # anche reverse
-        key2 = f"{normalize(sc['away'])} vs {normalize(sc['home'])}"
-        score_map[key2] = sc["winner"]
+    def names_match(a: str, b: str) -> bool:
+        """Match flessibile: controlla se due nomi sono lo stesso giocatore."""
+        a, b = normalize(a), normalize(b)
+        if a == b:
+            return True
+        # Match parziale: cognome (ultima parola) corrisponde
+        a_parts = a.split()
+        b_parts = b.split()
+        if a_parts and b_parts and a_parts[-1] == b_parts[-1]:
+            return True
+        # Match se uno contiene l'altro (abbreviazioni tipo "T. Boll" vs "Timo Boll")
+        if len(a) > 4 and len(b) > 4:
+            if a in b or b in a:
+                return True
+        return False
 
     updated = 0
     for sig in pending:
-        match_key = normalize(sig["match"])  # "Fan Zhendong vs Wang Chuqin"
-        winner = score_map.get(match_key)
-        if not winner:
-            continue
-
-        # Determina se il segnale è vinto o perso
+        p1 = sig.get("player1", "")
+        p2 = sig.get("player2", "")
         pick = sig.get("pick", "").lower()
-        sig_type = sig.get("signal_type", "")
         result = None
+        matched_score = None
 
-        if sig_type == "winner":
-            # "fan zhendong vince" → controlla se il vincitore corrisponde
-            if normalize(winner) in pick or any(
-                normalize(p) in pick
-                for p in [sig["player1"], sig["player2"]]
-                if normalize(p) in normalize(winner)
-            ):
-                result = "won"
-            else:
-                result = "lost"
+        # Cerca il match nei risultati
+        for sc in scores:
+            home, away = sc.get("home",""), sc.get("away","")
+            if (names_match(p1, home) and names_match(p2, away)) or \
+               (names_match(p1, away) and names_match(p2, home)):
+                matched_score = sc
+                break
 
-        elif sig_type in ("over", "under"):
-            # Per over/under non abbiamo il totale set — skip auto-update
+        if not matched_score:
             continue
 
-        elif sig_type == "handicap":
-            # Per handicap serve il numero di set — skip auto-update
-            continue
+        winner = matched_score.get("winner", "")
 
-        if result and db.auto_update_result(sig["id"], result):
+        # Determina vinto/perso: controlla se il vincitore è quello che abbiamo puntato
+        if names_match(p1, winner):
+            picked_won = names_match(p1, winner) and (
+                normalize(p1) in pick or
+                any(part in pick for part in normalize(p1).split() if len(part) > 3)
+            )
+        else:
+            picked_won = names_match(p2, winner) and (
+                normalize(p2) in pick or
+                any(part in pick for part in normalize(p2).split() if len(part) > 3)
+            )
+
+        result = "won" if picked_won else "lost"
+
+        if db.auto_update_result(sig["id"], result):
             updated += 1
+            # Registra nel bilancio
+            db.record_balance_entry(sig, result)
+
             emoji = "✅" if result == "won" else "❌"
+            bal_stats = db.get_balance_stats()
+            bal_str = f"€{bal_stats['current_balance']:+.0f}" if bal_stats["total_bets"] > 0 else "n/d"
+
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    f"{emoji} *Risultato aggiornato automaticamente!*\n\n"
-                    f"{sig.get('sport_label', '🏓')} {sig['match']}\n"
+                    f"{emoji} *Risultato automatico!*\n"
+                    f"{'━' * 22}\n"
+                    f"{sig.get('sport_label','🏓')} {sig['match']}\n"
                     f"🎯 {sig['pick']} @ {sig['odds']}\n"
-                    f"{'✅ VINTO!' if result == 'won' else '❌ Perso.'}"
+                    f"📌 Stake: {sig['stake']}/5\n\n"
+                    f"{'✅ *VINTO!* 🎉' if result == 'won' else '❌ *Perso.*'}\n\n"
+                    f"💰 Bilancio attuale: *{bal_str}*\n"
+                    f"📊 W/L: {bal_stats['won']}V/{bal_stats['lost']}P | "
+                    f"Win%: {bal_stats['winrate']}% | ROI: {bal_stats['roi']}%"
                 ),
                 parse_mode="Markdown"
             )
