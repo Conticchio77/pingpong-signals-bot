@@ -440,39 +440,65 @@ class SignalScraper:
         Formato: [{home, away, winner, sport}, ...]
         """
         results = []
+        seen_pairs: set[tuple] = set()   # dedup home+away cross sport_key
 
         # Tennis via The Odds API
+        # NOTA: "tennis" come sport_key generico spesso risponde 200 ma con array vuoto.
+        # Le partite reali sono su "tennis_atp" e "tennis_wta" — si testano per prime.
+        # NON interrompere al primo 200: continua su tutti i keys e dedup per coppia.
         if ODDS_KEY:
-            for sport_key in ["tennis", "tennis_atp", "tennis_wta"]:
-                url = (
-                    f"{ODDS_BASE}/sports/{sport_key}/scores/"
-                    f"?apiKey={ODDS_KEY}&daysFrom=1&dateFormat=iso"
-                )
-                async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
+                for sport_key in ["tennis_atp", "tennis_wta", "tennis"]:
+                    url = (
+                        f"{ODDS_BASE}/sports/{sport_key}/scores/"
+                        f"?apiKey={ODDS_KEY}&daysFrom=1&dateFormat=iso"
+                    )
                     try:
                         async with session.get(
                             url, timeout=aiohttp.ClientTimeout(total=15)
                         ) as resp:
-                            if resp.status == 200:
-                                events = await resp.json()
-                                for ev in events:
-                                    if not ev.get("completed"):
-                                        continue
-                                    scores = ev.get("scores") or []
-                                    if len(scores) < 2:
-                                        continue
+                            if resp.status == 404:
+                                logger.info(
+                                    f"Scores: sport key '{sport_key}' non trovata (404), provo la prossima"
+                                )
+                                continue
+                            if resp.status != 200:
+                                logger.warning(
+                                    f"Scores tennis errore ({sport_key}): HTTP {resp.status}"
+                                )
+                                continue
+                            events = await resp.json()
+                            added = 0
+                            for ev in events:
+                                if not ev.get("completed"):
+                                    continue
+                                scores = ev.get("scores") or []
+                                if len(scores) < 2:
+                                    continue
+                                home = ev.get("home_team", "")
+                                away = ev.get("away_team", "")
+                                pair = (home.lower(), away.lower())
+                                if pair in seen_pairs:
+                                    continue   # già raccolto da un'altra sport key
+                                try:
                                     score_map = {s["name"]: int(s["score"]) for s in scores}
-                                    home = ev.get("home_team", "")
-                                    away = ev.get("away_team", "")
-                                    if home in score_map and away in score_map:
-                                        results.append({
-                                            "home":   home,
-                                            "away":   away,
-                                            "winner": home if score_map[home] > score_map[away] else away,
-                                            "sport":  "tennis",
-                                        })
-                                if results:
-                                    break
+                                except (KeyError, ValueError):
+                                    continue
+                                if home in score_map and away in score_map:
+                                    winner = (
+                                        home if score_map[home] > score_map[away] else away
+                                    )
+                                    results.append({
+                                        "home":   home,
+                                        "away":   away,
+                                        "winner": winner,
+                                        "sport":  "tennis",
+                                    })
+                                    seen_pairs.add(pair)
+                                    added += 1
+                            logger.info(
+                                f"Scores tennis ({sport_key}): {added} partite completate trovate"
+                            )
                     except Exception as e:
                         logger.warning(f"Scores tennis errore ({sport_key}): {e}")
 

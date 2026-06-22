@@ -859,18 +859,41 @@ async def run_auto_results(app: Application):
             continue
 
         winner = matched_score.get("winner", "")
+        if not winner:
+            logger.warning(f"Auto-risultati: vincitore vuoto per {p1} vs {p2}, skip")
+            continue
 
-        # Determina vinto/perso: controlla se il vincitore è quello che abbiamo puntato
-        if names_match(p1, winner):
-            picked_won = names_match(p1, winner) and (
-                normalize(p1) in pick or
-                any(part in pick for part in normalize(p1).split() if len(part) > 3)
+        # Chi ha vinto?
+        winner_is_p1 = names_match(p1, winner)
+        winner_is_p2 = names_match(p2, winner)
+
+        if not winner_is_p1 and not winner_is_p2:
+            logger.warning(
+                f"Auto-risultati: vincitore '{winner}' non corrisponde "
+                f"né a p1='{p1}' né a p2='{p2}' — skip"
             )
+            continue
+
+        # Il pick menziona esplicitamente uno dei due giocatori?
+        def pick_mentions(player: str) -> bool:
+            n = normalize(player)
+            if n in pick:
+                return True
+            return any(part in pick for part in n.split() if len(part) > 3)
+
+        p1_in_pick = pick_mentions(p1)
+        p2_in_pick = pick_mentions(p2)
+
+        if p1_in_pick and not p2_in_pick:
+            picked_won = winner_is_p1
+        elif p2_in_pick and not p1_in_pick:
+            picked_won = winner_is_p2
         else:
-            picked_won = names_match(p2, winner) and (
-                normalize(p2) in pick or
-                any(part in pick for part in normalize(p2).split() if len(part) > 3)
+            # Pick ambiguo (menziona entrambi o nessuno) — skip sicuro
+            logger.warning(
+                f"Auto-risultati: pick ambiguo '{sig['pick']}' per {p1} vs {p2} — skip"
             )
+            continue
 
         result = "won" if picked_won else "lost"
 
