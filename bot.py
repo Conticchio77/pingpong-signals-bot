@@ -668,13 +668,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
 _scheduler: AsyncIOScheduler | None = None
+_main_loop: asyncio.AbstractEventLoop | None = None  # loop principale dell'Application, catturato in post_init
+
+def _schedule_coro(coro_factory):
+    """Esegue una coroutine sul loop principale dell'Application da un thread esterno
+    (APScheduler esegue i job su un proprio thread executor, dove asyncio.ensure_future
+    fallisce con 'no current event loop')."""
+    if _main_loop is not None:
+        asyncio.run_coroutine_threadsafe(coro_factory(), _main_loop)
+    else:
+        logger.error("Scheduler: main loop non disponibile, job saltato")
 
 def _restart_scheduler(app: Application, hours: int):
     global _scheduler
     if _scheduler:
         next_run = datetime.datetime.now(ROME) + datetime.timedelta(hours=hours)
         _scheduler.add_job(
-            lambda: asyncio.ensure_future(run_signal_scan(app)),
+            lambda: _schedule_coro(lambda: run_signal_scan(app)),
             trigger=IntervalTrigger(hours=hours, timezone=ROME),
             id="signal_scan",
             replace_existing=True,
@@ -683,15 +693,16 @@ def _restart_scheduler(app: Application, hours: int):
         logger.info(f"⏰ Scheduler aggiornato: ogni {hours}h | prossimo scan: {next_run.strftime('%H:%M')}")
 
 async def post_init(app: Application):
-    global _scheduler
-    hours     = db.get_settings()["scan_interval"]
-    now       = datetime.datetime.now(ROME)
+    global _scheduler, _main_loop
+    hours      = db.get_settings()["scan_interval"]
+    now        = datetime.datetime.now(ROME)
+    _main_loop = asyncio.get_running_loop()   # loop principale, usato dai job per agganciarsi correttamente
 
     _scheduler = AsyncIOScheduler(timezone=ROME)
 
     # Scan segnali: parte subito (next_run_time=now) poi ripete ogni X ore
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_signal_scan(app)),
+        lambda: _schedule_coro(lambda: run_signal_scan(app)),
         trigger=IntervalTrigger(hours=hours, timezone=ROME),
         id="signal_scan",
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
@@ -699,7 +710,7 @@ async def post_init(app: Application):
 
     # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_auto_results(app)),
+        lambda: _schedule_coro(lambda: run_auto_results(app)),
         trigger=IntervalTrigger(minutes=30, timezone=ROME),
         id="auto_results",
         next_run_time=now + datetime.timedelta(minutes=10),
@@ -856,44 +867,22 @@ async def run_auto_results(app: Application):
                 break
 
         if not matched_score:
+            logger.info(f"Auto-risultati: nessun match trovato per '{p1}' vs '{p2}' tra {len(scores)} risultati")
             continue
 
         winner = matched_score.get("winner", "")
-        if not winner:
-            logger.warning(f"Auto-risultati: vincitore vuoto per {p1} vs {p2}, skip")
-            continue
 
-        # Chi ha vinto?
-        winner_is_p1 = names_match(p1, winner)
-        winner_is_p2 = names_match(p2, winner)
-
-        if not winner_is_p1 and not winner_is_p2:
-            logger.warning(
-                f"Auto-risultati: vincitore '{winner}' non corrisponde "
-                f"né a p1='{p1}' né a p2='{p2}' — skip"
+        # Determina vinto/perso: controlla se il vincitore è quello che abbiamo puntato
+        if names_match(p1, winner):
+            picked_won = names_match(p1, winner) and (
+                normalize(p1) in pick or
+                any(part in pick for part in normalize(p1).split() if len(part) > 3)
             )
-            continue
-
-        # Il pick menziona esplicitamente uno dei due giocatori?
-        def pick_mentions(player: str) -> bool:
-            n = normalize(player)
-            if n in pick:
-                return True
-            return any(part in pick for part in n.split() if len(part) > 3)
-
-        p1_in_pick = pick_mentions(p1)
-        p2_in_pick = pick_mentions(p2)
-
-        if p1_in_pick and not p2_in_pick:
-            picked_won = winner_is_p1
-        elif p2_in_pick and not p1_in_pick:
-            picked_won = winner_is_p2
         else:
-            # Pick ambiguo (menziona entrambi o nessuno) — skip sicuro
-            logger.warning(
-                f"Auto-risultati: pick ambiguo '{sig['pick']}' per {p1} vs {p2} — skip"
+            picked_won = names_match(p2, winner) and (
+                normalize(p2) in pick or
+                any(part in pick for part in normalize(p2).split() if len(part) > 3)
             )
-            continue
 
         result = "won" if picked_won else "lost"
 
