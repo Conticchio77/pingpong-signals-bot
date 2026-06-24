@@ -42,7 +42,7 @@ SOFT_BOOKS = {
 }
 
 # ── Soglie value bet ───────────────────────────────────────────────────────────
-MIN_VALUE_PCT   = 2.5    # % minimo di edge per generare segnale
+MIN_VALUE_PCT   = 5.0    # % minimo di edge per generare segnale
 MIN_ODDS        = 1.40   # quota minima accettata
 MAX_ODDS        = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS  = 1      # almeno N soft book devono confermare la quota
@@ -336,7 +336,11 @@ class AIAnalyzer:
         book_note:  str = "",
     ) -> dict:
         now     = datetime.now(IT_TZ)
-        key_str = f"{match['name']}|{sig_type}|{pick}|{now.strftime('%Y%m%d')}"
+        # match_key basato su PARTITA + TIPO segnale (non sul pick): evita che la stessa
+        # partita generi più segnali "winner" nello stesso giorno se le quote cambiano tra
+        # uno scan e l'altro (es. prima "Holmgren vince", poi "Kym vince"). Permette comunque
+        # un segnale "winner" + un segnale "over/under" sulla stessa partita, se entrambi validi.
+        key_str = f"{match['name']}|{sig_type}|{now.strftime('%Y%m%d')}"
         mk      = hashlib.md5(key_str.encode()).hexdigest()[:16]
         stake   = self._stake(fair_prob, odds, confidence)
 

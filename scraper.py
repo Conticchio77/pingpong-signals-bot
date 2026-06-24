@@ -55,6 +55,7 @@ class SignalScraper:
 
     def __init__(self, db=None):
         self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
+        self._odds_tennis_keys: list[str] | None = None  # cache sport_key torneo tennis attivi (The Odds API)
         self.db = db   # se presente, cache persistente su DB (evita 429 da troppe /sports)
 
     # ── Entry point principale ─────────────────────────────────────────────────
@@ -332,7 +333,7 @@ class SignalScraper:
                     f"{ODDS_BASE}/sports/{sport_key}/odds/"
                     f"?apiKey={ODDS_KEY}"
                     f"&regions=eu,uk"
-                    f"&markets=h2h"
+                    f"&markets=h2h,totals"
                     f"&oddsFormat=decimal"
                     f"&dateFormat=iso"
                 )
@@ -386,6 +387,7 @@ class SignalScraper:
 
             best: dict[str, float] = {}
             raw_bookmakers: dict   = {}
+            over_odds = under_odds = totals_line = None
 
             for bm in ev.get("bookmakers", []):
                 bm_slug = bm.get("key", "").lower()
@@ -403,6 +405,17 @@ class SignalScraper:
                                 entry["away"] = p
                         if "home" in entry and "away" in entry:
                             raw_bookmakers[bm_slug] = entry
+                    elif market["key"] == "totals":
+                        for o in market.get("outcomes", []):
+                            p   = float(o["price"])
+                            pt  = o.get("point")
+                            if o["name"].lower() == "over":
+                                if over_odds is None or p > over_odds:
+                                    over_odds   = p
+                                    totals_line = pt
+                            elif o["name"].lower() == "under":
+                                if under_odds is None or p > under_odds:
+                                    under_odds = p
 
             if home not in best or away not in best:
                 return None
@@ -417,9 +430,9 @@ class SignalScraper:
                 "status":         "scheduled",
                 "odds_home":      round(best[home], 3),
                 "odds_away":      round(best[away], 3),
-                "over_odds":      None,
-                "under_odds":     None,
-                "totals_line":    None,
+                "over_odds":      round(over_odds,  3) if over_odds  else None,
+                "under_odds":     round(under_odds, 3) if under_odds else None,
+                "totals_line":    totals_line,
                 "source":         "odds_api",
                 "sport":          "tennis",
                 "sport_label":    "🎾 Tennis",
@@ -433,6 +446,33 @@ class SignalScraper:
     # ── Scores (aggiornamento risultati) ──────────────────────────────────────
     # ══════════════════════════════════════════════════════════════════════════
 
+    async def _get_active_tennis_sport_keys(self, session: aiohttp.ClientSession) -> list[str]:
+        """The Odds API: l'aggregatore 'tennis' funziona per /odds/ ma NON per /scores/
+        (risponde 'Unknown sport'). /scores/ richiede il sport_key del singolo torneo
+        attivo (es. tennis_atp_wimbledon). Li scopriamo da /sports/ (attivi = in season)."""
+        if self._odds_tennis_keys is not None:
+            return self._odds_tennis_keys
+        try:
+            async with session.get(
+                f"{ODDS_BASE}/sports/",
+                params={"apiKey": ODDS_KEY},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"The Odds API /sports status {r.status}")
+                    return []
+                all_sports = await r.json()
+                keys = [
+                    s["key"] for s in all_sports
+                    if s.get("key", "").startswith("tennis") and s.get("active")
+                ]
+                logger.info(f"The Odds API: torneo tennis attivi trovati: {keys}")
+                self._odds_tennis_keys = keys
+                return keys
+        except Exception as e:
+            logger.error(f"The Odds API /sports errore: {e}")
+            return []
+
     async def fetch_scores(self) -> list[dict]:
         """
         Risultati delle partite completate nelle ultime 24h.
@@ -442,13 +482,18 @@ class SignalScraper:
         results = []
 
         # Tennis via The Odds API
+        # NB: l'aggregatore "tennis" funziona per /odds/ ma NON per /scores/
+        # (risponde "Unknown sport") — serve il sport_key del torneo specifico in corso.
         if ODDS_KEY:
-            for sport_key in ["tennis", "tennis_atp", "tennis_wta"]:
-                url = (
-                    f"{ODDS_BASE}/sports/{sport_key}/scores/"
-                    f"?apiKey={ODDS_KEY}&daysFrom=1&dateFormat=iso"
-                )
-                async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
+                tennis_keys = await self._get_active_tennis_sport_keys(session)
+                if not tennis_keys:
+                    logger.warning("Scores tennis: nessun torneo attivo trovato, salto controllo risultati")
+                for sport_key in tennis_keys:
+                    url = (
+                        f"{ODDS_BASE}/sports/{sport_key}/scores/"
+                        f"?apiKey={ODDS_KEY}&daysFrom=1&dateFormat=iso"
+                    )
                     try:
                         async with session.get(
                             url, timeout=aiohttp.ClientTimeout(total=15)
@@ -473,8 +518,6 @@ class SignalScraper:
                                             "winner": home if score_map[home] > score_map[away] else away,
                                             "sport":  "tennis",
                                         })
-                                if results:
-                                    break
                             else:
                                 txt = await resp.text()
                                 logger.warning(f"Scores tennis ({sport_key}) status {resp.status}: {txt[:200]}")
