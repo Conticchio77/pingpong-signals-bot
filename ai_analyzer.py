@@ -21,7 +21,7 @@ import hashlib
 import logging
 import math
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,9 @@ SOFT_BOOKS = {
 MIN_VALUE_PCT   = 5.0    # % minimo di edge per generare segnale
 MIN_ODDS        = 1.40   # quota minima accettata
 MAX_ODDS        = 5.00   # quota massima accettata
-MIN_SOFT_BOOKS  = 1      # almeno N soft book devono confermare la quota
+MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
+MIN_HOURS_BEFORE     = 1.0    # scarta segnali con meno di N ore all'inizio
+MAX_EDGE_NO_SHARP    = 25.0   # cap edge% quando non c'è sharp book (de-vig semplice)
 
 
 class AIAnalyzer:
@@ -63,6 +65,32 @@ class AIAnalyzer:
         signals   = []
         raw_bm    = match.get("raw_bookmakers", {})   # da scraper arricchito
         has_sharp = bool(raw_bm)
+
+        # ── Filtro anticipo kickoff ──────────────────────────────────────────
+        kickoff_str = match.get("kickoff", "")
+        if kickoff_str:
+            try:
+                # Kickoff può essere ISO o "DD/MM HH:MM"
+                try:
+                    ko = datetime.fromisoformat(kickoff_str)
+                    if ko.tzinfo is None:
+                        ko = ko.replace(tzinfo=IT_TZ)
+                except ValueError:
+                    # Formato "24/06 18:00" → aggiungi anno corrente
+                    year = datetime.now(IT_TZ).year
+                    ko = datetime.strptime(f"{year}/{kickoff_str}", "%Y/%d/%m %H:%M")
+                    ko = ko.replace(tzinfo=IT_TZ)
+
+                now_it = datetime.now(IT_TZ)
+                hours_to_ko = (ko - now_it).total_seconds() / 3600
+                if hours_to_ko < MIN_HOURS_BEFORE:
+                    logger.info(
+                        f"Segnale scartato (kickoff troppo vicino: {hours_to_ko:.1f}h < {MIN_HOURS_BEFORE}h): "
+                        f"{match.get('name','?')} — kickoff {kickoff_str}"
+                    )
+                    return []
+            except Exception as e:
+                logger.warning(f"Impossibile parsare kickoff '{kickoff_str}': {e}")
 
         # ── Stima probabilità reale ──────────────────────────────────────────
         if has_sharp:
@@ -88,6 +116,9 @@ class AIAnalyzer:
 
         if best_h and MIN_ODDS <= best_h <= MAX_ODDS:
             value_h = fair_home * best_h - 1
+            # Cap edge se non abbiamo sharp book (de-vig semplice poco affidabile)
+            if not has_sharp:
+                value_h = min(value_h, MAX_EDGE_NO_SHARP / 100)
             if value_h >= MIN_VALUE_PCT / 100:
                 conf = self._confidence(value_h, has_sharp, match.get("source",""))
                 signals.append(self._build(
@@ -104,6 +135,9 @@ class AIAnalyzer:
 
         if best_a and MIN_ODDS <= best_a <= MAX_ODDS:
             value_a = fair_away * best_a - 1
+            # Cap edge se non abbiamo sharp book
+            if not has_sharp:
+                value_a = min(value_a, MAX_EDGE_NO_SHARP / 100)
             if value_a >= MIN_VALUE_PCT / 100:
                 conf = self._confidence(value_a, has_sharp, match.get("source",""))
                 signals.append(self._build(
@@ -127,6 +161,10 @@ class AIAnalyzer:
             if fair_ov and fair_un:
                 value_ov = fair_ov * ov - 1
                 value_un = fair_un * un - 1
+                # O/U usa sempre de-vig semplice → cap se non c'è sharp book
+                if not has_sharp:
+                    value_ov = min(value_ov, MAX_EDGE_NO_SHARP / 100)
+                    value_un = min(value_un, MAX_EDGE_NO_SHARP / 100)
 
                 unit = "set" if sport == "tabletennis" else "games"
 
@@ -271,13 +309,21 @@ class AIAnalyzer:
         - Entità del value edge
         - Se abbiamo usato Pinnacle (più affidabile) o de-vig semplice
         - Fonte dati (API reale vs fallback)
+
+        NOTA: senza sharp book il de-vig semplice non è affidabile →
+        confidenza cappata a 65 e penalità più alta.
         """
         # Base: da 50% (edge=2.5%) a 82% (edge=15%+)
         base = 50 + int(min(value * 200, 32))
 
-        # Bonus se abbiamo dati Pinnacle reali
         if has_sharp:
+            # Dati Pinnacle reali → bonus affidabilità
             base += 8
+        else:
+            # De-vig semplice: meno affidabile, penalità forte + cap
+            base -= 12
+            base = min(base, 65)   # mai sopra 65% senza sharp book
+
         # Penalità per fonte meno affidabile
         if source == "fallback":
             base -= 15
@@ -316,10 +362,11 @@ class AIAnalyzer:
     ) -> str:
         method = "de-vig Pinnacle" if has_sharp else "de-vig mercato"
         fair_odd = round(1 / fair_prob, 2) if fair_prob > 0 else "?"
+        note = "" if has_sharp else " ⚠️ Nessun sharp book disponibile — edge stimato, affidabilità ridotta."
         return (
             f"Probabilità fair ({method}): {fair_prob:.1%} → quota fair {fair_odd}. "
             f"Quota disponibile: {best_odd} ({book or 'media'}) — "
-            f"edge reale: +{(fair_prob * best_odd - 1)*100:.1f}%"
+            f"edge reale: +{(fair_prob * best_odd - 1)*100:.1f}%{note}"
         )
 
     # ── Build segnale ─────────────────────────────────────────────────────────
