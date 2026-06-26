@@ -476,19 +476,22 @@ class SignalScraper:
     async def fetch_scores(self) -> list[dict]:
         """
         Risultati delle partite completate nelle ultime 24h.
-        Copre sia tennis (The Odds API) sia ping pong (OddsPapi — se disponibile).
+        Copre sia tennis (The Odds API) sia ping pong (OddsPapi).
         Formato: [{home, away, winner, sport}, ...]
         """
         results = []
 
-        # Tennis via The Odds API
-        # NB: l'aggregatore "tennis" funziona per /odds/ ma NON per /scores/
-        # (risponde "Unknown sport") — serve il sport_key del torneo specifico in corso.
+        # ── Tennis via The Odds API ──────────────────────────────────────────
         if ODDS_KEY:
             async with aiohttp.ClientSession() as session:
+                # Non usiamo la cache in-memory per i scores: potrebbe essere vuota
+                # se il bot è appena ripartito. Forziamo un refetch diretto.
+                saved_cache = self._odds_tennis_keys
+                self._odds_tennis_keys = None
                 tennis_keys = await self._get_active_tennis_sport_keys(session)
                 if not tennis_keys:
-                    logger.warning("Scores tennis: nessun torneo attivo trovato, salto controllo risultati")
+                    self._odds_tennis_keys = saved_cache
+                    logger.warning("Scores tennis: nessun torneo attivo trovato")
                 for sport_key in tennis_keys:
                     url = (
                         f"{ODDS_BASE}/sports/{sport_key}/scores/"
@@ -523,6 +526,46 @@ class SignalScraper:
                                 logger.warning(f"Scores tennis ({sport_key}) status {resp.status}: {txt[:200]}")
                     except Exception as e:
                         logger.warning(f"Scores tennis errore ({sport_key}): {e}")
+
+        # ── Ping Pong via OddsPapi (/v4/results) ────────────────────────────
+        if ODDSPAPI_KEY:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    sport_id = await self._get_tt_sport_id(session)
+                    if sport_id:
+                        url = (
+                            f"{ODDSPAPI_BASE}/results"
+                            f"?token={ODDSPAPI_KEY}&sport_id={sport_id}&limit=50"
+                        )
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            logger.info(f"OddsPapi scores ping pong: HTTP {resp.status}")
+                            if resp.status == 200:
+                                data = await resp.json()
+                                events = data if isinstance(data, list) else data.get("data", [])
+                                logger.info(f"OddsPapi scores ping pong: {len(events)} eventi ricevuti")
+                                for ev in events:
+                                    home = ev.get("home", ev.get("home_team", ""))
+                                    away = ev.get("away", ev.get("away_team", ""))
+                                    scores_raw = ev.get("scores", {})
+                                    score_home = ev.get("score_home") or (scores_raw.get("home") if isinstance(scores_raw, dict) else None)
+                                    score_away = ev.get("score_away") or (scores_raw.get("away") if isinstance(scores_raw, dict) else None)
+                                    if not home or not away or score_home is None or score_away is None:
+                                        continue
+                                    try:
+                                        winner = home if int(score_home) > int(score_away) else away
+                                        results.append({
+                                            "home":   home,
+                                            "away":   away,
+                                            "winner": winner,
+                                            "sport":  "tabletennis",
+                                        })
+                                    except (ValueError, TypeError):
+                                        continue
+                            else:
+                                txt = await resp.text()
+                                logger.warning(f"OddsPapi scores status {resp.status}: {txt[:200]}")
+            except Exception as e:
+                logger.warning(f"OddsPapi scores errore: {e}")
 
         logger.info(f"Scores totali: {len(results)} partite completate")
         return results

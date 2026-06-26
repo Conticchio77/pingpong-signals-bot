@@ -71,13 +71,15 @@ class Database:
                 pass  # colonna già esistente
 
         defaults = {
-            "scan_interval":  "2",
-            "auto_send":      "0",
-            "min_confidence": "55",
-            "last_scan":      "mai",
-            "sport_filter":   "both",
-            "unit_value":     "10",   # €10 per unità stake
-            "tt_sport_id":    "",     # cache persistente ID OddsPapi ping pong
+            "scan_interval":    "2",
+            "auto_send":        "0",
+            "min_confidence":   "55",
+            "last_scan":        "mai",
+            "sport_filter":     "both",
+            "unit_value":       "10",
+            "tt_sport_id":      "",
+            "min_hours_before": "1.0",   # ore minime al kickoff
+            "max_edge_no_sharp":"20.0",  # cap edge% senza Pinnacle
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -195,12 +197,14 @@ class Database:
         rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
         raw  = {r["key"]: r["value"] for r in rows}
         return {
-            "scan_interval":  int(raw.get("scan_interval", 1)),
-            "auto_send":      raw.get("auto_send", "0") == "1",
-            "min_confidence": int(raw.get("min_confidence", 60)),
-            "last_scan":      raw.get("last_scan", "mai"),
-            "sport_filter":   raw.get("sport_filter", "both"),
-            "unit_value":     float(raw.get("unit_value", 10)),
+            "scan_interval":    int(raw.get("scan_interval", 1)),
+            "auto_send":        raw.get("auto_send", "0") == "1",
+            "min_confidence":   int(raw.get("min_confidence", 60)),
+            "last_scan":        raw.get("last_scan", "mai"),
+            "sport_filter":     raw.get("sport_filter", "both"),
+            "unit_value":       float(raw.get("unit_value", 10)),
+            "min_hours_before": float(raw.get("min_hours_before", 1.0)),
+            "max_edge_no_sharp":float(raw.get("max_edge_no_sharp", 20.0)),
         }
 
     def set_setting(self, key: str, value):

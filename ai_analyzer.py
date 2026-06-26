@@ -42,51 +42,52 @@ SOFT_BOOKS = {
 }
 
 # ── Soglie value bet ───────────────────────────────────────────────────────────
-MIN_VALUE_PCT   = 5.0    # % minimo di edge per generare segnale
-MIN_ODDS        = 1.40   # quota minima accettata
-MAX_ODDS        = 5.00   # quota massima accettata
+MIN_VALUE_PCT        = 5.0    # % minimo di edge per generare segnale
+MIN_ODDS             = 1.40   # quota minima accettata
+MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
-MIN_HOURS_BEFORE     = 1.0    # scarta segnali con meno di N ore all'inizio
-MAX_EDGE_NO_SHARP    = 25.0   # cap edge% quando non c'è sharp book (de-vig semplice)
+MIN_HOURS_BEFORE     = 1.0    # default ore minime al kickoff
+MAX_EDGE_NO_SHARP    = 20.0   # default cap edge% senza Pinnacle
 
 
 class AIAnalyzer:
 
-    async def analyze(self, match: dict) -> list[dict]:
+    async def analyze(self, match: dict, settings: dict = None) -> list[dict]:
         sport = match.get("sport", "tabletennis")
         try:
-            return self._analyze(match, sport)
+            return self._analyze(match, sport, settings or {})
         except Exception as e:
             logger.error(f"Analyzer errore [{sport}] {match.get('name','?')}: {e}")
             return []
 
     # ── Core ───────────────────────────────────────────────────────────────────
-    def _analyze(self, match: dict, sport: str) -> list[dict]:
+    def _analyze(self, match: dict, sport: str, settings: dict) -> list[dict]:
         signals   = []
         raw_bm    = match.get("raw_bookmakers", {})   # da scraper arricchito
         has_sharp = bool(raw_bm)
+
+        # Legge limiti da settings (con fallback alle costanti)
+        min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
+        max_edge_cap = float(settings.get("max_edge_no_sharp", MAX_EDGE_NO_SHARP)) / 100
 
         # ── Filtro anticipo kickoff ──────────────────────────────────────────
         kickoff_str = match.get("kickoff", "")
         if kickoff_str:
             try:
-                # Kickoff può essere ISO o "DD/MM HH:MM"
                 try:
                     ko = datetime.fromisoformat(kickoff_str)
                     if ko.tzinfo is None:
                         ko = ko.replace(tzinfo=IT_TZ)
                 except ValueError:
-                    # Formato "24/06 18:00" → aggiungi anno corrente
                     year = datetime.now(IT_TZ).year
                     ko = datetime.strptime(f"{year}/{kickoff_str}", "%Y/%d/%m %H:%M")
                     ko = ko.replace(tzinfo=IT_TZ)
-
                 now_it = datetime.now(IT_TZ)
                 hours_to_ko = (ko - now_it).total_seconds() / 3600
-                if hours_to_ko < MIN_HOURS_BEFORE:
+                if hours_to_ko < min_hours:
                     logger.info(
-                        f"Segnale scartato (kickoff troppo vicino: {hours_to_ko:.1f}h < {MIN_HOURS_BEFORE}h): "
-                        f"{match.get('name','?')} — kickoff {kickoff_str}"
+                        f"Segnale scartato (kickoff tra {hours_to_ko:.1f}h < min {min_hours}h): "
+                        f"{match.get('name','?')} — {kickoff_str}"
                     )
                     return []
             except Exception as e:
@@ -116,9 +117,8 @@ class AIAnalyzer:
 
         if best_h and MIN_ODDS <= best_h <= MAX_ODDS:
             value_h = fair_home * best_h - 1
-            # Cap edge se non abbiamo sharp book (de-vig semplice poco affidabile)
             if not has_sharp:
-                value_h = min(value_h, MAX_EDGE_NO_SHARP / 100)
+                value_h = min(value_h, max_edge_cap)
             if value_h >= MIN_VALUE_PCT / 100:
                 conf = self._confidence(value_h, has_sharp, match.get("source",""))
                 signals.append(self._build(
@@ -135,9 +135,8 @@ class AIAnalyzer:
 
         if best_a and MIN_ODDS <= best_a <= MAX_ODDS:
             value_a = fair_away * best_a - 1
-            # Cap edge se non abbiamo sharp book
             if not has_sharp:
-                value_a = min(value_a, MAX_EDGE_NO_SHARP / 100)
+                value_a = min(value_a, max_edge_cap)
             if value_a >= MIN_VALUE_PCT / 100:
                 conf = self._confidence(value_a, has_sharp, match.get("source",""))
                 signals.append(self._build(
@@ -161,10 +160,9 @@ class AIAnalyzer:
             if fair_ov and fair_un:
                 value_ov = fair_ov * ov - 1
                 value_un = fair_un * un - 1
-                # O/U usa sempre de-vig semplice → cap se non c'è sharp book
                 if not has_sharp:
-                    value_ov = min(value_ov, MAX_EDGE_NO_SHARP / 100)
-                    value_un = min(value_un, MAX_EDGE_NO_SHARP / 100)
+                    value_ov = min(value_ov, max_edge_cap)
+                    value_un = min(value_un, max_edge_cap)
 
                 unit = "set" if sport == "tabletennis" else "games"
 
@@ -317,12 +315,10 @@ class AIAnalyzer:
         base = 50 + int(min(value * 200, 32))
 
         if has_sharp:
-            # Dati Pinnacle reali → bonus affidabilità
-            base += 8
+            base += 8   # dati Pinnacle reali → bonus affidabilità
         else:
-            # De-vig semplice: meno affidabile, penalità forte + cap
-            base -= 12
-            base = min(base, 65)   # mai sopra 65% senza sharp book
+            base -= 12  # de-vig semplice → penalità forte
+            base = min(base, 65)  # mai sopra 65% senza sharp book
 
         # Penalità per fonte meno affidabile
         if source == "fallback":
@@ -362,7 +358,7 @@ class AIAnalyzer:
     ) -> str:
         method = "de-vig Pinnacle" if has_sharp else "de-vig mercato"
         fair_odd = round(1 / fair_prob, 2) if fair_prob > 0 else "?"
-        note = "" if has_sharp else " ⚠️ Nessun sharp book disponibile — edge stimato, affidabilità ridotta."
+        note = "" if has_sharp else " ⚠️ Nessun sharp book — edge stimato."
         return (
             f"Probabilità fair ({method}): {fair_prob:.1%} → quota fair {fair_odd}. "
             f"Quota disponibile: {best_odd} ({book or 'media'}) — "
@@ -383,11 +379,12 @@ class AIAnalyzer:
         book_note:  str = "",
     ) -> dict:
         now     = datetime.now(IT_TZ)
-        # match_key basato su PARTITA + TIPO segnale (non sul pick): evita che la stessa
-        # partita generi più segnali "winner" nello stesso giorno se le quote cambiano tra
-        # uno scan e l'altro (es. prima "Holmgren vince", poi "Kym vince"). Permette comunque
-        # un segnale "winner" + un segnale "over/under" sulla stessa partita, se entrambi validi.
-        key_str = f"{match['name']}|{sig_type}|{now.strftime('%Y%m%d')}"
+        # match_key: usa event_id se disponibile (stabile tra scan), altrimenti nome+data.
+        # sig_type distingue winner da over/under sulla stessa partita.
+        # NON includiamo il pick nel key: due scan dello stesso evento devono
+        # produrre la stessa chiave e il secondo viene ignorato da signal_exists().
+        event_id = match.get("event_id") or match["name"]
+        key_str = f"{event_id}|{sig_type}|{now.strftime('%Y%m%d')}"
         mk      = hashlib.md5(key_str.encode()).hexdigest()[:16]
         stake   = self._stake(fair_prob, odds, confidence)
 

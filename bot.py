@@ -240,7 +240,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Tastiera persistente → gestisce tasti fissi in basso ─────────────────────────
 async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
     txt = update.message.text
 
@@ -340,6 +340,8 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
+        [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
+        [InlineKeyboardButton(f"📉 Cap edge senza Pinnacle: {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     await fn(
@@ -353,7 +355,7 @@ async def send_settings(fn):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await query.edit_message_text("⛔ Non autorizzato.")
         return
     data = query.data
@@ -666,6 +668,62 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_settings(query.edit_message_text)
 
 
+    # ── Anticipo minimo kickoff ───────────────────────────────────────────────
+    elif data == "pick_hours_before":
+        current = db.get_settings().get("min_hours_before", 1.0)
+        opts = [
+            (0.5, "30 min — accetta segnali dell'ultima ora"),
+            (1.0, "1h — consigliato ✓"),
+            (2.0, "2h — più selettivo"),
+            (3.0, "3h — solo largo anticipo"),
+        ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if abs(float(val) - float(current)) < 0.01 else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_hours_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "⏰ *Anticipo minimo al kickoff*\n\n"
+            "Scarta segnali troppo vicini all'inizio partita.\n"
+            "Con 1h non ricevi segnali su partite che iniziano tra meno di 60 min.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_hours_"):
+        val = float(data.replace("set_hours_", ""))
+        db.set_setting("min_hours_before", val)
+        await send_settings(query.edit_message_text)
+
+    # ── Cap edge senza Pinnacle ───────────────────────────────────────────────
+    elif data == "pick_max_edge":
+        current = db.get_settings().get("max_edge_no_sharp", 20.0)
+        opts = [
+            (10.0, "10% — molto severo (pochi segnali)"),
+            (15.0, "15% — severo"),
+            (20.0, "20% — bilanciato ✓"),
+            (25.0, "25% — permissivo (più segnali)"),
+        ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if abs(float(val) - float(current)) < 0.01 else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_maxedge_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "📉 *Cap edge senza Pinnacle*\n\n"
+            "Senza sharp book il calcolo dell'edge può essere gonfiato.\n"
+            "Questo limite blocca i valori esagerati.\n\n"
+            "20% è il punto di equilibrio consigliato.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_maxedge_"):
+        val = float(data.replace("set_maxedge_", ""))
+        db.set_setting("max_edge_no_sharp", val)
+        await send_settings(query.edit_message_text)
+
+
 # ── Scheduler ────────────────────────────────────────────────────────────────────
 _scheduler: AsyncIOScheduler | None = None
 _main_loop: asyncio.AbstractEventLoop | None = None  # loop principale dell'Application, catturato in post_init
@@ -763,7 +821,7 @@ async def run_signal_scan(app: Application) -> int:
 
     for match in matches:
         try:
-            signals = await analyzer.analyze(match)
+            signals = await analyzer.analyze(match, settings)
             signals.sort(key=lambda x: x["value_pct"], reverse=True)
             for sig in signals:
                 if sig["confidence"] < settings["min_confidence"]:
