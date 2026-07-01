@@ -527,43 +527,84 @@ class SignalScraper:
                     except Exception as e:
                         logger.warning(f"Scores tennis errore ({sport_key}): {e}")
 
-        # ── Ping Pong via OddsPapi (/v4/results) ────────────────────────────
+        # ── Ping Pong via OddsPapi (/v4/fixtures?statusId=2 + /v4/settlements) ──
+        # NOTA: l'endpoint /v4/results NON esiste su OddsPapi (mai esistito nella
+        # loro API pubblica — da qui il 404 di prima). Il modo corretto per sapere
+        # chi ha vinto una fixture è:
+        #   1) /v4/fixtures?statusId=2 → elenco fixture concluse (statusId:
+        #      0=da iniziare, 1=live, 2=finita, 3=annullata)
+        #   2) /v4/settlements?fixtureId=... → per ciascuna fixture conclusa
+        #      restituisce WIN/LOSE per ogni outcome del mercato "101"
+        #      (Match Winner): outcome 101 = participant1, 102 = participant2.
+        # Ogni fixture finita controllata costa 1 richiesta aggiuntiva di quota,
+        # quindi limitiamo il numero di fixture per scan.
         if ODDSPAPI_KEY:
             try:
                 async with aiohttp.ClientSession() as session:
                     sport_id = await self._get_tt_sport_id(session)
                     if sport_id:
-                        url = (
-                            f"{ODDSPAPI_BASE}/results"
-                            f"?token={ODDSPAPI_KEY}&sport_id={sport_id}&limit=50"
-                        )
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                            logger.info(f"OddsPapi scores ping pong: HTTP {resp.status}")
+                        from_utc = (_now_it() - timedelta(hours=36)).astimezone(ZoneInfo("UTC")) \
+                            .strftime("%Y-%m-%dT%H:%M:%SZ")
+                        to_utc = _now_it().astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        async with session.get(
+                            f"{ODDSPAPI_BASE}/fixtures",
+                            params={
+                                "apiKey":   ODDSPAPI_KEY,
+                                "sportId":  sport_id,
+                                "from":     from_utc,
+                                "to":       to_utc,
+                                "statusId": 2,  # solo fixture concluse
+                            },
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as resp:
+                            logger.info(f"OddsPapi fixtures concluse ping pong: HTTP {resp.status}")
                             if resp.status == 200:
-                                data = await resp.json()
-                                events = data if isinstance(data, list) else data.get("data", [])
-                                logger.info(f"OddsPapi scores ping pong: {len(events)} eventi ricevuti")
-                                for ev in events:
-                                    home = ev.get("home", ev.get("home_team", ""))
-                                    away = ev.get("away", ev.get("away_team", ""))
-                                    scores_raw = ev.get("scores", {})
-                                    score_home = ev.get("score_home") or (scores_raw.get("home") if isinstance(scores_raw, dict) else None)
-                                    score_away = ev.get("score_away") or (scores_raw.get("away") if isinstance(scores_raw, dict) else None)
-                                    if not home or not away or score_home is None or score_away is None:
+                                fixtures = await resp.json()
+                                if isinstance(fixtures, dict):
+                                    fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
+                                logger.info(f"OddsPapi: {len(fixtures)} fixture concluse trovate")
+
+                                # Limita per non sforare la quota mensile (1 richiesta
+                                # /settlements per ogni fixture controllata)
+                                fixtures = fixtures[:15]
+
+                                for fix in fixtures:
+                                    home = fix.get("participant1Name", "")
+                                    away = fix.get("participant2Name", "")
+                                    fid  = fix.get("fixtureId", "")
+                                    if not home or not away or not fid:
                                         continue
                                     try:
-                                        winner = home if int(score_home) > int(score_away) else away
-                                        results.append({
-                                            "home":   home,
-                                            "away":   away,
-                                            "winner": winner,
-                                            "sport":  "tabletennis",
-                                        })
-                                    except (ValueError, TypeError):
-                                        continue
+                                        async with session.get(
+                                            f"{ODDSPAPI_BASE}/settlements",
+                                            params={"apiKey": ODDSPAPI_KEY, "fixtureId": fid},
+                                            timeout=aiohttp.ClientTimeout(total=10),
+                                        ) as sresp:
+                                            if sresp.status != 200:
+                                                logger.debug(f"OddsPapi settlements status {sresp.status} per {fid}")
+                                                continue
+                                            sdata = await sresp.json()
+                                            market   = (sdata.get("markets") or {}).get("101", {})
+                                            outcomes = market.get("outcomes", {})
+                                            r1 = outcomes.get("101", {}).get("players", {}).get("0", {}).get("result")
+                                            r2 = outcomes.get("102", {}).get("players", {}).get("0", {}).get("result")
+                                            if r1 == "WIN":
+                                                winner = home
+                                            elif r2 == "WIN":
+                                                winner = away
+                                            else:
+                                                continue  # esito non chiaro (push/annullato/mercato assente)
+                                            results.append({
+                                                "home":   home,
+                                                "away":   away,
+                                                "winner": winner,
+                                                "sport":  "tabletennis",
+                                            })
+                                    except Exception as e:
+                                        logger.debug(f"OddsPapi settlements errore fixture {fid}: {e}")
                             else:
                                 txt = await resp.text()
-                                logger.warning(f"OddsPapi scores status {resp.status}: {txt[:200]}")
+                                logger.warning(f"OddsPapi fixtures concluse status {resp.status}: {txt[:200]}")
             except Exception as e:
                 logger.warning(f"OddsPapi scores errore: {e}")
 
