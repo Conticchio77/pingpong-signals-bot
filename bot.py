@@ -758,12 +758,23 @@ async def post_init(app: Application):
 
     _scheduler = AsyncIOScheduler(timezone=ROME)
 
-    # Scan segnali: parte subito (next_run_time=now) poi ripete ogni X ore
+    # Scan segnali tennis: parte subito poi ripete ogni X ore (configurabile)
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_signal_scan(app)),
         trigger=IntervalTrigger(hours=hours, timezone=ROME),
         id="signal_scan",
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
+    )
+
+    # Scan ping pong dedicato: UNA VOLTA AL GIORNO alle 09:00
+    # Piano gratuito OddsPapi = 250 req/mese → 3 req/scan × 31 giorni = 93 req.
+    # Le restanti 157 req coprono il fetch sport_id e gli auto-risultati.
+    from apscheduler.triggers.cron import CronTrigger
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+        trigger=CronTrigger(hour=9, minute=0, timezone=ROME),
+        id="pingpong_scan",
+        next_run_time=now + datetime.timedelta(minutes=2),  # primo giro 2 min dopo boot
     )
 
     # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
@@ -778,7 +789,13 @@ async def post_init(app: Application):
     logger.info(f"⏰ Scheduler avviato — scan ogni {hours}h | risultati ogni 30min")
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
-async def run_signal_scan(app: Application) -> int:
+async def run_signal_scan(app: Application, sport_override: str = None) -> int:
+    """
+    Scan principale. Per default analizza SOLO tennis (The Odds API, nessun limite).
+    Il ping pong è gestito dal job dedicato run_pingpong_scan (1x/giorno) per
+    risparmiare quota OddsPapi (250 req/mese piano gratuito).
+    sport_override='tabletennis' forza lo scan ping pong (usato da run_pingpong_scan).
+    """
     logger.info("🔍 Avvio scan...")
     db.set_setting("last_scan", now_it_str())
 
@@ -796,9 +813,14 @@ async def run_signal_scan(app: Application) -> int:
     # Settings prima di tutto
     settings = db.get_settings()
 
-    # Filtra per sport se impostato
-    sport_filter = settings.get("sport_filter", "both")
-    if sport_filter != "both":
+    # Filtra per sport
+    sport_filter = sport_override or settings.get("sport_filter", "both")
+    if sport_filter == "both":
+        # In modalità "both" il job principale analizza solo tennis;
+        # il ping pong lo fa il job dedicato giornaliero.
+        matches = [m for m in matches if m.get("sport") == "tennis"]
+        logger.info(f"Scan principale: solo tennis ({len(matches)} partite) — ping pong gestito dal job giornaliero")
+    else:
         matches = [m for m in matches if m.get("sport") == sport_filter]
         logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
 
@@ -862,6 +884,20 @@ async def run_signal_scan(app: Application) -> int:
     return new_signals
 
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
+async def run_pingpong_scan(app: Application):
+    """
+    Scan ping pong giornaliero dedicato (chiamato dal job CronTrigger alle 09:00).
+    Usa solo 3 req OddsPapi per scan → ~93 req/mese su piano free da 250.
+    """
+    settings = db.get_settings()
+    sport_filter = settings.get("sport_filter", "both")
+    if sport_filter == "tennis":
+        logger.info("Ping pong scan saltato (sport_filter=tennis)")
+        return
+    logger.info("🏓 Avvio scan ping pong giornaliero...")
+    await run_signal_scan(app, sport_override="tabletennis")
+
+
 async def run_auto_results(app: Application):
     """
     Controlla le API per i risultati delle partite completate
@@ -886,25 +922,29 @@ async def run_auto_results(app: Application):
         logger.info("Auto-risultati: nessun risultato disponibile dalle API")
         return
 
+    logger.info(f"Auto-risultati: {len(scores)} risultati disponibili: {[(s['home'][:12], s['away'][:12]) for s in scores[:5]]}")
+
     def normalize(name: str) -> str:
-        """Normalizza nomi per matching flessibile (rimuove accenti, spazi extra, ecc.)"""
         import unicodedata
         name = unicodedata.normalize("NFKD", name.lower().strip())
         return "".join(c for c in name if not unicodedata.combining(c))
 
     def names_match(a: str, b: str) -> bool:
-        """Match flessibile: controlla se due nomi sono lo stesso giocatore."""
+        """Match flessibile tra nomi giocatori."""
         a, b = normalize(a), normalize(b)
         if a == b:
             return True
-        # Match parziale: cognome (ultima parola) corrisponde
         a_parts = a.split()
         b_parts = b.split()
-        if a_parts and b_parts and a_parts[-1] == b_parts[-1]:
+        # Cognome corrisponde (con almeno 4 caratteri per evitare falsi positivi)
+        if a_parts and b_parts and len(a_parts[-1]) >= 4 and a_parts[-1] == b_parts[-1]:
             return True
-        # Match se uno contiene l'altro (abbreviazioni tipo "T. Boll" vs "Timo Boll")
-        if len(a) > 4 and len(b) > 4:
-            if a in b or b in a:
+        # Uno contiene l'altro (abbreviazioni tipo "T. Boll" vs "Timo Boll")
+        if len(a) > 4 and len(b) > 4 and (a in b or b in a):
+            return True
+        # Iniziale + cognome (es. "J. Tjen" vs "Janice Tjen")
+        if len(a_parts) >= 2 and len(b_parts) >= 2:
+            if a_parts[-1] == b_parts[-1] and a_parts[0][0] == b_parts[0][0]:
                 return True
         return False
 
@@ -918,26 +958,27 @@ async def run_auto_results(app: Application):
 
         # Cerca il match nei risultati
         for sc in scores:
-            home, away = sc.get("home",""), sc.get("away","")
+            home, away = sc.get("home", ""), sc.get("away", "")
             if (names_match(p1, home) and names_match(p2, away)) or \
                (names_match(p1, away) and names_match(p2, home)):
                 matched_score = sc
                 break
 
         if not matched_score:
-            logger.info(f"Auto-risultati: nessun match trovato per '{p1}' vs '{p2}' tra {len(scores)} risultati")
+            logger.info(f"Auto-risultati: nessun match trovato per '{p1}' vs '{p2}'")
             continue
 
         winner = matched_score.get("winner", "")
+        logger.info(f"Auto-risultati: match trovato '{p1}' vs '{p2}' — vincitore API: '{winner}' — pick: '{pick}'")
 
-        # Determina vinto/perso: controlla se il vincitore è quello che abbiamo puntato
+        # Determina vinto/perso: il pick è tipo "Daria Kasatkina vince"
         if names_match(p1, winner):
-            picked_won = names_match(p1, winner) and (
+            picked_won = (
                 normalize(p1) in pick or
                 any(part in pick for part in normalize(p1).split() if len(part) > 3)
             )
         else:
-            picked_won = names_match(p2, winner) and (
+            picked_won = (
                 normalize(p2) in pick or
                 any(part in pick for part in normalize(p2).split() if len(part) > 3)
             )
