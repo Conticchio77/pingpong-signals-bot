@@ -369,6 +369,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Scan ─────────────────────────────────────────────────────────────────────
     elif data == "admin_scan":
         await query.edit_message_text("🔍 Scansione in corso... attendere.")
+        # Scan manuale: fa entrambi gli sport (tennis + ping pong)
         count = await run_signal_scan(context.application)
         await query.edit_message_text(
             f"✅ Scan completato!\n🆕 Nuovi segnali: *{count}*",
@@ -766,16 +767,20 @@ async def post_init(app: Application):
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
 
-    # Scan ping pong dedicato: UNA VOLTA AL GIORNO alle 09:00
-    # Piano gratuito OddsPapi = 250 req/mese → 3 req/scan × 31 giorni = 93 req.
-    # Le restanti 157 req coprono il fetch sport_id e gli auto-risultati.
-    from apscheduler.triggers.cron import CronTrigger
+
+    # Scan ping pong: ora casuale tra 09:00 e 19:00, primo avvio oggi o domani
+    import random as _random
+    _pp_hour   = _random.randint(9, 18)
+    _pp_minute = _random.randint(0, 59)
+    _pp_today  = now.replace(hour=_pp_hour, minute=_pp_minute, second=0, microsecond=0)
+    _pp_first  = _pp_today if _pp_today > now else _pp_today + datetime.timedelta(days=1)
+    from apscheduler.triggers.date import DateTrigger
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-        trigger=CronTrigger(hour=9, minute=0, timezone=ROME),
+        trigger=DateTrigger(run_date=_pp_first, timezone=ROME),
         id="pingpong_scan",
-        next_run_time=now + datetime.timedelta(minutes=2),  # primo giro 2 min dopo boot
     )
+    logger.info(f"🏓 Primo scan ping pong: {_pp_first.strftime('%d/%m %H:%M')}")
 
     # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
     _scheduler.add_job(
@@ -792,9 +797,7 @@ async def post_init(app: Application):
 async def run_signal_scan(app: Application, sport_override: str = None) -> int:
     """
     Scan principale. Per default analizza SOLO tennis (The Odds API, nessun limite).
-    Il ping pong è gestito dal job dedicato run_pingpong_scan (1x/giorno) per
-    risparmiare quota OddsPapi (250 req/mese piano gratuito).
-    sport_override='tabletennis' forza lo scan ping pong (usato da run_pingpong_scan).
+    Analizza entrambi gli sport (tennis + ping pong) in un unico passaggio.
     """
     logger.info("🔍 Avvio scan...")
     db.set_setting("last_scan", now_it_str())
@@ -816,17 +819,16 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
     # Filtra per sport
     sport_filter = sport_override or settings.get("sport_filter", "both")
     if sport_filter == "both":
-        # In modalità "both" il job principale analizza solo tennis;
-        # il ping pong lo fa il job dedicato giornaliero.
+        # Scan automatico principale = solo tennis; ping pong ha job dedicato giornaliero
         matches = [m for m in matches if m.get("sport") == "tennis"]
-        logger.info(f"Scan principale: solo tennis ({len(matches)} partite) — ping pong gestito dal job giornaliero")
+        logger.info(f"Scan tennis: {len(matches)} partite")
     else:
         matches = [m for m in matches if m.get("sport") == sport_filter]
         logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
 
-    # Se nessuna partita reale (solo fallback) avvisa l'admin
+    # Se nessuna partita reale (solo fallback) avvisa l'admin — solo in scan automatico
     real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
-    if not real_matches and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
+    if not real_matches and not sport_override and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
         logger.info("Nessuna partita reale disponibile in questo momento")
         await app.bot.send_message(
             chat_id=ADMIN_ID,
@@ -884,21 +886,7 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
     return new_signals
 
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
-async def run_pingpong_scan(app: Application):
-    """
-    Scan ping pong giornaliero dedicato (chiamato dal job CronTrigger alle 09:00).
-    Usa solo 3 req OddsPapi per scan → ~93 req/mese su piano free da 250.
-    """
-    settings = db.get_settings()
-    sport_filter = settings.get("sport_filter", "both")
-    if sport_filter == "tennis":
-        logger.info("Ping pong scan saltato (sport_filter=tennis)")
-        return
-    logger.info("🏓 Avvio scan ping pong giornaliero...")
-    await run_signal_scan(app, sport_override="tabletennis")
 
-
-async def run_auto_results(app: Application):
     """
     Controlla le API per i risultati delle partite completate
     e aggiorna automaticamente i segnali winner pendenti.
