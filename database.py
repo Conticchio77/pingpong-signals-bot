@@ -71,7 +71,7 @@ class Database:
                 pass  # colonna già esistente
 
         defaults = {
-            "scan_interval":    "2",
+            "scan_interval":    "3",
             "auto_send":        "0",
             "min_confidence":   "55",
             "last_scan":        "mai",

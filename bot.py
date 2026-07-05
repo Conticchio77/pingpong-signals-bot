@@ -246,7 +246,7 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if txt == "🔍 Scan":
         msg = await update.message.reply_text("🔍 Scansione in corso...")
-        count = await run_signal_scan(context.application)
+        count = await run_signal_scan(context.application, manual=True)
         await msg.edit_text(f"✅ Scan completato! Nuovi segnali: *{count}*", parse_mode="Markdown")
         await update.message.reply_text(admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb())
 
@@ -335,7 +335,7 @@ async def send_settings(fn):
     sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sf, "🏓🎾 Entrambi")
 
     kb = [
-        [InlineKeyboardButton(f"⏱ Scan: ogni {s['scan_interval']}h", callback_data="pick_interval")],
+        [InlineKeyboardButton(f"⏱ Scan tennis: ogni {s['scan_interval']}h", callback_data="pick_interval")],
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
         [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
@@ -344,8 +344,14 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"📉 Cap edge senza Pinnacle: {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
+    # Stima consumo crediti The Odds API
+    interval   = s["scan_interval"]
+    scan_day   = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
+    credits_mo = scan_day * 2 * 31  # ~2 crediti per scan
     await fn(
         "⚙️ *Impostazioni*\n\n"
+        f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n"
+        f"🏓 _OddsPapi ping pong: ~{6*31} req/mese su 250 disponibili_\n\n"
         "Tocca un'opzione per modificarla:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
@@ -369,8 +375,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Scan ─────────────────────────────────────────────────────────────────────
     elif data == "admin_scan":
         await query.edit_message_text("🔍 Scansione in corso... attendere.")
-        # Scan manuale: fa entrambi gli sport (tennis + ping pong)
-        count = await run_signal_scan(context.application)
+        count = await run_signal_scan(context.application, manual=True)
         await query.edit_message_text(
             f"✅ Scan completato!\n🆕 Nuovi segnali: *{count}*",
             parse_mode="Markdown",
@@ -572,16 +577,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Scegli intervallo scan (picker visuale) ───────────────────────────────────
     elif data == "pick_interval":
         current = db.get_settings()["scan_interval"]
-        opts    = [1, 2, 4, 6, 12]
+        # Finestra attiva 07-22 = 15h → scan_per_giorno = 15 // intervallo
+        opts = [1, 2, 3, 4, 6]
         kb = []
-        row = []
         for o in opts:
-            label = f"✅ {o}h" if o == current else f"{o}h"
-            row.append(InlineKeyboardButton(label, callback_data=f"set_interval_{o}"))
-        kb.append(row)
+            scans_day = 15 // o
+            credits_mo = scans_day * 2 * 31
+            prefix = "✅ " if o == current else ""
+            warn = " ⚠️" if credits_mo > 450 else ""
+            label = f"{prefix}{o}h — ~{credits_mo} crediti/mese{warn}"
+            kb.append([InlineKeyboardButton(label, callback_data=f"set_interval_{o}")])
         kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(
-            f"⏱ *Seleziona ogni quante ore fare lo scan*\n(attuale: ogni {current}h):",
+            "⏱ *Frequenza scan tennis*\n\n"
+            "Scan attivi solo tra 07:00 e 22:00.\n"
+            "The Odds API: 500 crediti/mese gratuiti.\n"
+            f"Attuale: ogni {current}h",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -730,13 +741,16 @@ _scheduler: AsyncIOScheduler | None = None
 _main_loop: asyncio.AbstractEventLoop | None = None  # loop principale dell'Application, catturato in post_init
 
 def _schedule_coro(coro_factory):
-    """Esegue una coroutine sul loop principale dell'Application da un thread esterno
-    (APScheduler esegue i job su un proprio thread executor, dove asyncio.ensure_future
-    fallisce con 'no current event loop')."""
-    if _main_loop is not None:
-        asyncio.run_coroutine_threadsafe(coro_factory(), _main_loop)
-    else:
+    """Esegue una coroutine sul loop principale dell'Application da un thread esterno."""
+    if _main_loop is None:
         logger.error("Scheduler: main loop non disponibile, job saltato")
+        return
+    async def _wrapper():
+        try:
+            await coro_factory()
+        except Exception as exc:
+            logger.error(f"Scheduler job errore: {exc}", exc_info=True)
+    asyncio.run_coroutine_threadsafe(_wrapper(), _main_loop)
 
 def _restart_scheduler(app: Application, hours: int):
     global _scheduler
@@ -759,28 +773,13 @@ async def post_init(app: Application):
 
     _scheduler = AsyncIOScheduler(timezone=ROME)
 
-    # Scan segnali tennis: parte subito poi ripete ogni X ore (configurabile)
+    # Scan segnali: parte subito (next_run_time=now) poi ripete ogni X ore
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_signal_scan(app)),
         trigger=IntervalTrigger(hours=hours, timezone=ROME),
         id="signal_scan",
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
-
-
-    # Scan ping pong: ora casuale tra 09:00 e 19:00, primo avvio oggi o domani
-    import random as _random
-    _pp_hour   = _random.randint(9, 18)
-    _pp_minute = _random.randint(0, 59)
-    _pp_today  = now.replace(hour=_pp_hour, minute=_pp_minute, second=0, microsecond=0)
-    _pp_first  = _pp_today if _pp_today > now else _pp_today + datetime.timedelta(days=1)
-    from apscheduler.triggers.date import DateTrigger
-    _scheduler.add_job(
-        lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-        trigger=DateTrigger(run_date=_pp_first, timezone=ROME),
-        id="pingpong_scan",
-    )
-    logger.info(f"🏓 Primo scan ping pong: {_pp_first.strftime('%d/%m %H:%M')}")
 
     # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
     _scheduler.add_job(
@@ -790,16 +789,26 @@ async def post_init(app: Application):
         next_run_time=now + datetime.timedelta(minutes=10),
     )
 
+    # Scan ping pong: ogni giorno alle 07:00 (CronTrigger, affidabile)
+    from apscheduler.triggers.cron import CronTrigger
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+        trigger=CronTrigger(hour=7, minute=0, timezone=ROME),
+        id="pingpong_scan",
+    )
+
     _scheduler.start()
-    logger.info(f"⏰ Scheduler avviato — scan ogni {hours}h | risultati ogni 30min")
+    logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 30min")
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
-async def run_signal_scan(app: Application, sport_override: str = None) -> int:
-    """
-    Scan principale. Per default analizza SOLO tennis (The Odds API, nessun limite).
-    Analizza entrambi gli sport (tennis + ping pong) in un unico passaggio.
-    """
-    logger.info("🔍 Avvio scan...")
+async def run_signal_scan(app: Application, manual: bool = False) -> int:
+    ora = datetime.datetime.now(ROME).hour
+    sport_ov = getattr(run_signal_scan, "_sport_override", None)
+    # Scan automatico tennis: solo tra 07:00 e 22:00
+    if not manual and not sport_ov and not (7 <= ora <= 21):
+        logger.info(f"Scan tennis saltato (ora {ora}:xx fuori finestra 07-22)")
+        return 0
+    logger.info("🔍 Avvio scan tennis..." if not sport_ov else "🏓 Avvio scan ping pong...")
     db.set_setting("last_scan", now_it_str())
 
     try:
@@ -817,28 +826,33 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
     settings = db.get_settings()
 
     # Filtra per sport
-    sport_filter = sport_override or settings.get("sport_filter", "both")
+    sport_filter = getattr(run_signal_scan, "_sport_override", None) or settings.get("sport_filter", "both")
     if sport_filter == "both":
-        # Scan automatico principale = solo tennis; ping pong ha job dedicato giornaliero
+        # Scan automatico: solo tennis. Ping pong ha job dedicato giornaliero.
         matches = [m for m in matches if m.get("sport") == "tennis"]
         logger.info(f"Scan tennis: {len(matches)} partite")
     else:
         matches = [m for m in matches if m.get("sport") == sport_filter]
         logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
+    # Reset override
+    if hasattr(run_signal_scan, "_sport_override"):
+        del run_signal_scan._sport_override
 
-    # Se nessuna partita reale (solo fallback) avvisa l'admin — solo in scan automatico
+    # Se nessuna partita reale avvisa l'admin (solo in orario diurno 07-23 per non spammare)
     real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
-    if not real_matches and not sport_override and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
+    if not real_matches and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
         logger.info("Nessuna partita reale disponibile in questo momento")
-        await app.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "ℹ️ *Nessuna partita disponibile*\n\n"
-                "Le API non hanno partite quotate al momento.\n"
-                "Il prossimo scan automatico riproverà tra poco."
-            ),
-            parse_mode="Markdown",
-        )
+        ora = datetime.datetime.now(ROME).hour
+        if 7 <= ora <= 23:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "ℹ️ *Nessuna partita disponibile*\n\n"
+                    "Le API non hanno partite quotate al momento.\n"
+                    "Il prossimo scan automatico riproverà tra poco."
+                ),
+                parse_mode="Markdown",
+            )
         return 0
 
     new_signals = 0
@@ -886,7 +900,24 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
     return new_signals
 
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
+async def run_pingpong_scan(app: Application):
+    """
+    Scan ping pong giornaliero alle 07:00.
+    Scarica le migliori 3 fixture del giorno (partite fino alle 19:00),
+    analizza e invia i segnali. 1 sola chiamata API al giorno = ~3 req/giorno.
+    """
+    settings = db.get_settings()
+    if settings.get("sport_filter") == "tennis":
+        logger.info("Ping pong scan saltato (sport_filter=tennis)")
+        return
+    logger.info("🏓 Avvio scan ping pong giornaliero (ore 07:00)...")
+    run_signal_scan._sport_override = "tabletennis"
+    await run_signal_scan(app)
+    logger.info("🏓 Scan ping pong completato — prossimo domani alle 07:00")
 
+
+
+async def run_auto_results(app: Application):
     """
     Controlla le API per i risultati delle partite completate
     e aggiorna automaticamente i segnali winner pendenti.
@@ -910,7 +941,7 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
         logger.info("Auto-risultati: nessun risultato disponibile dalle API")
         return
 
-    logger.info(f"Auto-risultati: {len(scores)} risultati disponibili: {[(s['home'][:12], s['away'][:12]) for s in scores[:5]]}")
+    logger.info(f"Auto-risultati: {len(scores)} risultati — es: {[(s['home'][:10],s['away'][:10]) for s in scores[:3]]}") 
 
     def normalize(name: str) -> str:
         import unicodedata
@@ -922,12 +953,11 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
         a, b = normalize(a), normalize(b)
         if a == b:
             return True
-        a_parts = a.split()
-        b_parts = b.split()
-        # Cognome corrisponde (con almeno 4 caratteri per evitare falsi positivi)
+        a_parts, b_parts = a.split(), b.split()
+        # Cognome corrisponde (min 4 char per evitare falsi positivi)
         if a_parts and b_parts and len(a_parts[-1]) >= 4 and a_parts[-1] == b_parts[-1]:
             return True
-        # Uno contiene l'altro (abbreviazioni tipo "T. Boll" vs "Timo Boll")
+        # Uno contiene l'altro (es. "T. Boll" in "Timo Boll")
         if len(a) > 4 and len(b) > 4 and (a in b or b in a):
             return True
         # Iniziale + cognome (es. "J. Tjen" vs "Janice Tjen")
@@ -946,30 +976,26 @@ async def run_signal_scan(app: Application, sport_override: str = None) -> int:
 
         # Cerca il match nei risultati
         for sc in scores:
-            home, away = sc.get("home", ""), sc.get("away", "")
+            home, away = sc.get("home",""), sc.get("away","")
             if (names_match(p1, home) and names_match(p2, away)) or \
                (names_match(p1, away) and names_match(p2, home)):
                 matched_score = sc
                 break
 
         if not matched_score:
-            logger.info(f"Auto-risultati: nessun match trovato per '{p1}' vs '{p2}'")
+            logger.info(f"Auto-risultati: nessun match per '{p1}' vs '{p2}'")
             continue
 
         winner = matched_score.get("winner", "")
-        logger.info(f"Auto-risultati: match trovato '{p1}' vs '{p2}' — vincitore API: '{winner}' — pick: '{pick}'")
+        logger.info(f"Auto-risultati: match trovato '{p1}' vs '{p2}' — vincitore: '{winner}' — pick: '{pick}'")
 
-        # Determina vinto/perso: il pick è tipo "Daria Kasatkina vince"
+        # Determina vinto/perso: il pick è tipo "Kasatkina vince"
         if names_match(p1, winner):
-            picked_won = (
-                normalize(p1) in pick or
-                any(part in pick for part in normalize(p1).split() if len(part) > 3)
-            )
+            picked_won = (normalize(p1) in pick or
+                any(part in pick for part in normalize(p1).split() if len(part) > 3))
         else:
-            picked_won = (
-                normalize(p2) in pick or
-                any(part in pick for part in normalize(p2).split() if len(part) > 3)
-            )
+            picked_won = (normalize(p2) in pick or
+                any(part in pick for part in normalize(p2).split() if len(part) > 3))
 
         result = "won" if picked_won else "lost"
 

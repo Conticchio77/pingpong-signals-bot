@@ -164,29 +164,25 @@ class SignalScraper:
                         fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                     logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
 
-                    # ── Risparmio quota: max 3 fixture per scan ──────────────
-                    # Piano gratuito = 250 req/mese. Ogni fixture = 1 req /odds.
-                    # Con 3 fixture: ~3 req/scan × 12 scan/giorno = 36/giorno → ~6 giorni.
-                    # Con scan ping pong ogni 24h (vedi bot.py): 3 req/giorno → mese intero.
-                    MAX_FIXTURES_PER_SCAN = 3
-
+                    # Limita a 12 fixture più vicine nel tempo per evitare rate limit
+                    # (ogni fixture = 1 chiamata API per le quote — piano gratuito 250/mese)
                     def _sort_key(f):
                         s = f.get("startDate") or f.get("startTime") or ""
                         try:
                             return datetime.fromisoformat(s.replace("Z", "+00:00"))
                         except Exception:
                             return datetime.max.replace(tzinfo=IT_TZ)
-
-                    # Preferisci fixture con quote già embedded (evita /odds inutili)
-                    with_odds    = [f for f in fixtures if f.get("odds") or f.get("markets")]
-                    without_odds = [f for f in fixtures if not (f.get("odds") or f.get("markets"))]
-                    selected = (
-                        sorted(with_odds, key=_sort_key)[:MAX_FIXTURES_PER_SCAN] +
-                        sorted(without_odds, key=_sort_key)
-                    )[:MAX_FIXTURES_PER_SCAN]
-                    fixtures = selected
-
-                    logger.info(f"OddsPapi: selezionate {len(fixtures)}/{len(with_odds)+len(without_odds)} fixture (max {MAX_FIXTURES_PER_SCAN})")
+                    # Filtra solo partite entro le 19:00 di oggi (scan mattutino)
+                    # e prende le migliori 3 per kickoff
+                    today_19 = _now_it().replace(hour=22, minute=0, second=0, microsecond=0)
+                    fixtures_today = [
+                        f for f in fixtures
+                        if _sort_key(f) <= today_19
+                    ]
+                    # Se non ci sono partite entro le 19, prende comunque le prime 3 del giorno
+                    pool = fixtures_today if fixtures_today else fixtures
+                    fixtures = sorted(pool, key=_sort_key)[:6]  # max 6 per risparmiare quota OddsPapi
+                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture (evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []
@@ -539,87 +535,14 @@ class SignalScraper:
                                             "sport":  "tennis",
                                         })
                                     else:
-                                        logger.debug(f"Scores tennis: nomi non in score_map per {home} vs {away}. Keys: {list(score_map.keys())[:4]}")
+                                        logger.debug(f"Scores tennis: nomi non in score_map {home} vs {away}. Keys: {list(score_map.keys())[:4]}")
                             else:
                                 txt = await resp.text()
                                 logger.warning(f"Scores tennis ({sport_key}) status {resp.status}: {txt[:200]}")
                     except Exception as e:
                         logger.warning(f"Scores tennis errore ({sport_key}): {e}")
 
-        # ── Ping Pong via OddsPapi ────────────────────────────────────────────
-        # NON usiamo /settlements (costa 1 req per partita = troppo per piano free).
-        # Usiamo /fixtures?statusId=2 che restituisce le fixture concluse con
-        # il punteggio embedded nel campo "score" o "result" senza costi aggiuntivi.
-        # 1 sola richiesta per tutti i risultati del giorno.
-        if ODDSPAPI_KEY:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    sport_id = await self._get_tt_sport_id(session)
-                    if sport_id:
-                        from_utc = (_now_it() - timedelta(hours=36)).astimezone(ZoneInfo("UTC")) \
-                            .strftime("%Y-%m-%dT%H:%M:%SZ")
-                        to_utc = _now_it().astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        async with session.get(
-                            f"{ODDSPAPI_BASE}/fixtures",
-                            params={
-                                "apiKey":   ODDSPAPI_KEY,
-                                "sportId":  sport_id,
-                                "from":     from_utc,
-                                "to":       to_utc,
-                                "statusId": 2,  # solo fixture concluse
-                            },
-                            timeout=aiohttp.ClientTimeout(total=15),
-                        ) as resp:
-                            logger.info(f"OddsPapi fixtures concluse ping pong: HTTP {resp.status}")
-                            if resp.status == 200:
-                                fixtures = await resp.json()
-                                if isinstance(fixtures, dict):
-                                    fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
-                                logger.info(f"OddsPapi: {len(fixtures)} fixture concluse")
-                                for fix in fixtures:
-                                    home = fix.get("participant1Name", "")
-                                    away = fix.get("participant2Name", "")
-                                    if not home or not away:
-                                        continue
-                                    # Prova a leggere il vincitore dall'embedded score
-                                    # OddsPapi include spesso "score": {"home": N, "away": N}
-                                    # oppure "result": {"winner": "home"/"away"}
-                                    winner = None
-                                    result_field = fix.get("result") or {}
-                                    if isinstance(result_field, dict):
-                                        w = result_field.get("winner", "")
-                                        if w == "home":
-                                            winner = home
-                                        elif w == "away":
-                                            winner = away
-                                    if winner is None:
-                                        score = fix.get("score") or {}
-                                        if isinstance(score, dict):
-                                            sh = score.get("home") or score.get("participant1")
-                                            sa = score.get("away") or score.get("participant2")
-                                            if sh is not None and sa is not None:
-                                                try:
-                                                    winner = home if int(sh) > int(sa) else away
-                                                except (ValueError, TypeError):
-                                                    pass
-                                    if winner:
-                                        results.append({
-                                            "home":   home,
-                                            "away":   away,
-                                            "winner": winner,
-                                            "sport":  "tabletennis",
-                                        })
-                                    else:
-                                        logger.debug(f"OddsPapi: nessun score embedded per {home} vs {away} — fixture: {list(fix.keys())}")
-                            else:
-                                txt = await resp.text()
-                                logger.warning(f"OddsPapi fixtures concluse status {resp.status}: {txt[:200]}")
-            except Exception as e:
-                logger.warning(f"OddsPapi scores errore: {e}")
-
-        logger.info(f"Scores totali: {len(results)} partite completate")
-        return results
-
+        # ── Ping Pong via OddsPapi (/v4/fixtures?statusId=2 + /v4/settlements) ──
         # NOTA: l'endpoint /v4/results NON esiste su OddsPapi (mai esistito nella
         # loro API pubblica — da qui il 404 di prima). Il modo corretto per sapere
         # chi ha vinto una fixture è:

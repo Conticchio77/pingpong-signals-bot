@@ -381,9 +381,11 @@ class AIAnalyzer:
         now     = datetime.now(IT_TZ)
         # match_key: usa event_id se disponibile (stabile tra scan), altrimenti nome+data.
         # sig_type distingue winner da over/under sulla stessa partita.
-        # NON includiamo il pick nel key: due scan dello stesso evento devono
-        # produrre la stessa chiave e il secondo viene ignorato da signal_exists().
-        event_id = match.get("event_id") or match["name"]
+        event_id = match.get("event_id") or ""
+        if not event_id:
+            # Fallback: nome normalizzato + data. Meno stabile ma meglio di niente.
+            event_id = f"{match['name'].lower().replace(' ', '_')}_{now.strftime('%Y%m%d')}"
+            logger.warning(f"match_key: event_id mancante per '{match['name']}' — uso nome come chiave")
         key_str = f"{event_id}|{sig_type}|{now.strftime('%Y%m%d')}"
         mk      = hashlib.md5(key_str.encode()).hexdigest()[:16]
         stake   = self._stake(fair_prob, odds, confidence)
