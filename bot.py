@@ -211,7 +211,6 @@ def admin_panel_kb():
          InlineKeyboardButton("📋 Segnali",           callback_data="admin_list")],
         [InlineKeyboardButton("📊 Statistiche",       callback_data="admin_stats"),
          InlineKeyboardButton("⚙️ Impostazioni",      callback_data="admin_settings")],
-        [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
     ])
 
 # ── /start e /menu ──────────────────────────────────────────────────────────────
@@ -343,6 +342,7 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"📉 Cap edge tennis (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
+        [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     # Stima consumo crediti The Odds API
