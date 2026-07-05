@@ -68,7 +68,11 @@ class AIAnalyzer:
 
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
-        max_edge_cap = float(settings.get("max_edge_no_sharp", MAX_EDGE_NO_SHARP)) / 100
+        # Cap edge senza Pinnacle: più basso per ping pong (de-vig meno affidabile senza sharp)
+        if sport == "tabletennis":
+            max_edge_cap = 15.0 / 100   # ping pong: max 15% (OddsPapi non ha mai Pinnacle)
+        else:
+            max_edge_cap = float(settings.get("max_edge_no_sharp", MAX_EDGE_NO_SHARP)) / 100
 
         # ── Filtro anticipo kickoff ──────────────────────────────────────────
         kickoff_str = match.get("kickoff", "")

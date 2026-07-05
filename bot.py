@@ -211,6 +211,7 @@ def admin_panel_kb():
          InlineKeyboardButton("📋 Segnali",           callback_data="admin_list")],
         [InlineKeyboardButton("📊 Statistiche",       callback_data="admin_stats"),
          InlineKeyboardButton("⚙️ Impostazioni",      callback_data="admin_settings")],
+        [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
     ])
 
 # ── /start e /menu ──────────────────────────────────────────────────────────────
@@ -341,7 +342,7 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
-        [InlineKeyboardButton(f"📉 Cap edge senza Pinnacle: {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
+        [InlineKeyboardButton(f"📉 Cap edge tennis (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
     # Stima consumo crediti The Odds API
@@ -371,6 +372,70 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb()
         )
+
+    # ── Guida impostazioni ───────────────────────────────────────────────────────
+    if data == "admin_guide":
+        guida = (
+            "📖 *Guida alle impostazioni*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            "⏱ *Scan tennis — ogni quante ore*\n"
+            "Controlla nuove partite tennis su The Odds API.\n"
+            "Attivo solo tra le 07:00 e le 22:00.\n"
+            "• 3h → ~310 crediti/mese ✅ _consigliato_\n"
+            "• 2h → ~465 crediti/mese ⚠️\n"
+            "• 1h → ~930 crediti/mese ❌\n"
+            "Budget disponibile: 500 crediti/mese gratuiti.\n\n"
+
+            "📤 *Auto-invio VIP*\n"
+            "Se ON, i segnali vengono inviati automaticamente al gruppo VIP senza approvazione manuale.\n"
+            "• OFF → rivedi ogni segnale prima di inviarlo ✅ _consigliato_\n"
+            "• ON → invio immediato, meno controllo\n\n"
+
+            "🎯 *Confidenza minima*\n"
+            "Soglia sotto cui un segnale viene scartato.\n"
+            "• 55% → più segnali, qualità media\n"
+            "• 60% → bilanciato ✅ _consigliato_\n"
+            "• 65% → meno segnali, più selettivo\n"
+            "• 70%+ → pochissimi segnali, solo i migliori\n"
+            "Senza Pinnacle la confidenza è cappata a 65% automaticamente.\n\n"
+
+            "🏅 *Filtro sport*\n"
+            "• Entrambi → tennis + ping pong ✅ _consigliato_\n"
+            "• Solo tennis → ignora ping pong\n"
+            "• Solo ping pong → ignora tennis\n\n"
+
+            "💶 *Unità stake (€)*\n"
+            "Valore in € di 1 unità di stake.\n"
+            "Es. con €10: stake 3/5 = €30, stake 5/5 = €50.\n"
+            "Imposta in base al tuo bankroll.\n\n"
+
+            "⏰ *Anticipo minimo kickoff*\n"
+            "Scarta segnali troppo vicini all'inizio.\n"
+            "• 1h → consigliato ✅\n"
+            "• 2h → più conservativo\n"
+            "Con 30 min rischi di non trovare la quota in tempo.\n\n"
+
+            "📉 *Cap edge tennis (no Pinnacle)*\n"
+            "Limita gli edge gonfiati quando Pinnacle non è disponibile.\n"
+            "• 20% → consigliato per tennis ✅\n"
+            "• 15% → più severo\n"
+            "🏓 Ping pong: fisso a 15% (OddsPapi non ha Pinnacle).\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏓 *Ping pong*: scan fisso alle 07:00, max 6 fixture fino alle 22:00.\n"
+            "Budget OddsPapi: ~200 req/mese su 250 disponibili.\n"
+            "Entrambe le API si resettano il 1° di ogni mese."
+        )
+        await query.edit_message_text(
+            guida,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Vai alle impostazioni", callback_data="admin_settings")],
+                [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+            ])
+        )
+        return
 
     # ── Scan ─────────────────────────────────────────────────────────────────────
     elif data == "admin_scan":
@@ -722,10 +787,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_maxedge_{val}")])
         kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(
-            "📉 *Cap edge senza Pinnacle*\n\n"
-            "Senza sharp book il calcolo dell'edge può essere gonfiato.\n"
-            "Questo limite blocca i valori esagerati.\n\n"
-            "20% è il punto di equilibrio consigliato.",
+            "📉 *Cap edge tennis senza Pinnacle*\n\n"
+            "Quando Pinnacle non è disponibile il de-vig è meno preciso.\n"
+            "Questo limita gli edge gonfiati per il *tennis*.\n\n"
+            "🏓 Ping pong: fisso a 15% (OddsPapi non ha Pinnacle)\n"
+            "✅ 20% è il valore consigliato per il tennis.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
