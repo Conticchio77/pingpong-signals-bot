@@ -863,6 +863,23 @@ async def post_init(app: Application):
         id="pingpong_scan",
     )
 
+    # ── Recupero scan ping pong al boot ──────────────────────────────────────
+    # Se il bot riparte dopo le 07:00 (es. dopo un redeploy da GitHub) e lo
+    # scan ping pong di oggi non è ancora partito, il CronTrigger sopra
+    # aspetterebbe fino a domani alle 07:00. Qui lo recuperiamo subito.
+    today_str = now.strftime("%Y-%m-%d")
+    last_pp_row = db.conn.execute(
+        "SELECT value FROM settings WHERE key='last_pingpong_scan_date'"
+    ).fetchone()
+    last_pp = last_pp_row["value"] if last_pp_row else ""
+    if now.hour >= 7 and last_pp != today_str:
+        logger.info(f"🏓 Scan ping pong di oggi ({today_str}) non ancora eseguito — recupero al boot")
+        _scheduler.add_job(
+            lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+            id="pingpong_scan_catchup",
+            next_run_time=now + datetime.timedelta(seconds=20),
+        )
+
     _scheduler.start()
     logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 30min")
 
@@ -894,9 +911,15 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     # Filtra per sport
     sport_filter = getattr(run_signal_scan, "_sport_override", None) or settings.get("sport_filter", "both")
     if sport_filter == "both":
-        # Scan automatico: solo tennis. Ping pong ha job dedicato giornaliero.
-        matches = [m for m in matches if m.get("sport") == "tennis"]
-        logger.info(f"Scan tennis: {len(matches)} partite")
+        if manual:
+            # Scan manuale: controlla entrambi gli sport, l'utente ha premuto
+            # apposta il pulsante e si aspetta di vedere anche il ping pong.
+            logger.info(f"Scan manuale (entrambi gli sport): {len(matches)} partite")
+        else:
+            # Scan automatico orario: solo tennis, per non consumare la quota
+            # OddsPapi. Il ping pong ha il suo job dedicato giornaliero.
+            matches = [m for m in matches if m.get("sport") == "tennis"]
+            logger.info(f"Scan tennis: {len(matches)} partite")
     else:
         matches = [m for m in matches if m.get("sport") == sport_filter]
         logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
@@ -968,18 +991,24 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
 async def run_pingpong_scan(app: Application):
     """
-    Scan ping pong giornaliero alle 07:00.
-    Scarica le migliori 3 fixture del giorno (partite fino alle 19:00),
-    analizza e invia i segnali. 1 sola chiamata API al giorno = ~3 req/giorno.
+    Scan ping pong giornaliero.
+    Normalmente parte alle 07:00 (CronTrigger). Se il bot si riavvia dopo le
+    07:00 (es. dopo un redeploy) e lo scan di oggi non è ancora partito,
+    post_init lo recupera automaticamente al boot (vedi "catchup" più sotto).
+    Scarica le migliori fixture del giorno, analizza e invia i segnali.
     """
     settings = db.get_settings()
     if settings.get("sport_filter") == "tennis":
         logger.info("Ping pong scan saltato (sport_filter=tennis)")
         return
-    logger.info("🏓 Avvio scan ping pong giornaliero (ore 07:00)...")
+    logger.info("🏓 Avvio scan ping pong...")
     run_signal_scan._sport_override = "tabletennis"
     await run_signal_scan(app)
-    logger.info("🏓 Scan ping pong completato — prossimo domani alle 07:00")
+    # Segna la data di oggi come "già scansionata" — evita che il recupero al
+    # boot rilanci lo scan più volte nello stesso giorno dopo altri redeploy
+    today_str = datetime.datetime.now(ROME).strftime("%Y-%m-%d")
+    db.set_setting("last_pingpong_scan_date", today_str)
+    logger.info(f"🏓 Scan ping pong completato — segnato come eseguito per {today_str}")
 
 
 
