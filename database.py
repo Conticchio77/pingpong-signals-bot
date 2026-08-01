@@ -153,6 +153,28 @@ class Database:
         ).fetchone()[0]
         roi = round(total_won_profit / total_stake_all * 100, 1) if total_stake_all > 0 else 0
 
+        # ── Breakdown per sport (ping pong vs tennis) ────────────────────────
+        by_sport = {}
+        sport_rows = self.conn.execute(
+            """SELECT sport, sport_label,
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                      SUM(CASE WHEN result='won'  THEN 1 ELSE 0 END) AS won,
+                      SUM(CASE WHEN result='lost' THEN 1 ELSE 0 END) AS lost
+               FROM signals GROUP BY sport"""
+        ).fetchall()
+        for r in sport_rows:
+            s_won, s_lost = r["won"] or 0, r["lost"] or 0
+            s_total_res = s_won + s_lost
+            by_sport[r["sport"] or "n/d"] = {
+                "sport_label": r["sport_label"] or r["sport"] or "n/d",
+                "total":       r["total"] or 0,
+                "pending":     r["pending"] or 0,
+                "won":         s_won,
+                "lost":        s_lost,
+                "winrate":     round(s_won / s_total_res * 100, 1) if s_total_res > 0 else 0,
+            }
+
         return {
             "total":     total,
             "sent_vip":  sent,
@@ -163,6 +185,7 @@ class Database:
             "winrate":   winrate,
             "roi":       roi,
             "last_scan": self.get_settings()["last_scan"],
+            "by_sport":  by_sport,
         }
 
     def purge_old_signals(self) -> int:

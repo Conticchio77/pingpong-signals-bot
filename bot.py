@@ -191,6 +191,20 @@ def admin_panel_text() -> str:
     sport_filter = s.get("sport_filter", "both")
     sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sport_filter, "🏓🎾 Entrambi")
 
+    # ── Righe con la suddivisione per sport ──────────────────────────────────
+    by_sport = stats.get("by_sport", {})
+    sport_lines = []
+    order = ["tabletennis", "tennis"]  # ping pong prima, poi tennis, poi eventuali altri
+    for key in order + [k for k in by_sport if k not in order]:
+        d = by_sport.get(key)
+        if not d or d["total"] == 0:
+            continue
+        sport_lines.append(
+            f"{d['sport_label']}: *{d['total']}* tot | ⏳ {d['pending']} | "
+            f"✅ {d['won']}V ❌ {d['lost']}P | Win% {d['winrate']}%"
+        )
+    sport_breakdown = ("\n" + "\n".join(sport_lines) + "\n") if sport_lines else ""
+
     return (
         f"🏓🎾 *Signals Bot — Admin Panel*\n"
         f"{'━' * 26}\n"
@@ -198,6 +212,7 @@ def admin_panel_text() -> str:
         f"🔗 {src_tag}\n\n"
         f"📨 Segnali tot: *{stats['total']}* | ⏳ Pendenti: *{stats['pending']}*\n"
         f"✅ Vinti: *{stats['won']}* | ❌ Persi: *{stats['lost']}* | 🏆 Win%: *{stats['winrate']}%*\n"
+        f"{sport_breakdown}"
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
         f"⚙️ Scan ogni *{s['scan_interval']}h* | "
         f"Confidenza min: *{s['min_confidence']}%* | "
@@ -280,8 +295,11 @@ async def send_signals_list(fn):
     }
     kb = []
     for s in signals:
-        si    = status_icon.get(s["status"], "•")
-        label = f"{si} {s['kickoff']} | {s['match'][:18]} @{s['odds']}"
+        si = status_icon.get(s["status"], "•")
+        sport_label = s.get("sport_label") or ""
+        # Prende solo l'emoji iniziale dello sport (es. "🏓" da "🏓 Ping Pong")
+        sport_icon = sport_label.split(" ")[0] if sport_label else ("🏓" if s.get("sport") == "tabletennis" else "🎾")
+        label = f"{si} {sport_icon} {s['kickoff']} | {s['match'][:16]} @{s['odds']}"
         kb.append([InlineKeyboardButton(label, callback_data=f"view_signal_{s['id']}")])
     kb.append([InlineKeyboardButton("🗑 Cancella vecchi segnali", callback_data="confirm_purge")])
     await fn(
