@@ -193,16 +193,27 @@ def admin_panel_text() -> str:
 
     # ── Righe con la suddivisione per sport ──────────────────────────────────
     by_sport = stats.get("by_sport", {})
+    sport_meta = {
+        "tabletennis": "🏓 Ping Pong",
+        "tennis":      "🎾 Tennis",
+    }
     sport_lines = []
-    order = ["tabletennis", "tennis"]  # ping pong prima, poi tennis, poi eventuali altri
-    for key in order + [k for k in by_sport if k not in order]:
-        d = by_sport.get(key)
-        if not d or d["total"] == 0:
-            continue
+    seen_keys = set()
+    for key, default_label in sport_meta.items():
+        d = by_sport.get(key, {})
+        label = d.get("sport_label") or default_label
         sport_lines.append(
-            f"{d['sport_label']}: *{d['total']}* tot | ⏳ {d['pending']} | "
-            f"✅ {d['won']}V ❌ {d['lost']}P | Win% {d['winrate']}%"
+            f"{label}: *{d.get('total', 0)}* tot | ⏳ {d.get('pending', 0)} | "
+            f"✅ {d.get('won', 0)}V ❌ {d.get('lost', 0)}P | Win% {d.get('winrate', 0)}%"
         )
+        seen_keys.add(key)
+    # Eventuali sport extra non previsti sopra (mostrati solo se hanno segnali)
+    for key, d in by_sport.items():
+        if key not in seen_keys and d.get("total", 0) > 0:
+            sport_lines.append(
+                f"{d['sport_label']}: *{d['total']}* tot | ⏳ {d['pending']} | "
+                f"✅ {d['won']}V ❌ {d['lost']}P | Win% {d['winrate']}%"
+            )
     sport_breakdown = ("\n" + "\n".join(sport_lines) + "\n") if sport_lines else ""
 
     return (
