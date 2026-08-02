@@ -876,16 +876,25 @@ async def post_init(app: Application):
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
 
-    # Auto-risultati: ogni 30 minuti, prima esecuzione dopo 10 minuti
+    # Auto-risultati tennis: ogni 30 minuti (The Odds API, quota ampia)
     _scheduler.add_job(
-        lambda: _schedule_coro(lambda: run_auto_results(app)),
+        lambda: _schedule_coro(lambda: run_auto_results(app, sport="tennis")),
         trigger=IntervalTrigger(minutes=30, timezone=ROME),
-        id="auto_results",
+        id="auto_results_tennis",
         next_run_time=now + datetime.timedelta(minutes=10),
     )
 
-    # Scan ping pong: ogni giorno alle 07:00 (CronTrigger, affidabile)
+    # Auto-risultati ping pong: solo 2 volte al giorno (OddsPapi, 250
+    # richieste/mese — un controllo ogni 30 min esaurirebbe la quota in
+    # pochi giorni e bloccherebbe anche la ricerca di nuove partite)
     from apscheduler.triggers.cron import CronTrigger
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: run_auto_results(app, sport="tabletennis")),
+        trigger=CronTrigger(hour="14,22", minute=0, timezone=ROME),
+        id="auto_results_pingpong",
+    )
+
+    # Scan ping pong: ogni giorno alle 07:00 (CronTrigger, affidabile)
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
         trigger=CronTrigger(hour=7, minute=0, timezone=ROME),
@@ -1018,45 +1027,120 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     return new_signals
 
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
+PINGPONG_MAX_RETRIES = 2   # tentativi extra se lo scan mattutino fallisce
+PINGPONG_RETRY_DELAY_MIN = 45
+
 async def run_pingpong_scan(app: Application):
     """
     Scan ping pong giornaliero.
     Normalmente parte alle 07:00 (CronTrigger). Se il bot si riavvia dopo le
     07:00 (es. dopo un redeploy) e lo scan di oggi non è ancora partito,
     post_init lo recupera automaticamente al boot (vedi "catchup" più sotto).
+    Se la chiamata fallisce (errore rete/API), riprova automaticamente dopo
+    ~45 minuti, fino a PINGPONG_MAX_RETRIES tentativi extra nello stesso giorno.
     Scarica le migliori fixture del giorno, analizza e invia i segnali.
     """
     settings = db.get_settings()
     if settings.get("sport_filter") == "tennis":
         logger.info("Ping pong scan saltato (sport_filter=tennis)")
         return
-    logger.info("🏓 Avvio scan ping pong...")
-    run_signal_scan._sport_override = "tabletennis"
-    await run_signal_scan(app)
-    # Segna la data di oggi come "già scansionata" — evita che il recupero al
-    # boot rilanci lo scan più volte nello stesso giorno dopo altri redeploy
+
     today_str = datetime.datetime.now(ROME).strftime("%Y-%m-%d")
-    db.set_setting("last_pingpong_scan_date", today_str)
-    logger.info(f"🏓 Scan ping pong completato — segnato come eseguito per {today_str}")
+
+    # Conta i tentativi già fatti oggi (reset automatico al cambio data)
+    retry_key = "pingpong_scan_attempts_date"
+    count_key = "pingpong_scan_attempts_count"
+    last_attempt_date = db.conn.execute(
+        "SELECT value FROM settings WHERE key=?", (retry_key,)
+    ).fetchone()
+    last_attempt_date = last_attempt_date["value"] if last_attempt_date else ""
+    if last_attempt_date != today_str:
+        attempts_today = 0
+        db.set_setting(retry_key, today_str)
+    else:
+        row = db.conn.execute("SELECT value FROM settings WHERE key=?", (count_key,)).fetchone()
+        attempts_today = int(row["value"]) if row and row["value"] else 0
+
+    logger.info(f"🏓 Avvio scan ping pong (tentativo {attempts_today + 1})...")
+
+    ok = False
+    try:
+        run_signal_scan._sport_override = "tabletennis"
+        await run_signal_scan(app)
+        ok = True
+    except Exception as e:
+        logger.error(f"🏓 Scan ping pong fallito: {e}", exc_info=True)
+
+    attempts_today += 1
+    db.set_setting(count_key, str(attempts_today))
+
+    if ok:
+        # Segna la data di oggi come "già scansionata" — evita che il recupero
+        # al boot o un retry pendente rilancino lo scan più volte nello stesso giorno
+        db.set_setting("last_pingpong_scan_date", today_str)
+        logger.info(f"🏓 Scan ping pong completato — segnato come eseguito per {today_str}")
+        return
+
+    if attempts_today <= PINGPONG_MAX_RETRIES:
+        retry_time = datetime.datetime.now(ROME) + datetime.timedelta(minutes=PINGPONG_RETRY_DELAY_MIN)
+        logger.warning(
+            f"🏓 Scan ping pong: riprovo alle {retry_time.strftime('%H:%M')} "
+            f"(tentativo {attempts_today + 1}/{PINGPONG_MAX_RETRIES + 1})"
+        )
+        _scheduler.add_job(
+            lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+            id="pingpong_scan_retry",
+            replace_existing=True,
+            next_run_time=retry_time,
+        )
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"⚠️ *Scan ping pong fallito* (tentativo {attempts_today}/"
+                    f"{PINGPONG_MAX_RETRIES + 1}) — riprovo alle {retry_time.strftime('%H:%M')}."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    else:
+        logger.error("🏓 Scan ping pong: esauriti i tentativi per oggi, riprovo domani alle 07:00")
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="❌ *Scan ping pong*: falliti tutti i tentativi di oggi. Riprovo domani alle 07:00.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
 
 
-async def run_auto_results(app: Application):
+async def run_auto_results(app: Application, sport: str = "both"):
     """
     Controlla le API per i risultati delle partite completate
     e aggiorna automaticamente i segnali winner pendenti.
     Over/Under rimane manuale (no dati set dalle API gratuite).
+
+    sport: "both" | "tennis" | "tabletennis" — limita il controllo a un solo
+    sport. Usato per separare la frequenza dei controlli: il tennis (The Odds
+    API, 500 crediti/mese) può girare ogni 30 min, il ping pong (OddsPapi,
+    solo 250 richieste/mese) ha una schedulazione propria molto più rada
+    (vedi post_init) per non esaurire la quota.
     """
     pending = db.get_signals_for_auto_result()
     # Considera solo segnali winner — over/under non aggiornabili automaticamente
     pending = [s for s in pending if s.get("signal_type") == "winner"]
+    if sport != "both":
+        pending = [s for s in pending if s.get("sport") == sport]
     if not pending:
         return
 
-    logger.info(f"🔄 Auto-risultati: controllo {len(pending)} segnali winner pendenti...")
+    logger.info(f"🔄 Auto-risultati [{sport}]: controllo {len(pending)} segnali winner pendenti...")
 
     try:
-        scores = await scraper.fetch_scores()
+        scores = await scraper.fetch_scores(sport=sport)
     except Exception as e:
         logger.warning(f"Auto-risultati errore fetch: {e}")
         return
