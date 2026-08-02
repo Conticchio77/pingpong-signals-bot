@@ -593,9 +593,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "show_balance_chart":
         bal = db.get_balance_stats()
         if bal["total_bets"] < 2:
-            await query.answer("⚠️ Servono almeno 2 risultati per il grafico.", show_alert=True)
+            await query.edit_message_text(
+                "⚠️ Servono almeno 2 risultati per generare il grafico.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Statistiche", callback_data="admin_stats")]])
+            )
             return
-        await query.answer("📈 Generazione grafico...")
         buf = genera_grafico_bilancio()
         kb = [[InlineKeyboardButton("🔙 Statistiche", callback_data="admin_stats")]]
         if buf:
