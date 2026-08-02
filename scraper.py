@@ -482,16 +482,24 @@ class SignalScraper:
             logger.error(f"The Odds API /sports errore: {e}")
             return []
 
-    async def fetch_scores(self) -> list[dict]:
+    async def fetch_scores(self, sport: str = "both") -> list[dict]:
         """
         Risultati delle partite completate nelle ultime 24h.
         Copre sia tennis (The Odds API) sia ping pong (OddsPapi).
         Formato: [{home, away, winner, sport}, ...]
+
+        sport: "both" | "tennis" | "tabletennis" — limita le chiamate API
+        al solo sport richiesto. Usato per evitare di consumare la quota
+        OddsPapi (250 req/mese) ad ogni controllo automatico dei risultati
+        tennis (che gira ogni 30 min): il ping pong ha una schedulazione
+        propria, molto più rada, separata in bot.py.
         """
         results = []
+        want_tennis    = sport in ("both", "tennis")
+        want_pingpong  = sport in ("both", "tabletennis")
 
         # ── Tennis via The Odds API ──────────────────────────────────────────
-        if ODDS_KEY:
+        if want_tennis and ODDS_KEY:
             async with aiohttp.ClientSession() as session:
                 # Non usiamo la cache in-memory per i scores: potrebbe essere vuota
                 # se il bot è appena ripartito. Forziamo un refetch diretto.
@@ -553,7 +561,7 @@ class SignalScraper:
         #      (Match Winner): outcome 101 = participant1, 102 = participant2.
         # Ogni fixture finita controllata costa 1 richiesta aggiuntiva di quota,
         # quindi limitiamo il numero di fixture per scan.
-        if ODDSPAPI_KEY:
+        if want_pingpong and ODDSPAPI_KEY:
             try:
                 async with aiohttp.ClientSession() as session:
                     sport_id = await self._get_tt_sport_id(session)
