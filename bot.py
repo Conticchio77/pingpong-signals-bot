@@ -923,7 +923,7 @@ async def post_init(app: Application):
         )
 
     _scheduler.start()
-    logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 30min")
+    logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 60min")
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
 async def run_signal_scan(app: Application, manual: bool = False) -> int:
@@ -946,6 +946,26 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     sources = set(m.get("source", "?") for m in matches)
     sports  = set(m.get("sport", "?") for m in matches)
     logger.info(f"Fonti: {sources} | Sport: {sports} | Partite: {len(matches)}")
+
+    # ── Avviso quota esaurita/ripristinata (una volta sola per cambio stato) ──
+    async def _notify_quota_change(api_name: str, sport_label: str, setting_key: str, quota_ok: bool):
+        prev = db.get_setting(setting_key, "1") == "1"
+        if quota_ok != prev:
+            db.set_setting(setting_key, "1" if quota_ok else "0")
+            if quota_ok:
+                text = f"✅ *{sport_label}*: quota {api_name} di nuovo disponibile — segnali reali riattivati."
+            else:
+                text = (
+                    f"⚠️ *{sport_label}*: quota {api_name} esaurita.\n"
+                    f"Niente nuovi segnali reali finché non si resetta. Ti avviso appena torna disponibile."
+                )
+            try:
+                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Notifica quota {api_name} fallita: {e}")
+
+    await _notify_quota_change("The Odds API", "🎾 Tennis", "tennis_quota_ok", scraper.tennis_quota_ok)
+    await _notify_quota_change("OddsPapi", "🏓 Ping Pong", "pingpong_quota_ok", scraper.pingpong_quota_ok)
 
     # Settings prima di tutto
     settings = db.get_settings()
@@ -971,19 +991,23 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
 
     # Se nessuna partita reale avvisa l'admin (solo in orario diurno 07-23 per non spammare)
     real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
+    quota_is_the_reason = not (scraper.tennis_quota_ok and scraper.pingpong_quota_ok)
     if not real_matches and (ODDS_KEY or os.environ.get("ODDSPAPI_KEY")):
         logger.info("Nessuna partita reale disponibile in questo momento")
-        ora = datetime.datetime.now(ROME).hour
-        if 7 <= ora <= 23:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "ℹ️ *Nessuna partita disponibile*\n\n"
-                    "Le API non hanno partite quotate al momento.\n"
-                    "Il prossimo scan automatico riproverà tra poco."
-                ),
-                parse_mode="Markdown",
-            )
+        # Il messaggio generico va mandato solo se il motivo NON è la quota esaurita
+        # (in quel caso l'admin è già stato avvisato da _notify_quota_change sopra).
+        if not quota_is_the_reason:
+            ora = datetime.datetime.now(ROME).hour
+            if 7 <= ora <= 23:
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "ℹ️ *Nessuna partita disponibile*\n\n"
+                        "Le API non hanno partite quotate al momento.\n"
+                        "Il prossimo scan automatico riproverà tra poco."
+                    ),
+                    parse_mode="Markdown",
+                )
         return 0
 
     new_signals = 0

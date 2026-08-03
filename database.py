@@ -1,13 +1,21 @@
 import sqlite3
 import os
+import logging
 from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "signals.db")
 
 
 class Database:
     def __init__(self):
+        is_persistent = os.path.isabs(DB_PATH) and DB_PATH != "signals.db"
+        logger.info(
+            f"💾 DB in uso: {DB_PATH} "
+            f"({'persistente su volume' if is_persistent else '⚠️ ATTENZIONE: path relativo, probabilmente NON persistente tra i redeploy'})"
+        )
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -229,6 +237,13 @@ class Database:
             "min_hours_before": float(raw.get("min_hours_before", 1.0)),
             "max_edge_no_sharp":float(raw.get("max_edge_no_sharp", 20.0)),
         }
+
+    def get_setting(self, key: str, default=None):
+        """Legge una singola chiave arbitraria dalla tabella settings (non solo quelle note)."""
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
 
     def set_setting(self, key: str, value):
         self.conn.execute(

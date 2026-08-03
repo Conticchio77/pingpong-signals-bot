@@ -57,6 +57,10 @@ class SignalScraper:
         self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
         self._odds_tennis_keys: list[str] | None = None  # cache sport_key torneo tennis attivi (The Odds API)
         self.db = db   # se presente, cache persistente su DB (evita 429 da troppe /sports)
+        # Stato quota, aggiornato ad ogni chiamata reale alle API — usato da bot.py
+        # per avvisare l'admin quando i segnali si fermano per quota esaurita.
+        self.tennis_quota_ok   = True
+        self.pingpong_quota_ok = True
 
     # ── Entry point principale ─────────────────────────────────────────────────
     async def fetch_matches(self) -> list[dict]:
@@ -113,7 +117,10 @@ class SignalScraper:
             ) as r:
                 if r.status != 200:
                     logger.warning(f"OddsPapi /sports status {r.status}")
+                    if r.status == 429:
+                        self.pingpong_quota_ok = False
                     return None
+                self.pingpong_quota_ok = True
                 sports = await r.json()
                 for s in sports:
                     name = (s.get("name") or s.get("slug") or "").lower()
@@ -157,7 +164,10 @@ class SignalScraper:
                     if r.status != 200:
                         txt = await r.text()
                         logger.warning(f"OddsPapi fixtures status {r.status}: {txt[:120]}")
+                        if r.status == 429:
+                            self.pingpong_quota_ok = False
                         return []
+                    self.pingpong_quota_ok = True
                     fixtures = await r.json()
                     # fixtures può essere lista diretta o {"data": [...]}
                     if isinstance(fixtures, dict):
@@ -356,6 +366,7 @@ class SignalScraper:
                             f"The Odds API tennis ({sport_key}) — usate:{used} rimaste:{rem}"
                         )
                         if resp.status == 200:
+                            self.tennis_quota_ok = True
                             events = await resp.json()
                             logger.info(
                                 f"The Odds API ({sport_key}): {len(events)} eventi"
@@ -373,6 +384,8 @@ class SignalScraper:
                             logger.warning(
                                 f"The Odds API ({sport_key}) status {resp.status}: {txt[:120]}"
                             )
+                            if resp.status == 401:
+                                self.tennis_quota_ok = False
                 except Exception as e:
                     logger.error(f"The Odds API tennis errore ({sport_key}): {e}")
 
