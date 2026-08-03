@@ -878,10 +878,12 @@ async def post_init(app: Application):
         next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
 
-    # Auto-risultati tennis: ogni 30 minuti (The Odds API, quota ampia)
+    # Auto-risultati tennis: ogni 60 minuti (ridotto da 30 — insieme al filtro
+    # per tornei con segnali pendenti in scraper.py, taglia drasticamente il
+    # consumo di crediti The Odds API che si stava esaurendo in 2-3 giorni)
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_auto_results(app, sport="tennis")),
-        trigger=IntervalTrigger(minutes=30, timezone=ROME),
+        trigger=IntervalTrigger(minutes=60, timezone=ROME),
         id="auto_results_tennis",
         next_run_time=now + datetime.timedelta(minutes=10),
     )
@@ -1164,9 +1166,13 @@ async def run_auto_results(app: Application, sport: str = "both"):
         if a == b:
             return True
         a_parts, b_parts = a.split(), b.split()
-        # Cognome corrisponde (min 4 char per evitare falsi positivi)
+        # Cognome corrisponde DA SOLO: valido solo se uno dei due non ha un nome
+        # proprio (es. liste con un solo nome) — altrimenti cognomi comuni
+        # (Garcia, Martinez, Petrovic...) rischiano falsi positivi tra giocatori
+        # diversi, con impatto diretto sul bilancio.
         if a_parts and b_parts and len(a_parts[-1]) >= 4 and a_parts[-1] == b_parts[-1]:
-            return True
+            if len(a_parts) == 1 or len(b_parts) == 1:
+                return True
         # Uno contiene l'altro (es. "T. Boll" in "Timo Boll")
         if len(a) > 4 and len(b) > 4 and (a in b or b in a):
             return True

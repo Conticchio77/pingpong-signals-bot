@@ -341,7 +341,7 @@ class SignalScraper:
                 url = (
                     f"{ODDS_BASE}/sports/{sport_key}/odds/"
                     f"?apiKey={ODDS_KEY}"
-                    f"&regions=eu,uk"
+                    f"&regions=eu"
                     f"&markets=h2h,totals"
                     f"&oddsFormat=decimal"
                     f"&dateFormat=iso"
@@ -499,16 +499,53 @@ class SignalScraper:
         want_pingpong  = sport in ("both", "tabletennis")
 
         # ── Tennis via The Odds API ──────────────────────────────────────────
+        # OTTIMIZZAZIONE QUOTA: prima di chiamare /scores/ per torneo, controlliamo
+        # se abbiamo davvero segnali tennis pendenti. Senza questo controllo, ogni
+        # esecuzione (ogni 30-60 min) chiamava /scores/ per OGNI torneo ATP/WTA
+        # attivo (anche 8-10 in contemporanea in periodo di tour), bruciando fino
+        # a 480 richieste/giorno per controllare risultati di tornei dove magari
+        # non avevamo nemmeno un segnale aperto.
+        pending_tournaments = set()
+        if self.db and want_tennis:
+            try:
+                for sig in self.db.get_signals_for_auto_result():
+                    if sig.get("sport") == "tennis" and sig.get("tournament"):
+                        pending_tournaments.add(sig["tournament"].strip().lower())
+            except Exception as e:
+                logger.warning(f"Scores tennis: errore lettura segnali pendenti: {e}")
+
+        if want_tennis and ODDS_KEY and not pending_tournaments:
+            logger.info("Scores tennis: nessun segnale tennis pendente — salto il controllo (risparmio quota)")
+            want_tennis = False
+
         if want_tennis and ODDS_KEY:
             async with aiohttp.ClientSession() as session:
                 # Non usiamo la cache in-memory per i scores: potrebbe essere vuota
                 # se il bot è appena ripartito. Forziamo un refetch diretto.
                 saved_cache = self._odds_tennis_keys
                 self._odds_tennis_keys = None
-                tennis_keys = await self._get_active_tennis_sport_keys(session)
-                if not tennis_keys:
+                all_tennis_keys = await self._get_active_tennis_sport_keys(session)
+                if not all_tennis_keys:
                     self._odds_tennis_keys = saved_cache
                     logger.warning("Scores tennis: nessun torneo attivo trovato")
+
+                # Filtra: controlla solo i tornei per cui abbiamo segnali pendenti,
+                # invece di TUTTI i tornei attivi (risparmio quota drastico).
+                # Normalizziamo (no spazi/underscore/prefisso "tennis_") perché il
+                # titolo segnale ("WTA Washington Open") e la sport key
+                # ("tennis_wta_washington_open") hanno formati diversi.
+                def _norm(s: str) -> str:
+                    return s.lower().replace("tennis_", "").replace("_", "").replace(" ", "")
+                pending_norm = {_norm(t) for t in pending_tournaments}
+                tennis_keys = [
+                    k for k in all_tennis_keys
+                    if any(pn in _norm(k) or _norm(k) in pn for pn in pending_norm)
+                ]
+                if all_tennis_keys and not tennis_keys:
+                    logger.info(
+                        f"Scores tennis: nessun torneo attivo corrisponde ai segnali pendenti "
+                        f"({pending_tournaments}) tra quelli disponibili {all_tennis_keys}"
+                    )
                 for sport_key in tennis_keys:
                     url = (
                         f"{ODDS_BASE}/sports/{sport_key}/scores/"

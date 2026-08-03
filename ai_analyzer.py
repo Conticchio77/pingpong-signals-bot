@@ -116,8 +116,8 @@ class AIAnalyzer:
 
         # ── Winner ──────────────────────────────────────────────────────────
         # Cerca la quota migliore nei soft book (o usa odds_home/away)
-        best_h, best_h_book = self._best_soft_odd(raw_bm, p1, match.get("odds_home"))
-        best_a, best_a_book = self._best_soft_odd(raw_bm, p2, match.get("odds_away"))
+        best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"))
+        best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"))
 
         if best_h and MIN_ODDS <= best_h <= MAX_ODDS:
             value_h = fair_home * best_h - 1
@@ -267,10 +267,17 @@ class AIAnalyzer:
         return round((1/oh) / margin, 4), round((1/oa) / margin, 4)
 
     # ── Miglior quota soft book ────────────────────────────────────────────────
-    def _best_soft_odd(self, raw_bm: dict, player: str, fallback: float) -> tuple:
+    def _best_soft_odd(self, raw_bm: dict, side: str, fallback: float) -> tuple:
         """
-        Cerca la quota migliore per un giocatore tra i soft book.
+        Cerca la quota migliore per un lato (side = "home" o "away") tra i soft book.
         Ritorna (quota, nome_book).
+
+        NOTA: prende `side` esplicito (non il nome giocatore) perché raw_bookmakers
+        usa sempre chiavi generiche {"home": x, "away": y} (vedi scraper.py, entry["home"]/
+        entry["away"]). Il vecchio codice cercava il nome giocatore dentro le chiavi
+        "home"/"away" (che non lo contengono mai) e poi aveva un fallback che leggeva
+        SEMPRE "home" a prescindere dal lato cercato — quindi il lato "away" riceveva
+        sempre la quota home per errore.
         """
         if not raw_bm:
             return fallback, None
@@ -282,20 +289,9 @@ class AIAnalyzer:
             # Salta sharp book per la ricerca della quota "da giocare"
             if any(s in book_name.lower() for s in SHARP_BOOKS):
                 continue
-            # Cerca la quota per il giocatore nel dict del bookmaker
-            price = None
-            for key, val in odds.items():
-                if isinstance(val, (int, float)) and player.lower() in key.lower():
-                    price = float(val)
-                    break
-                # Struttura alternativa: {"home": x, "away": y}
-                if key in ("home", "away") and isinstance(val, (int, float)):
-                    if key == "home" and "home" in odds:
-                        price = float(val)
-                        break
-
-            if price and price > best_price:
-                best_price = price
+            val = odds.get(side)
+            if isinstance(val, (int, float)) and val > best_price:
+                best_price = float(val)
                 best_book  = book_name
 
         # Se non trovato tra soft, usa il fallback (media mercato)
