@@ -1103,7 +1103,13 @@ async def run_pingpong_scan(app: Application):
     try:
         run_signal_scan._sport_override = "tabletennis"
         await run_signal_scan(app)
-        ok = True
+        # OddsPapi non lancia eccezioni sui suoi errori (429/timeout): li logga
+        # e basta, quindi "nessuna eccezione" non vuol dire "dati reali ottenuti".
+        # Controlliamo esplicitamente lo stato quota per non segnare il giorno
+        # come completato quando in realtà OddsPapi ha risposto 429.
+        ok = scraper.pingpong_quota_ok
+        if not ok:
+            logger.warning("🏓 Scan ping pong: quota OddsPapi esaurita (429) — non segnato come completato, riprovo")
     except Exception as e:
         logger.error(f"🏓 Scan ping pong fallito: {e}", exc_info=True)
 
