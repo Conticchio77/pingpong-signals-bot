@@ -381,7 +381,7 @@ async def send_settings(fn):
     await fn(
         "⚙️ *Impostazioni*\n\n"
         f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n"
-        f"🏓 _OddsPapi ping pong: ~{6*31} req/mese su 250 disponibili_\n\n"
+        f"🏓 _OddsPapi ping pong: ~{4*31} req/mese su 250 disponibili_\n\n"
         "Tocca un'opzione per modificarla:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
@@ -452,9 +452,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🏓 Ping pong: fisso a 15% (OddsPapi non ha Pinnacle).\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏓 *Ping pong*: scan fisso alle 07:00, max 6 fixture fino alle 22:00.\n"
-            "Budget OddsPapi: ~200 req/mese su 250 disponibili.\n"
-            "Entrambe le API si resettano il 1° di ogni mese."
+            "🏓 *Ping pong*: scan fisso alle 07:00, max 4 fixture fino alle 22:00.\n"
+            "Budget OddsPapi: ~125 req/mese su 250 disponibili.\n"
+            "The Odds API si resetta il 1° del mese. OddsPapi si resetta dalla data di attivazione della chiave (non necessariamente il 1°) — controlla su oddspapi.io/us/account."
         )
         await query.edit_message_text(
             guida,

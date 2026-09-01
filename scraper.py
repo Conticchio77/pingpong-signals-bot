@@ -179,7 +179,7 @@ class SignalScraper:
                         fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                     logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
 
-                    # Limita a 12 fixture più vicine nel tempo per evitare rate limit
+                    # Limita a 4 fixture più vicine nel tempo per evitare rate limit
                     # (ogni fixture = 1 chiamata API per le quote — piano gratuito 250/mese)
                     def _sort_key(f):
                         s = f.get("startDate") or f.get("startTime") or ""
@@ -196,7 +196,7 @@ class SignalScraper:
                     ]
                     # Se non ci sono partite entro le 19, prende comunque le prime 3 del giorno
                     pool = fixtures_today if fixtures_today else fixtures
-                    fixtures = sorted(pool, key=_sort_key)[:6]  # max 6 per risparmiare quota OddsPapi
+                    fixtures = sorted(pool, key=_sort_key)[:4]  # max 4 per risparmiare quota OddsPapi
                     logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture (evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
