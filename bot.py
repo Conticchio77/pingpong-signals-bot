@@ -936,8 +936,21 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     logger.info("🔍 Avvio scan tennis..." if not sport_ov else "🏓 Avvio scan ping pong...")
     db.set_setting("last_scan", now_it_str())
 
+    # Settings e filtro sport PRIMA della fetch: evita di interrogare OddsPapi
+    # (ping pong) quando serve solo il tennis, e viceversa — prima veniva
+    # sempre fetchato tutto e scartato dopo, bruciando la quota OddsPapi
+    # (250 richieste/mese) ad ogni scan automatico tennis.
+    settings = db.get_settings()
+    sport_filter = sport_ov or settings.get("sport_filter", "both")
+    if sport_filter == "both" and not manual:
+        # Scan automatico orario: solo tennis, per non consumare la quota
+        # OddsPapi. Il ping pong ha il suo job dedicato giornaliero.
+        fetch_sport = "tennis"
+    else:
+        fetch_sport = sport_filter
+
     try:
-        matches = await scraper.fetch_matches()
+        matches = await scraper.fetch_matches(sport=fetch_sport)
     except Exception as e:
         logger.error(f"Errore scraping: {e}")
         matches = scraper.get_fallback_matches()
@@ -967,19 +980,14 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     await _notify_quota_change("The Odds API", "🎾 Tennis", "tennis_quota_ok", scraper.tennis_quota_ok)
     await _notify_quota_change("OddsPapi", "🏓 Ping Pong", "pingpong_quota_ok", scraper.pingpong_quota_ok)
 
-    # Settings prima di tutto
-    settings = db.get_settings()
-
-    # Filtra per sport
-    sport_filter = getattr(run_signal_scan, "_sport_override", None) or settings.get("sport_filter", "both")
+    # Filtra per sport (safety net: con fetch_sport mirato i match sono già
+    # del sport giusto, tranne nel caso manuale "both" dove restano entrambi)
     if sport_filter == "both":
         if manual:
             # Scan manuale: controlla entrambi gli sport, l'utente ha premuto
             # apposta il pulsante e si aspetta di vedere anche il ping pong.
             logger.info(f"Scan manuale (entrambi gli sport): {len(matches)} partite")
         else:
-            # Scan automatico orario: solo tennis, per non consumare la quota
-            # OddsPapi. Il ping pong ha il suo job dedicato giornaliero.
             matches = [m for m in matches if m.get("sport") == "tennis"]
             logger.info(f"Scan tennis: {len(matches)} partite")
     else:

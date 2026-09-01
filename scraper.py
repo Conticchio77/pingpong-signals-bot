@@ -63,24 +63,29 @@ class SignalScraper:
         self.pingpong_quota_ok = True
 
     # ── Entry point principale ─────────────────────────────────────────────────
-    async def fetch_matches(self) -> list[dict]:
-        """Restituisce partite di ENTRAMBI gli sport, ordinate per kickoff."""
+    async def fetch_matches(self, sport: str = "both") -> list[dict]:
+        """Restituisce partite. sport: "both" | "tennis" | "tabletennis" —
+        limita le chiamate API al solo sport richiesto, per non consumare
+        inutilmente la quota OddsPapi (250 richieste/mese) durante gli scan
+        automatici tennis-only (il ping pong ha il suo job dedicato)."""
         results = []
+        want_pingpong = sport in ("both", "tabletennis")
+        want_tennis   = sport in ("both", "tennis")
 
         # 1. Ping Pong via OddsPapi
-        if ODDSPAPI_KEY:
+        if want_pingpong and ODDSPAPI_KEY:
             tt = await self._fetch_oddspapi_tt()
             logger.info(f"OddsPapi Ping Pong: {len(tt)} partite")
             results.extend(tt)
-        else:
+        elif want_pingpong:
             logger.warning("ODDSPAPI_KEY non impostata — ping pong saltato")
 
         # 2. Tennis via The Odds API
-        if ODDS_KEY:
+        if want_tennis and ODDS_KEY:
             ten = await self._fetch_odds_api_tennis()
             logger.info(f"The Odds API Tennis: {len(ten)} partite")
             results.extend(ten)
-        else:
+        elif want_tennis:
             logger.warning("ODDS_API_KEY non impostata — tennis saltato")
 
         # Fallback se entrambe le API sono assenti
