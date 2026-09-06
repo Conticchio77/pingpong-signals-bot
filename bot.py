@@ -17,6 +17,8 @@ from scraper import SignalScraper
 from ai_analyzer import AIAnalyzer
 from database import Database
 
+import httpx
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -28,6 +30,28 @@ TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
 VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
 ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
+
+# ── Relay verso il bot "Segnali dal Futuro" (inoltro privato filtrato per utente) ──
+# Telegram non consegna ai bot i messaggi scritti da altri bot: il post nel gruppo VIP
+# resta solo un contenitore/archivio visivo. L'inoltro privato agli utenti passa da qui.
+RELAY_URL = os.environ.get("RELAY_URL", "https://node-red-production-9694.up.railway.app/relay-segnale-esterno")
+RELAY_KEY = os.environ.get("RELAY_SECRET_KEY", "xUp_WW4mUaGCIZNoWkSWXx3c6BpNDaZy")
+
+async def relay_to_private(text: str, category: str = "ping_signal"):
+    """Manda il segnale all'endpoint del bot VIP, che lo inoltra in privato agli utenti idonei."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                RELAY_URL,
+                headers={"X-Relay-Key": RELAY_KEY},
+                json={"category": category, "text": text, "parse_mode": "Markdown"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Relay privato fallito ({resp.status_code}): {resp.text[:200]}")
+            else:
+                logger.info(f"Relay privato ok: {resp.json()}")
+    except Exception as e:
+        logger.warning(f"Relay privato: errore di connessione: {e}")
 
 db       = Database()
 scraper  = SignalScraper(db=db)
@@ -512,6 +536,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.application.bot.send_message(
                 chat_id=VIP_GROUP_ID, text=vip_signal_text(s), parse_mode="Markdown"
             )
+            await relay_to_private(vip_signal_text(s))
             db.update_signal_status(sig_id, "sent")
             kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
                    InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
@@ -1054,6 +1079,7 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
                     await app.bot.send_message(
                         chat_id=VIP_GROUP_ID, text=vip_signal_text(sig), parse_mode="Markdown"
                     )
+                    await relay_to_private(vip_signal_text(sig))
                     db.update_signal_status(sig_id, "sent")
 
         except Exception as e:
