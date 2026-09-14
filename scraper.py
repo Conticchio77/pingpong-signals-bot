@@ -614,8 +614,32 @@ class SignalScraper:
         #   2) /v4/settlements?fixtureId=... → per ciascuna fixture conclusa
         #      restituisce WIN/LOSE per ogni outcome del mercato "101"
         #      (Match Winner): outcome 101 = participant1, 102 = participant2.
-        # Ogni fixture finita controllata costa 1 richiesta aggiuntiva di quota,
-        # quindi limitiamo il numero di fixture per scan.
+        # Ogni fixture finita controllata costa 1 richiesta aggiuntiva di quota.
+        #
+        # OTTIMIZZAZIONE QUOTA (come per il tennis sopra): prima controlliamo se
+        # abbiamo davvero segnali ping pong pendenti. Senza questo filtro, ogni
+        # esecuzione (2 volte al giorno) controllava fino a 15 fixture concluse
+        # a prescindere da quanti segnali fossero effettivamente aperti — cioè
+        # fino a 1 (fixtures) + 15 (settlements) = 16 richieste per controllo,
+        # 32/giorno, ~1000/mese: molto oltre le 250 richieste/mese disponibili,
+        # ed è la causa più probabile per cui la quota si esaurisce sempre a
+        # metà mese. Ora controlliamo solo le fixture che corrispondono a un
+        # giocatore con un segnale ping pong pendente.
+        pending_pp_players = set()
+        if self.db and want_pingpong:
+            try:
+                for sig in self.db.get_signals_for_auto_result():
+                    if sig.get("sport") == "tabletennis":
+                        pending_pp_players.add(sig.get("player1", "").strip().lower())
+                        pending_pp_players.add(sig.get("player2", "").strip().lower())
+                pending_pp_players.discard("")
+            except Exception as e:
+                logger.warning(f"Scores ping pong: errore lettura segnali pendenti: {e}")
+
+        if want_pingpong and ODDSPAPI_KEY and not pending_pp_players:
+            logger.info("Scores ping pong: nessun segnale ping pong pendente — salto il controllo (risparmio quota)")
+            want_pingpong = False
+
         if want_pingpong and ODDSPAPI_KEY:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -642,9 +666,16 @@ class SignalScraper:
                                     fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                                 logger.info(f"OddsPapi: {len(fixtures)} fixture concluse trovate")
 
-                                # Limita per non sforare la quota mensile (1 richiesta
-                                # /settlements per ogni fixture controllata)
-                                fixtures = fixtures[:15]
+                                # Tiene solo le fixture i cui giocatori hanno un
+                                # segnale pendente (risparmio quota — vedi sopra),
+                                # con un tetto di sicurezza extra a 6 richieste
+                                # /settlements anche nel caso limite.
+                                def _matches_pending(fix: dict) -> bool:
+                                    h = (fix.get("participant1Name") or "").strip().lower()
+                                    a = (fix.get("participant2Name") or "").strip().lower()
+                                    return h in pending_pp_players or a in pending_pp_players
+                                fixtures = [f for f in fixtures if _matches_pending(f)][:6]
+                                logger.info(f"OddsPapi: {len(fixtures)} fixture da verificare (match con segnali pendenti)")
 
                                 for fix in fixtures:
                                     home = fix.get("participant1Name", "")

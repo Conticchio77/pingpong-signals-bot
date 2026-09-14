@@ -42,7 +42,7 @@ SOFT_BOOKS = {
 }
 
 # ── Soglie value bet ───────────────────────────────────────────────────────────
-MIN_VALUE_PCT        = 5.0    # % minimo di edge per generare segnale
+MIN_VALUE_PCT        = 3.0    # % minimo di edge per generare segnale (default — override da settings["min_value_pct"])
 MIN_ODDS             = 1.40   # quota minima accettata
 MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
@@ -68,6 +68,7 @@ class AIAnalyzer:
 
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
+        min_value    = float(settings.get("min_value_pct", MIN_VALUE_PCT)) / 100
         # Cap edge senza Pinnacle: più basso per ping pong (de-vig meno affidabile senza sharp)
         if sport == "tabletennis":
             max_edge_cap = 15.0 / 100   # ping pong: max 15% (OddsPapi non ha mai Pinnacle)
@@ -123,7 +124,7 @@ class AIAnalyzer:
             value_h = fair_home * best_h - 1
             if not has_sharp:
                 value_h = min(value_h, max_edge_cap)
-            if value_h >= MIN_VALUE_PCT / 100:
+            if value_h >= min_value:
                 conf = self._confidence(value_h, has_sharp, match.get("source",""))
                 signals.append(self._build(
                     match     = match,
@@ -141,7 +142,7 @@ class AIAnalyzer:
             value_a = fair_away * best_a - 1
             if not has_sharp:
                 value_a = min(value_a, max_edge_cap)
-            if value_a >= MIN_VALUE_PCT / 100:
+            if value_a >= min_value:
                 conf = self._confidence(value_a, has_sharp, match.get("source",""))
                 signals.append(self._build(
                     match     = match,
@@ -170,7 +171,7 @@ class AIAnalyzer:
 
                 unit = "set" if sport == "tabletennis" else "games"
 
-                if value_ov >= MIN_VALUE_PCT / 100:
+                if value_ov >= min_value:
                     conf = self._confidence(value_ov, has_sharp, match.get("source",""))
                     signals.append(self._build(
                         match     = match,
@@ -187,7 +188,7 @@ class AIAnalyzer:
                         book_note = f"Linea: {line} {unit}",
                     ))
 
-                elif value_un >= MIN_VALUE_PCT / 100:
+                elif value_un >= min_value:
                     conf = self._confidence(value_un, has_sharp, match.get("source",""))
                     signals.append(self._build(
                         match     = match,

@@ -395,6 +395,7 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"📉 Cap edge tennis (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
+        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
         [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
@@ -475,9 +476,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 15% → più severo\n"
             "🏓 Ping pong: fisso a 15% (OddsPapi non ha Pinnacle).\n\n"
 
+            "💎 *Value minimo segnale*\n"
+            "Edge minimo (fair value vs quota disponibile) sotto cui una partita viene ignorata.\n"
+            "• 2% → molto permissivo (più segnali, meno affidabili)\n"
+            "• 3% → bilanciato ✅ _consigliato_\n"
+            "• 4-5% → selettivo (pochi segnali, solo i migliori)\n"
+            "Se noti giorni interi senza segnali tennis, prova ad abbassarlo.\n\n"
+
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🏓 *Ping pong*: scan fisso alle 07:00, max 4 fixture fino alle 22:00.\n"
-            "Budget OddsPapi: ~125 req/mese su 250 disponibili.\n"
+            "Controllo risultati 2 volte/giorno, solo sui giocatori con segnali aperti (max 6 fixture a controllo).\n"
+            "Budget OddsPapi: ~150-200 req/mese su 250 disponibili (stima).\n"
             "The Odds API si resetta il 1° del mese. OddsPapi si resetta dalla data di attivazione della chiave (non necessariamente il 1°) — controlla su oddspapi.io/us/account."
         )
         await query.edit_message_text(
@@ -855,6 +864,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("set_maxedge_"):
         val = float(data.replace("set_maxedge_", ""))
         db.set_setting("max_edge_no_sharp", val)
+        await send_settings(query.edit_message_text)
+
+    # ── Value minimo segnale ─────────────────────────────────────────────────
+    elif data == "pick_value_pct":
+        current = db.get_settings().get("min_value_pct", 3.0)
+        opts = [
+            (2.0, "2% — permissivo (più segnali)"),
+            (3.0, "3% — bilanciato ✓"),
+            (4.0, "4% — selettivo"),
+            (5.0, "5% — molto selettivo (pochi segnali)"),
+        ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if abs(float(val) - float(current)) < 0.01 else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_valuepct_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "💎 *Value minimo per generare un segnale*\n\n"
+            "Edge minimo tra quota fair (de-vig) e quota disponibile.\n"
+            "Più basso = più segnali ma mediamente meno marcati.\n"
+            "Più alto = pochi segnali ma solo i più netti.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_valuepct_"):
+        val = float(data.replace("set_valuepct_", ""))
+        db.set_setting("min_value_pct", val)
         await send_settings(query.edit_message_text)
 
 
