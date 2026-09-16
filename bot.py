@@ -988,9 +988,18 @@ async def post_init(app: Application):
     logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 60min")
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
-async def run_signal_scan(app: Application, manual: bool = False) -> int:
+async def run_signal_scan(app: Application, manual: bool = False, sport_override: str | None = None) -> int:
+    """
+    sport_override: forza lo scan su un solo sport ("tabletennis" per il job
+    ping pong), bypassando la finestra oraria 07-22 e il filtro sport_filter
+    dell'utente. Passato come parametro esplicito (non più come attributo
+    condiviso sulla funzione) per evitare race condition tra scan concorrenti
+    — es. uno scan tennis automatico che parte mentre uno scan ping pong è
+    ancora in corso rischiava di "ereditare" l'override sbagliato e girare
+    silenziosamente come ping pong invece che come tennis.
+    """
     ora = datetime.datetime.now(ROME).hour
-    sport_ov = getattr(run_signal_scan, "_sport_override", None)
+    sport_ov = sport_override
     # Scan automatico tennis: solo tra 07:00 e 22:00
     if not manual and not sport_ov and not (7 <= ora <= 21):
         logger.info(f"Scan tennis saltato (ora {ora}:xx fuori finestra 07-22)")
@@ -1055,10 +1064,6 @@ async def run_signal_scan(app: Application, manual: bool = False) -> int:
     else:
         matches = [m for m in matches if m.get("sport") == sport_filter]
         logger.info(f"Filtro sport '{sport_filter}': {len(matches)} partite rimaste")
-    # Reset override
-    if hasattr(run_signal_scan, "_sport_override"):
-        del run_signal_scan._sport_override
-
     # Se nessuna partita reale avvisa l'admin (solo in orario diurno 07-23 per non spammare)
     real_matches = [m for m in matches if m.get("source") not in ("fallback",)]
     quota_is_the_reason = not (scraper.tennis_quota_ok and scraper.pingpong_quota_ok)
@@ -1164,8 +1169,7 @@ async def run_pingpong_scan(app: Application):
 
     ok = False
     try:
-        run_signal_scan._sport_override = "tabletennis"
-        await run_signal_scan(app)
+        await run_signal_scan(app, sport_override="tabletennis")
         # OddsPapi non lancia eccezioni sui suoi errori (429/timeout): li logga
         # e basta, quindi "nessuna eccezione" non vuol dire "dati reali ottenuti".
         # Controlliamo esplicitamente lo stato quota per non segnare il giorno
