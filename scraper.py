@@ -10,7 +10,9 @@ Sorgenti:
   • Tennis    → The Odds API (gratuita, 500 crediti/mese)
                Endpoint: https://api.the-odds-api.com/v4
                Env var:  ODDS_API_KEY   (già presente nel tuo progetto)
-               Sport key: "tennis"
+               Sport key: scoperto dinamicamente da /sports/ (solo tornei
+               attivi, es. "tennis_wta_guadalajara_open") — nessuna chiave
+               aggregata "tennis"/"tennis_atp"/"tennis_wta" (non esiste)
 
 Variabili Railway da aggiungere:
   ODDSPAPI_KEY  = <la tua chiave da oddspapi.io>
@@ -346,13 +348,28 @@ class SignalScraper:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _fetch_odds_api_tennis(self) -> list[dict]:
-        """Recupera partite di tennis da The Odds API (sport key: 'tennis')."""
+        """Recupera partite di tennis da The Odds API.
+
+        RISPARMIO QUOTA: non esistono chiavi aggregate "tennis"/"tennis_atp"/
+        "tennis_wta" — The Odds API espone solo chiavi per singolo torneo
+        (es. "tennis_wta_guadalajara_open"), come conferma /sports/. Prima
+        interrogavamo 3 chiavi fisse a indovinare (spesso inesistenti, ma
+        comunque a pagamento se valide), bruciando fino a 6 crediti a scan
+        anche senza trovare nulla. Ora chiediamo prima /sports/ (gratis, non
+        consuma crediti) per sapere quali tornei di tennis sono REALMENTE
+        attivi in questo momento, e interroghiamo /odds/ solo per quelli.
+        Manteniamo markets=h2h,totals: vogliamo sia il vincente (h2h) sia
+        l'over (totals), quindi il costo resta 2 crediti per torneo attivo.
+        """
         matches = []
-        # "tennis" restituisce ATP + WTA + ITF aggregati
-        sports_to_try = ["tennis", "tennis_atp", "tennis_wta"]
 
         async with aiohttp.ClientSession() as session:
-            for sport_key in sports_to_try:
+            tennis_keys = await self._get_active_tennis_sport_keys(session)
+            if not tennis_keys:
+                logger.info("Odds tennis: nessun torneo attivo al momento — salto la chiamata /odds/")
+                return []
+
+            for sport_key in tennis_keys:
                 url = (
                     f"{ODDS_BASE}/sports/{sport_key}/odds/"
                     f"?apiKey={ODDS_KEY}"
@@ -380,8 +397,6 @@ class SignalScraper:
                                 parsed = self._parse_odds_api_tennis(ev)
                                 if parsed:
                                     matches.append(parsed)
-                            if matches:
-                                break   # bastano le partite del primo sport key valido
                         elif resp.status == 404:
                             logger.info(f"Sport key '{sport_key}' non trovato, provo il prossimo")
                         else:
