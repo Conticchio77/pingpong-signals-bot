@@ -57,6 +57,7 @@ class SignalScraper:
 
     def __init__(self, db=None):
         self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
+        self._tennis_oddspapi_id: int | None = None  # cache ID OddsPapi per tennis (fallback)
         self._odds_tennis_keys: list[str] | None = None  # cache sport_key torneo tennis attivi (The Odds API)
         self.db = db   # se presente, cache persistente su DB (evita 429 da troppe /sports)
         # Stato quota, aggiornato ad ogni chiamata reale alle API — usato da bot.py
@@ -82,15 +83,32 @@ class SignalScraper:
         elif want_pingpong:
             logger.warning("ODDSPAPI_KEY non impostata — ping pong saltato")
 
-        # 2. Tennis via The Odds API
+        # 2. Tennis via The Odds API (fonte primaria: 500 crediti/mese, h2h+totals)
+        tennis_matches = []
         if want_tennis and ODDS_KEY:
-            ten = await self._fetch_odds_api_tennis()
-            logger.info(f"The Odds API Tennis: {len(ten)} partite")
-            results.extend(ten)
-        elif want_tennis:
-            logger.warning("ODDS_API_KEY non impostata — tennis saltato")
+            tennis_matches = await self._fetch_odds_api_tennis()
+            logger.info(f"The Odds API Tennis: {len(tennis_matches)} partite")
 
-        # Fallback se entrambe le API sono assenti
+        # 2b. Fallback tennis via OddsPapi — riusa la stessa ODDSPAPI_KEY già
+        # attiva per il ping pong (nessuna nuova chiave da configurare). Si
+        # attiva SOLO quando The Odds API non ha restituito nulla di reale:
+        # o perché la quota (500 crediti/mese) è esaurita, o perché
+        # ODDS_API_KEY non è affatto configurata. Così la quota OddsPapi
+        # condivisa (250 richieste/mese) resta protetta per il ping pong e
+        # viene toccata dal tennis solo quando serve davvero.
+        if want_tennis and not tennis_matches and ODDSPAPI_KEY:
+            if not ODDS_KEY:
+                logger.info("ODDS_API_KEY non impostata — uso OddsPapi come fonte tennis primaria")
+            else:
+                logger.warning("The Odds API tennis a quota esaurita/non disponibile — provo fallback OddsPapi")
+            tennis_matches = await self._fetch_oddspapi_tennis()
+            logger.info(f"OddsPapi Tennis (fallback): {len(tennis_matches)} partite")
+        elif want_tennis and not tennis_matches and not ODDS_KEY:
+            logger.warning("Nessuna API tennis configurata (ODDS_API_KEY/ODDSPAPI_KEY) — tennis saltato")
+
+        results.extend(tennis_matches)
+
+        # Fallback demo se nessuna API ha restituito nulla
         if not results:
             logger.warning("Nessuna API configurata — uso fallback misto")
             results = self.get_fallback_matches()
@@ -319,6 +337,115 @@ class SignalScraper:
                         under_odds = price
 
         return odds_home, odds_away, over_odds, under_odds, totals_line
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── OddsPapi: Tennis (fallback quando The Odds API è a quota esaurita) ─────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _get_tennis_oddspapi_sport_id(self, session: aiohttp.ClientSession) -> int | None:
+        """Scopre l'ID OddsPapi per il tennis (distinto dal ping pong: 'tennis'
+        è contenuto in 'table tennis', quindi va escluso esplicitamente).
+        Cache in-memory + persistente su DB come per il ping pong."""
+        if self._tennis_oddspapi_id:
+            return self._tennis_oddspapi_id
+
+        if self.db is not None:
+            cached = self.db.get_setting("tennis_oddspapi_sport_id")
+            if cached:
+                self._tennis_oddspapi_id = int(cached)
+                logger.info(f"OddsPapi: tennis sportId={cached} (da cache DB)")
+                return self._tennis_oddspapi_id
+
+        try:
+            async with session.get(
+                f"{ODDSPAPI_BASE}/sports",
+                params={"apiKey": ODDSPAPI_KEY},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"OddsPapi /sports status {r.status} (ricerca tennis)")
+                    if r.status == 429:
+                        self.pingpong_quota_ok = False
+                    return None
+                sports = await r.json()
+                for s in sports:
+                    name = (s.get("name") or s.get("slug") or "").lower()
+                    if "tennis" in name and "table" not in name:
+                        self._tennis_oddspapi_id = s.get("sportId") or s.get("id")
+                        logger.info(f"OddsPapi: tennis sportId={self._tennis_oddspapi_id} ({s.get('name')})")
+                        if self.db is not None and self._tennis_oddspapi_id:
+                            self.db.set_setting("tennis_oddspapi_sport_id", str(self._tennis_oddspapi_id))
+                        return self._tennis_oddspapi_id
+                names = [s.get("name", "?") for s in sports]
+                logger.warning(f"OddsPapi: tennis non trovato. Sport disponibili: {names}")
+        except Exception as e:
+            logger.error(f"OddsPapi /sports errore (ricerca tennis): {e}")
+        return None
+
+    async def _fetch_oddspapi_tennis(self) -> list[dict]:
+        """Fallback tennis: stessa logica del ping pong via OddsPapi, ma
+        limitata a 3 fixture per scan (invece di 4) per lasciare più margine
+        alla quota condivisa 250/mese, dato che si attiva solo quando serve."""
+        matches = []
+        async with aiohttp.ClientSession() as session:
+            sport_id = await self._get_tennis_oddspapi_sport_id(session)
+            if sport_id is None:
+                logger.warning("OddsPapi: sport ID tennis non trovato — fallback tennis non disponibile")
+                return []
+
+            today    = _now_it().strftime("%Y-%m-%d")
+            tomorrow = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                async with session.get(
+                    f"{ODDSPAPI_BASE}/fixtures",
+                    params={
+                        "apiKey":  ODDSPAPI_KEY,
+                        "sportId": sport_id,
+                        "from":    today,
+                        "to":      tomorrow,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    rem = r.headers.get("X-RateLimit-Remaining", "?")
+                    logger.info(f"OddsPapi fixtures tennis — richieste rimaste: {rem}")
+                    if r.status != 200:
+                        txt = await r.text()
+                        logger.warning(f"OddsPapi fixtures tennis status {r.status}: {txt[:120]}")
+                        if r.status == 429:
+                            self.pingpong_quota_ok = False
+                        return []
+                    fixtures = await r.json()
+                    if isinstance(fixtures, dict):
+                        fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
+                    logger.info(f"OddsPapi tennis: {len(fixtures)} fixture ricevute")
+
+                    def _sort_key(f):
+                        s = f.get("startDate") or f.get("startTime") or ""
+                        try:
+                            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        except Exception:
+                            return datetime.max.replace(tzinfo=IT_TZ)
+
+                    fixtures = sorted(fixtures, key=_sort_key)[:3]  # max 3: risparmia quota condivisa
+                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture (fallback, risparmio quota)")
+            except Exception as e:
+                logger.error(f"OddsPapi fixtures tennis errore: {e}")
+                return []
+
+            for fix in fixtures:
+                parsed = await self._parse_oddspapi_fixture(session, fix)
+                if parsed:
+                    # _parse_oddspapi_fixture marca tutto come ping pong: qui
+                    # correggiamo sport/label/source per il tennis.
+                    parsed["sport"]       = "tennis"
+                    parsed["sport_label"] = "🎾 Tennis"
+                    if parsed.get("source") == "oddspapi":
+                        parsed["source"] = "oddspapi_tennis"
+                    elif parsed.get("source") == "oddspapi_noodds":
+                        parsed["source"] = "oddspapi_tennis_noodds"
+                    matches.append(parsed)
+
+        return matches
 
     def _extract_raw_bookmakers(self, data: dict, p1: str, p2: str) -> dict:
         """

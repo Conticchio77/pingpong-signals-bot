@@ -81,10 +81,12 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
 
     # Fonte dati
     src_map = {
-        "odds_api":        "📡 The Odds API",
-        "oddspapi":        "📡 OddsPapi",
-        "oddspapi_noodds": "📡 OddsPapi (fixture only)",
-        "fallback":        "⚠️ Quote stimate",
+        "odds_api":              "📡 The Odds API",
+        "oddspapi":              "📡 OddsPapi",
+        "oddspapi_noodds":       "📡 OddsPapi (fixture only)",
+        "oddspapi_tennis":       "📡 OddsPapi (fallback tennis)",
+        "oddspapi_tennis_noodds":"📡 OddsPapi (fallback tennis, fixture only)",
+        "fallback":              "⚠️ Quote stimate",
     }
     src = src_map.get(s.get("source", ""), "⚠️ Quote stimate")
 
