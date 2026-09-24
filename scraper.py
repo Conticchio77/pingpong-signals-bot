@@ -24,6 +24,7 @@ usato da bot.py per differenziare i segnali nella UI.
 
 import aiohttp
 import asyncio
+import json
 import logging
 import os
 import random
@@ -75,6 +76,7 @@ class SignalScraper:
         self._oddspapi_min_interval = 0.8  # secondi
         self._last_oddspapi_call    = 0.0
         self._oddspapi_lock         = asyncio.Lock()
+        self._oddspapi_schema_logged = False  # dump struttura /odds solo una volta
 
     async def _throttle_oddspapi(self):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere."""
@@ -301,11 +303,25 @@ class SignalScraper:
                             # vuoto? struttura diversa da quella attesa?). Ora logghiamo
                             # cosa è arrivato per capire la vera causa.
                             if odds_home is None:
-                                n_bm = len(data.get("bookmakerOdds") or {})
+                                bm_odds_dict = data.get("bookmakerOdds") or {}
+                                n_bm = len(bm_odds_dict)
+                                if not self._oddspapi_schema_logged and bm_odds_dict:
+                                    # Prende UN bookmaker a caso e ne mostra la struttura
+                                    # grezza (solo la prima volta, per non intasare i
+                                    # log): ci serve capire come sono fatti gli
+                                    # "outcomes" per correggere l'estrazione — finora
+                                    # abbiamo solo ipotizzato la forma e ci sbagliavamo.
+                                    first_slug = next(iter(bm_odds_dict))
+                                    sample = {first_slug: bm_odds_dict[first_slug]}
+                                    logger.warning(
+                                        f"OddsPapi /odds — struttura reale (fixtureId={fid}): "
+                                        f"chiavi top-level: {list(data.keys())} | "
+                                        f"campione 1 bookmaker: {json.dumps(sample)[:1500]}"
+                                    )
+                                    self._oddspapi_schema_logged = True
                                 logger.warning(
                                     f"OddsPapi /odds 200 ma nessuna quota estratta per "
-                                    f"{p1} vs {p2} (fixtureId={fid}): {n_bm} bookmaker nel "
-                                    f"payload, chiavi risposta: {list(data.keys())[:8]}"
+                                    f"{p1} vs {p2} (fixtureId={fid}): {n_bm} bookmaker"
                                 )
                         else:
                             body = await r.text()
