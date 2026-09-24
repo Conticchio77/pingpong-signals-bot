@@ -207,17 +207,17 @@ class SignalScraper:
                             return datetime.fromisoformat(s.replace("Z", "+00:00"))
                         except Exception:
                             return datetime.max.replace(tzinfo=IT_TZ)
-                    # Filtra solo partite entro le 19:00 di oggi (scan mattutino)
-                    # e prende le migliori 3 per kickoff
-                    today_19 = _now_it().replace(hour=22, minute=0, second=0, microsecond=0)
-                    fixtures_today = [
-                        f for f in fixtures
-                        if _sort_key(f) <= today_19
-                    ]
-                    # Se non ci sono partite entro le 19, prende comunque le prime 3 del giorno
-                    pool = fixtures_today if fixtures_today else fixtures
-                    fixtures = sorted(pool, key=_sort_key)[:4]  # max 4 per risparmiare quota OddsPapi
-                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture (evita rate limit)")
+                    # FIX: filtra SOLO partite future (kickoff >= adesso). Prima si
+                    # ordinavano le fixture dell'intera giornata (00:00-22:00) e si
+                    # prendevano le prime N per orario — ma il ping pong (Setka Cup,
+                    # Liga Pro, ecc.) gioca 24/7, quindi allo scan delle 07:00 le
+                    # "prime N" erano quasi sempre partite già giocate stanotte tra
+                    # mezzanotte e le 7. Risultato: nessun segnale ping pong è mai
+                    # stato generato. Ora prendiamo le prime N future, qualsiasi ora.
+                    now = _now_it()
+                    future_fixtures = [f for f in fixtures if _sort_key(f) >= now]
+                    fixtures = sorted(future_fixtures, key=_sort_key)[:4]  # max 4 per risparmiare quota OddsPapi
+                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture future (evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []
@@ -275,13 +275,15 @@ class SignalScraper:
                 except Exception as e:
                     logger.debug(f"OddsPapi odds errore fixture {fid}: {e}")
 
-            # Se non abbiamo le quote, stima ragionevole (non random puro)
-            if odds_home is None:
-                odds_home = round(random.uniform(1.60, 2.20), 2)
-                odds_away = round(random.uniform(1.60, 2.20), 2)
-                source    = "oddspapi_noodds"
-            else:
-                source = "oddspapi"
+            # FIX: prima qui si inventavano quote con random.uniform() quando
+            # OddsPapi non restituiva quote reali per la fixture — un "segnale"
+            # calcolato contro numeri casuali non è una partita vera, per quanto
+            # l'evento in sé lo fosse. Ora, senza quote reali, scartiamo la
+            # fixture: niente segnale è meglio di un segnale fasullo.
+            if odds_home is None or odds_away is None:
+                logger.info(f"OddsPapi: nessuna quota reale per {p1} vs {p2} — fixture scartata")
+                return None
+            source = "oddspapi"
 
             return {
                 "event_id":        str(fid),
@@ -426,8 +428,18 @@ class SignalScraper:
                         except Exception:
                             return datetime.max.replace(tzinfo=IT_TZ)
 
-                    fixtures = sorted(fixtures, key=_sort_key)[:3]  # max 3: risparmia quota condivisa
-                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture (fallback, risparmio quota)")
+                    # FIX: stesso bug del ping pong — filtra SOLO partite future
+                    # (kickoff >= adesso) prima di prendere le prime 3. Prima si
+                    # ordinava l'intera finestra "oggi→domani" e si prendevano le
+                    # più vicine per orario, che spesso erano già passate (es. un
+                    # torneo sudamericano con kickoff alle 02:00 IT, già finito
+                    # quando lo scan gira nel pomeriggio) — venivano scartate a
+                    # valle dall'analyzer (kickoff nel passato) sprecando la
+                    # richiesta e restituendo 0 segnali.
+                    now = _now_it()
+                    future_fixtures = [f for f in fixtures if _sort_key(f) >= now]
+                    fixtures = sorted(future_fixtures, key=_sort_key)[:3]  # max 3: risparmia quota condivisa
+                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture future (fallback, risparmio quota)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures tennis errore: {e}")
                 return []

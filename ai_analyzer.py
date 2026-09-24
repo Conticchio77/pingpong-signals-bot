@@ -66,6 +66,14 @@ class AIAnalyzer:
         raw_bm    = match.get("raw_bookmakers", {})   # da scraper arricchito
         has_sharp = bool(raw_bm)
 
+        # FIX: blocco esplicito, indipendente da qualunque altra logica a monte
+        # (in bot.py) — un match con source "fallback" (dati demo/random, usati
+        # solo se TUTTE le API sono giù) non deve MAI produrre un segnale reale.
+        source = match.get("source", "")
+        if source == "fallback":
+            logger.info(f"Match scartato (fonte demo, non una partita vera): {match.get('name','?')}")
+            return []
+
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
         min_value    = float(settings.get("min_value_pct", MIN_VALUE_PCT)) / 100
