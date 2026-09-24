@@ -23,6 +23,7 @@ usato da bot.py per differenziare i segnali nella UI.
 """
 
 import aiohttp
+import asyncio
 import logging
 import os
 import random
@@ -64,6 +65,25 @@ class SignalScraper:
         # per avvisare l'admin quando i segnali si fermano per quota esaurita.
         self.tennis_quota_ok   = True
         self.pingpong_quota_ok = True
+        # FIX: throttle tra chiamate OddsPapi. Nel log del 24/09 quasi TUTTE
+        # le fixture venivano scartate per "nessuna quota reale" — non perché
+        # mancassero davvero le quote, ma perché il bot sparava le richieste
+        # /fixtures + N x /odds una via l'altra senza pausa, e OddsPapi
+        # rispondeva 429 "rate limited" a quasi tutte (persino la seconda
+        # /fixtures nello stesso scan). Ora si aspetta un minimo tra due
+        # chiamate consecutive a OddsPapi, qualunque sia l'endpoint.
+        self._oddspapi_min_interval = 0.8  # secondi
+        self._last_oddspapi_call    = 0.0
+        self._oddspapi_lock         = asyncio.Lock()
+
+    async def _throttle_oddspapi(self):
+        """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere."""
+        async with self._oddspapi_lock:
+            now  = asyncio.get_event_loop().time()
+            wait = self._oddspapi_min_interval - (now - self._last_oddspapi_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_oddspapi_call = asyncio.get_event_loop().time()
 
     # ── Entry point principale ─────────────────────────────────────────────────
     async def fetch_matches(self, sport: str = "both") -> list[dict]:
@@ -135,6 +155,7 @@ class SignalScraper:
 
         # 2. Cache assente: interroga /sports (consuma 1 richiesta)
         try:
+            await self._throttle_oddspapi()
             async with session.get(
                 f"{ODDSPAPI_BASE}/sports",
                 params={"apiKey": ODDSPAPI_KEY},
@@ -174,6 +195,7 @@ class SignalScraper:
             today     = _now_it().strftime("%Y-%m-%d")
             tomorrow  = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
             try:
+                await self._throttle_oddspapi()
                 async with session.get(
                     f"{ODDSPAPI_BASE}/fixtures",
                     params={
@@ -257,6 +279,7 @@ class SignalScraper:
 
             if fid:
                 try:
+                    await self._throttle_oddspapi()
                     async with session.get(
                         f"{ODDSPAPI_BASE}/odds",
                         params={
@@ -359,6 +382,7 @@ class SignalScraper:
                 return self._tennis_oddspapi_id
 
         try:
+            await self._throttle_oddspapi()
             async with session.get(
                 f"{ODDSPAPI_BASE}/sports",
                 params={"apiKey": ODDSPAPI_KEY},
@@ -398,6 +422,7 @@ class SignalScraper:
             today    = _now_it().strftime("%Y-%m-%d")
             tomorrow = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
             try:
+                await self._throttle_oddspapi()
                 async with session.get(
                     f"{ODDSPAPI_BASE}/fixtures",
                     params={
@@ -802,6 +827,7 @@ class SignalScraper:
                         from_utc = (_now_it() - timedelta(hours=36)).astimezone(ZoneInfo("UTC")) \
                             .strftime("%Y-%m-%dT%H:%M:%SZ")
                         to_utc = _now_it().astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        await self._throttle_oddspapi()
                         async with session.get(
                             f"{ODDSPAPI_BASE}/fixtures",
                             params={
@@ -838,6 +864,7 @@ class SignalScraper:
                                     if not home or not away or not fid:
                                         continue
                                     try:
+                                        await self._throttle_oddspapi()
                                         async with session.get(
                                             f"{ODDSPAPI_BASE}/settlements",
                                             params={"apiKey": ODDSPAPI_KEY, "fixtureId": fid},

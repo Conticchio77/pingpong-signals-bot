@@ -281,9 +281,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alias /menu — riporta sempre al pannello principale."""
+    """Alias /menu — riporta sempre al pannello principale.
+    FIX: la tastiera persistente in basso (Scan/Segnali/Stats/Impostazioni/
+    Home) viene agganciata da Telegram SOLO quando un messaggio la include
+    esplicitamente in reply_markup — prima questo accadeva solo in /start,
+    quindi se la tastiera spariva dal client (es. Telegram Desktop dopo un
+    riavvio) l'unico modo per farla ricomparire era rifare /start. Ora anche
+    /menu la riattacca."""
     if update.effective_user.id != ADMIN_ID:
         return
+    await update.message.reply_text(
+        "🏓 Usa i tasti qui sotto per navigare:",
+        reply_markup=PERSISTENT_KB
+    )
     await update.message.reply_text(
         admin_panel_text(),
         parse_mode="Markdown",
@@ -1046,7 +1056,14 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                     f"Niente nuovi segnali reali finché non si resetta. Ti avviso appena torna disponibile."
                 )
             try:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
+                # FIX: riattacca la tastiera persistente anche qui — questi
+                # avvisi automatici arrivano senza che l'admin abbia toccato
+                # nulla, quindi sono un buon punto per tenerla "viva" nel
+                # client senza dover rifare /start.
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID, text=text, parse_mode="Markdown",
+                    reply_markup=PERSISTENT_KB,
+                )
             except Exception as e:
                 logger.error(f"Notifica quota {api_name} fallita: {e}")
 
@@ -1084,6 +1101,7 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                         "Il prossimo scan automatico riproverà tra poco."
                     ),
                     parse_mode="Markdown",
+                    reply_markup=PERSISTENT_KB,
                 )
         return 0
 
