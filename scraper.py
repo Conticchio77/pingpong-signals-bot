@@ -295,8 +295,26 @@ class SignalScraper:
                                 self._extract_oddspapi_odds(data, p1, p2)
                             # Salva quote per bookmaker per de-vig Pinnacle
                             raw_bookmakers = self._extract_raw_bookmakers(data, p1, p2)
+                            # FIX: prima qui non si logava nulla se lo status era 200
+                            # ma l'estrazione non trovava comunque quote — quindi ogni
+                            # "fixture scartata" era una scatola nera (rate limit? corpo
+                            # vuoto? struttura diversa da quella attesa?). Ora logghiamo
+                            # cosa è arrivato per capire la vera causa.
+                            if odds_home is None:
+                                n_bm = len(data.get("bookmakerOdds") or {})
+                                logger.warning(
+                                    f"OddsPapi /odds 200 ma nessuna quota estratta per "
+                                    f"{p1} vs {p2} (fixtureId={fid}): {n_bm} bookmaker nel "
+                                    f"payload, chiavi risposta: {list(data.keys())[:8]}"
+                                )
+                        else:
+                            body = await r.text()
+                            logger.warning(
+                                f"OddsPapi /odds status {r.status} per {p1} vs {p2} "
+                                f"(fixtureId={fid}): {body[:200]}"
+                            )
                 except Exception as e:
-                    logger.debug(f"OddsPapi odds errore fixture {fid}: {e}")
+                    logger.warning(f"OddsPapi /odds eccezione fixture {fid} ({p1} vs {p2}): {e}")
 
             # FIX: prima qui si inventavano quote con random.uniform() quando
             # OddsPapi non restituiva quote reali per la fixture — un "segnale"
