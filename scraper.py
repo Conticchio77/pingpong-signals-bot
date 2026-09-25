@@ -129,7 +129,12 @@ class SignalScraper:
         if cached:
             return cached
 
-        setting_key = f"oddspapi_winner_market_{sport_id}"
+        # FIX: chiave versionata "_v2" — la vecchia chiave senza suffisso può
+        # contenere valori sbagliati salvati dalle esecuzioni precedenti al fix
+        # del filtro sportId (es. marketId=10728 riusato per qualunque sport).
+        # Con un nome nuovo la cache riparte pulita invece di fidarsi di dati
+        # scritti da codice difettoso.
+        setting_key = f"oddspapi_winner_market_v2_{sport_id}"
         if self.db is not None:
             raw = self.db.get_setting(setting_key)
             if raw:
@@ -205,7 +210,7 @@ class SignalScraper:
         if cached:
             return cached
 
-        setting_key = f"oddspapi_totals_market_{sport_id}"
+        setting_key = f"oddspapi_totals_market_v2_{sport_id}"
         if self.db is not None:
             raw = self.db.get_setting(setting_key)
             if raw:
@@ -229,7 +234,20 @@ class SignalScraper:
             and (m.get("handicap") or 0) > 0   # >0: è una vera linea over/under
         ]
         if not candidates:
-            logger.warning(f"OddsPapi: nessun mercato totals (over/under) trovato per sportId={sport_id}")
+            # Diagnostica: mostra TUTTI i marketType/period presenti per questo
+            # sport, per capire se "totals" ha un nome diverso qui (es. "total",
+            # "over_under") o se il filtro handicap/marketLength è troppo stretto.
+            sport_markets = [m for m in markets if m.get("sportId") == sport_id]
+            sample = [
+                (m.get("marketId"), m.get("marketType"), m.get("marketLength"),
+                 m.get("handicap"), m.get("period"), m.get("marketName"))
+                for m in sport_markets
+            ][:20]
+            logger.warning(
+                f"OddsPapi: nessun mercato totals (over/under) trovato per "
+                f"sportId={sport_id} tra {len(sport_markets)} mercati di questo "
+                f"sport. Campione (marketId, type, length, handicap, period, name): {sample}"
+            )
             return None
 
         candidates.sort(key=lambda m: m.get("handicap") or 0)
