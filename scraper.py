@@ -228,7 +228,7 @@ class SignalScraper:
         candidates = [
             m for m in markets
             if m.get("sportId") == sport_id
-            and m.get("marketType") == "totals"
+            and str(m.get("marketType") or "").startswith("totals")  # "totals", "totals-points", "totals-sets", ecc.
             and m.get("marketLength") == 2
             and not m.get("playerProp")
             and (m.get("handicap") or 0) > 0   # >0: è una vera linea over/under
@@ -444,10 +444,21 @@ class SignalScraper:
                     # "prime N" erano quasi sempre partite già giocate stanotte tra
                     # mezzanotte e le 7. Risultato: nessun segnale ping pong è mai
                     # stato generato. Ora prendiamo le prime N future, qualsiasi ora.
+                    #
+                    # FIX 2: "future" da solo non basta — il ping pong gioca una
+                    # partita ogni 5 minuti H24, quindi le fixture "più vicine nel
+                    # tempo" hanno quasi sempre il kickoff tra pochi minuti.
+                    # L'analyzer scarta comunque tutto sotto min_hours_before (1h di
+                    # default), quindi prima si sprecava la chiamata /odds (quota!)
+                    # su partite che sarebbero state buttate via subito dopo. Ora
+                    # chiediamo fixture che partono tra almeno 75 minuti (1h + un
+                    # margine di sicurezza sul tempo che lo scan impiega) — così le
+                    # quote recuperate hanno davvero una chance di diventare un segnale.
                     now = _now_it()
-                    future_fixtures = [f for f in fixtures if _sort_key(f) >= now]
+                    min_start = now + timedelta(minutes=75)
+                    future_fixtures = [f for f in fixtures if _sort_key(f) >= min_start]
                     fixtures = sorted(future_fixtures, key=_sort_key)[:4]  # max 4 per risparmiare quota OddsPapi
-                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture future (evita rate limit)")
+                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture future (>75min, evita rate limit)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []
@@ -718,10 +729,15 @@ class SignalScraper:
                     # quando lo scan gira nel pomeriggio) — venivano scartate a
                     # valle dall'analyzer (kickoff nel passato) sprecando la
                     # richiesta e restituendo 0 segnali.
+                    #
+                    # FIX 2: stesso margine di sicurezza del ping pong — richiediamo
+                    # kickoff tra almeno 75 minuti, non semplicemente "nel futuro",
+                    # perché l'analyzer scarta comunque tutto sotto 1h (min_hours_before).
                     now = _now_it()
-                    future_fixtures = [f for f in fixtures if _sort_key(f) >= now]
+                    min_start = now + timedelta(minutes=75)
+                    future_fixtures = [f for f in fixtures if _sort_key(f) >= min_start]
                     fixtures = sorted(future_fixtures, key=_sort_key)[:3]  # max 3: risparmia quota condivisa
-                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture future (fallback, risparmio quota)")
+                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture future (>75min, fallback, risparmio quota)")
             except Exception as e:
                 logger.error(f"OddsPapi fixtures tennis errore: {e}")
                 return []
