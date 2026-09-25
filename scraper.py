@@ -76,7 +76,6 @@ class SignalScraper:
         self._oddspapi_min_interval = 0.8  # secondi
         self._last_oddspapi_call    = 0.0
         self._oddspapi_lock         = asyncio.Lock()
-        self._oddspapi_schema_logged = False  # dump struttura /odds solo una volta
 
     async def _throttle_oddspapi(self):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere."""
@@ -86,6 +85,97 @@ class SignalScraper:
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_oddspapi_call = asyncio.get_event_loop().time()
+
+    async def _get_winner_market(self, session: aiohttp.ClientSession, sport_id: int) -> dict | None:
+        """Scopre il mercato "vincente 2-way" (moneyline) REALE per questo sport.
+
+        FIX: prima il codice chiedeva sempre marketId=101 come se fosse un ID
+        fisso e universale. In realtà OddsPapi deriva marketId/outcomeId dallo
+        sportId (è il prefisso dell'ID stesso — vedi docs.oddspapi.io/concepts):
+        101 è il mercato vincente del calcio (sportId 10), NON del tennis
+        (sportId 12, mercato 121) né tantomeno del ping pong (sportId 25).
+        Chiedere sempre 101 per ogni sport spiega perché ogni fixture tornava
+        "0 bookmaker nel mercato giusto" pur avendone centinaia nel payload.
+        Ora lo scopriamo da /markets (chiamata unica, cache in-memory + DB)."""
+        cache_attr = f"_winner_market_{sport_id}"
+        cached = getattr(self, cache_attr, None)
+        if cached:
+            return cached
+
+        setting_key = f"oddspapi_winner_market_{sport_id}"
+        if self.db is not None:
+            raw = self.db.get_setting(setting_key)
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    setattr(self, cache_attr, parsed)
+                    return parsed
+                except Exception:
+                    pass
+
+        await self._throttle_oddspapi()
+        try:
+            async with session.get(
+                f"{ODDSPAPI_BASE}/markets",
+                params={"apiKey": ODDSPAPI_KEY, "sportId": sport_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"OddsPapi /markets status {r.status} (sportId={sport_id})")
+                    if r.status == 429:
+                        self.pingpong_quota_ok = False
+                    return None
+                markets = await r.json()
+        except Exception as e:
+            logger.error(f"OddsPapi /markets errore (sportId={sport_id}): {e}")
+            return None
+
+        candidates = [
+            m for m in markets
+            if m.get("marketType") == "moneyline"
+            and m.get("marketLength") == 2
+            and not m.get("playerProp")
+            and (m.get("handicap") or 0) == 0
+        ]
+        if not candidates:
+            sample = [(m.get("marketId"), m.get("marketType"), m.get("period")) for m in markets][:15]
+            logger.warning(
+                f"OddsPapi: nessun mercato moneyline 2-way trovato per sportId={sport_id}. "
+                f"Mercati disponibili (campione): {sample}"
+            )
+            return None
+
+        # Se più candidati (periodi diversi), preferisci la partita intera
+        preferred_periods = ("match", "fulltime", "result", "game", "regulation")
+        chosen = next(
+            (c for p in preferred_periods for c in candidates if c.get("period") == p),
+            candidates[0],
+        )
+        outcomes = chosen.get("outcomes") or []
+        if len(outcomes) != 2:
+            logger.warning(
+                f"OddsPapi: mercato moneyline sportId={sport_id} ha {len(outcomes)} "
+                f"outcome (attesi 2): {chosen}"
+            )
+            return None
+
+        result = {
+            "market_id":  chosen["marketId"],
+            "outcome_p1": outcomes[0]["outcomeId"],
+            "outcome_p2": outcomes[1]["outcomeId"],
+        }
+        logger.info(
+            f"OddsPapi: mercato vincente sportId={sport_id} → "
+            f"{chosen.get('marketName')} (marketId={result['market_id']}, "
+            f"outcomes={result['outcome_p1']}/{result['outcome_p2']})"
+        )
+        setattr(self, cache_attr, result)
+        if self.db is not None:
+            try:
+                self.db.set_setting(setting_key, json.dumps(result))
+            except Exception as e:
+                logger.debug(f"OddsPapi: impossibile cachare winner market su DB: {e}")
+        return result
 
     # ── Entry point principale ─────────────────────────────────────────────────
     async def fetch_matches(self, sport: str = "both") -> list[dict]:
@@ -193,6 +283,11 @@ class SignalScraper:
                 logger.warning("OddsPapi: sport ID ping pong non trovato — ping pong non disponibile")
                 return []
 
+            winner_market = await self._get_winner_market(session, sport_id)
+            if winner_market is None:
+                logger.warning("OddsPapi: mercato vincente ping pong non trovato — ping pong non disponibile")
+                return []
+
             # Fetch fixtures dei prossimi 2 giorni
             today     = _now_it().strftime("%Y-%m-%d")
             tomorrow  = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -248,14 +343,14 @@ class SignalScraper:
 
             # Per ogni fixture recupera le quote
             for fix in fixtures:
-                parsed = await self._parse_oddspapi_fixture(session, fix)
+                parsed = await self._parse_oddspapi_fixture(session, fix, winner_market)
                 if parsed:
                     matches.append(parsed)
 
         return matches
 
     async def _parse_oddspapi_fixture(
-        self, session: aiohttp.ClientSession, fix: dict
+        self, session: aiohttp.ClientSession, fix: dict, winner_market: dict
     ) -> dict | None:
         try:
             p1 = (fix.get("participant1Name") or fix.get("home") or "").strip()
@@ -287,41 +382,27 @@ class SignalScraper:
                         params={
                             "apiKey":    ODDSPAPI_KEY,
                             "fixtureId": fid,
-                            "marketId":  "101",   # 101 = Match Winner (moneyline)
+                            # FIX: marketId scoperto dinamicamente per questo sport
+                            # (vedi _get_winner_market) — non più "101" fisso, che
+                            # era il mercato vincente del calcio, non del tennis/
+                            # ping pong. OddsPapi deriva gli ID dallo sportId.
+                            "marketId":  str(winner_market["market_id"]),
                         },
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as r:
                         if r.status == 200:
                             data = await r.json()
                             odds_home, odds_away, over_odds, under_odds, totals_line = \
-                                self._extract_oddspapi_odds(data, p1, p2)
+                                self._extract_oddspapi_odds(data, winner_market)
                             # Salva quote per bookmaker per de-vig Pinnacle
-                            raw_bookmakers = self._extract_raw_bookmakers(data, p1, p2)
-                            # FIX: prima qui non si logava nulla se lo status era 200
-                            # ma l'estrazione non trovava comunque quote — quindi ogni
-                            # "fixture scartata" era una scatola nera (rate limit? corpo
-                            # vuoto? struttura diversa da quella attesa?). Ora logghiamo
-                            # cosa è arrivato per capire la vera causa.
+                            raw_bookmakers = self._extract_raw_bookmakers(data, winner_market)
                             if odds_home is None:
-                                bm_odds_dict = data.get("bookmakerOdds") or {}
-                                n_bm = len(bm_odds_dict)
-                                if not self._oddspapi_schema_logged and bm_odds_dict:
-                                    # Prende UN bookmaker a caso e ne mostra la struttura
-                                    # grezza (solo la prima volta, per non intasare i
-                                    # log): ci serve capire come sono fatti gli
-                                    # "outcomes" per correggere l'estrazione — finora
-                                    # abbiamo solo ipotizzato la forma e ci sbagliavamo.
-                                    first_slug = next(iter(bm_odds_dict))
-                                    sample = {first_slug: bm_odds_dict[first_slug]}
-                                    logger.warning(
-                                        f"OddsPapi /odds — struttura reale (fixtureId={fid}): "
-                                        f"chiavi top-level: {list(data.keys())} | "
-                                        f"campione 1 bookmaker: {json.dumps(sample)[:1500]}"
-                                    )
-                                    self._oddspapi_schema_logged = True
-                                logger.warning(
-                                    f"OddsPapi /odds 200 ma nessuna quota estratta per "
-                                    f"{p1} vs {p2} (fixtureId={fid}): {n_bm} bookmaker"
+                                n_bm = len(data.get("bookmakerOdds") or {})
+                                logger.info(
+                                    f"OddsPapi: nessun bookmaker ha quotato il mercato "
+                                    f"vincente per {p1} vs {p2} (fixtureId={fid}, "
+                                    f"{n_bm} bookmaker nel payload ma nessuno su "
+                                    f"marketId={winner_market['market_id']})"
                                 )
                         else:
                             body = await r.text()
@@ -365,35 +446,48 @@ class SignalScraper:
             return None
 
     def _extract_oddspapi_odds(
-        self, data: dict, p1: str, p2: str
+        self, data: dict, winner_market: dict
     ) -> tuple:
-        """Estrae le migliori quote dal response OddsPapi."""
+        """Estrae le migliori quote dal response OddsPapi.
+
+        FIX: la struttura reale (vedi docs.oddspapi.io) NON è la lista piatta
+        {"bookmakerOdds": {slug: {"outcomes": [{"name":.., "price":..}]}}} che
+        si ipotizzava — è annidata per bookmaker → "markets" (keyed
+        dall'ID scoperto in _get_winner_market) → "outcomes" (keyed per
+        outcome_p1/outcome_p2) → "players" → "0" → "price". Niente "name" nel
+        singolo outcome: l'associazione a p1/p2 è data dall'ID outcome, non dal
+        nome del giocatore (che qui è quasi sempre null).
+        Nota: per ora non estraiamo over/under (richiederebbe scoprire anche
+        il mercato "totals" per sport, non ancora implementato).
+        """
         odds_home = odds_away = over_odds = under_odds = None
         totals_line = 3.5
 
-        # Struttura: {"bookmakerOdds": {"bookmakerSlug": {"outcomes": [...]}}}
+        mkt_id = str(winner_market["market_id"])
+        oc_p1  = str(winner_market["outcome_p1"])
+        oc_p2  = str(winner_market["outcome_p2"])
+
         bm_odds = data.get("bookmakerOdds") or {}
         for bm_slug, bm_data in bm_odds.items():
-            outcomes = bm_data.get("outcomes") or []
-            for o in outcomes:
-                name  = (o.get("name") or o.get("participant") or "").lower()
-                price = float(o.get("price") or o.get("odds") or 0)
-                if not price:
-                    continue
-                if p1.lower() in name or name in p1.lower():
-                    if odds_home is None or price > odds_home:
-                        odds_home = price
-                elif p2.lower() in name or name in p2.lower():
-                    if odds_away is None or price > odds_away:
-                        odds_away = price
-                elif "over" in name:
-                    if over_odds is None or price > over_odds:
-                        over_odds = price
-                        pt = float(o.get("point") or o.get("line") or 3.5)
-                        totals_line = pt
-                elif "under" in name:
-                    if under_odds is None or price > under_odds:
-                        under_odds = price
+            market = (bm_data.get("markets") or {}).get(mkt_id)
+            if not market:
+                continue
+            outcomes = market.get("outcomes") or {}
+
+            def _price(oc_id):
+                try:
+                    return float(
+                        outcomes.get(oc_id, {}).get("players", {}).get("0", {}).get("price")
+                    )
+                except (TypeError, ValueError):
+                    return None
+
+            price1 = _price(oc_p1)
+            price2 = _price(oc_p2)
+            if price1 and (odds_home is None or price1 > odds_home):
+                odds_home = price1
+            if price2 and (odds_away is None or price2 > odds_away):
+                odds_away = price2
 
         return odds_home, odds_away, over_odds, under_odds, totals_line
 
@@ -453,6 +547,11 @@ class SignalScraper:
                 logger.warning("OddsPapi: sport ID tennis non trovato — fallback tennis non disponibile")
                 return []
 
+            winner_market = await self._get_winner_market(session, sport_id)
+            if winner_market is None:
+                logger.warning("OddsPapi: mercato vincente tennis non trovato — fallback tennis non disponibile")
+                return []
+
             today    = _now_it().strftime("%Y-%m-%d")
             tomorrow = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
             try:
@@ -504,7 +603,7 @@ class SignalScraper:
                 return []
 
             for fix in fixtures:
-                parsed = await self._parse_oddspapi_fixture(session, fix)
+                parsed = await self._parse_oddspapi_fixture(session, fix, winner_market)
                 if parsed:
                     # _parse_oddspapi_fixture marca tutto come ping pong: qui
                     # correggiamo sport/label/source per il tennis.
@@ -518,28 +617,31 @@ class SignalScraper:
 
         return matches
 
-    def _extract_raw_bookmakers(self, data: dict, p1: str, p2: str) -> dict:
+    def _extract_raw_bookmakers(self, data: dict, winner_market: dict) -> dict:
         """
         Estrae quote per ogni bookmaker nel formato:
         {"pinnacle": {"home": 1.85, "away": 2.10}, "bet365": {...}, ...}
         Usato dall'analyzer per il de-vig Pinnacle.
+        FIX: stessa struttura reale annidata di _extract_oddspapi_odds.
         """
         raw = {}
+        mkt_id = str(winner_market["market_id"])
+        oc_p1  = str(winner_market["outcome_p1"])
+        oc_p2  = str(winner_market["outcome_p2"])
+
         bm_odds = data.get("bookmakerOdds") or {}
         for slug, bm_data in bm_odds.items():
-            outcomes = bm_data.get("outcomes") or []
-            entry = {}
-            for o in outcomes:
-                name  = (o.get("name") or o.get("participant") or "").lower()
-                price = float(o.get("price") or o.get("odds") or 0)
-                if not price:
-                    continue
-                if p1.lower() in name or name in p1.lower():
-                    entry["home"] = price
-                elif p2.lower() in name or name in p2.lower():
-                    entry["away"] = price
-            if "home" in entry and "away" in entry:
-                raw[slug.lower()] = entry
+            market = (bm_data.get("markets") or {}).get(mkt_id)
+            if not market:
+                continue
+            outcomes = market.get("outcomes") or {}
+            try:
+                price1 = float(outcomes.get(oc_p1, {}).get("players", {}).get("0", {}).get("price"))
+                price2 = float(outcomes.get(oc_p2, {}).get("players", {}).get("0", {}).get("price"))
+            except (TypeError, ValueError):
+                continue
+            if price1 and price2:
+                raw[slug.lower()] = {"home": price1, "away": price2}
         return raw
 
 
