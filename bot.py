@@ -543,6 +543,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
             InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
         ])
+        kb.append([InlineKeyboardButton("🚫 Annulla (sospesa)", callback_data=f"result_{sig_id}_void")])
         kb.append([InlineKeyboardButton("🔙 Lista", callback_data="admin_list")])
         await query.edit_message_text(signal_text(s), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -577,17 +578,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Lista", callback_data="admin_list")]])
         )
 
-    # ── Risultato vinto/perso ────────────────────────────────────────────────────
+    # ── Risultato vinto/perso/annullato ─────────────────────────────────────────
     elif data.startswith("result_"):
         parts  = data.split("_")
         sig_id, result = int(parts[1]), parts[2]
         sig = db.get_signal(sig_id)
         db.update_signal_status(sig_id, result, result)
-        # Registra nel bilancio
-        if sig:
+        # Annullata (partita sospesa/rinviata): niente bilancio, non conta come
+        # vinta né persa — result="void" è già escluso da get_stats() perché
+        # lì si contano solo result IN ('won','lost').
+        if sig and result != "void":
             db.record_balance_entry(sig, result)
-        emoji  = "✅" if result == "won" else "❌"
-        label  = "VINTO! 🎉" if result == "won" else "Perso."
+
+        if result == "void":
+            emoji, label = "🚫", "Annullata (partita sospesa)"
+        else:
+            emoji  = "✅" if result == "won" else "❌"
+            label  = "VINTO! 🎉" if result == "won" else "Perso."
         kb = [
             [InlineKeyboardButton("📋 Torna alla lista", callback_data="admin_list")],
             [InlineKeyboardButton("🔙 Home",             callback_data="admin_home")],
@@ -595,7 +602,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{emoji} *{label}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
         )
-        if sig:
+        if sig and result != "void":
             sport_label = sig.get("sport_label", "🏓")
             bal = db.get_balance_stats()
             bal_str = f"€{bal['current_balance']:+.0f}" if bal["total_bets"] > 0 else "n/d"
@@ -996,8 +1003,42 @@ async def post_init(app: Application):
             next_run_time=now + datetime.timedelta(seconds=20),
         )
 
+    # ── Reset automatico intervallo scan a inizio mese ───────────────────────
+    # Quando The Odds API va a quota esaurita si abbassa la frequenza dello
+    # scan tennis per allungare la vita della quota OddsPapi condivisa col
+    # ping pong. Il 1° del mese si resetta anche The Odds API — questo job
+    # riporta da solo scan_interval al valore "normale" quel giorno, senza
+    # doverselo ricordare a mano ogni volta.
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: _monthly_reset_scan_interval(app)),
+        trigger=CronTrigger(day=1, hour=0, minute=5, timezone=ROME),
+        id="monthly_reset_scan_interval",
+    )
+
     _scheduler.start()
     logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 60min")
+
+# Valore a cui torna scan_interval il 1° di ogni mese (vedi _monthly_reset_scan_interval)
+NORMAL_SCAN_INTERVAL_HOURS = 3
+
+async def _monthly_reset_scan_interval(app: Application):
+    current = db.get_settings()["scan_interval"]
+    if current == NORMAL_SCAN_INTERVAL_HOURS:
+        return
+    db.set_setting("scan_interval", NORMAL_SCAN_INTERVAL_HOURS)
+    _restart_scheduler(app, NORMAL_SCAN_INTERVAL_HOURS)
+    try:
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🔄 *Inizio mese*: scan tennis riportato a ogni "
+                f"*{NORMAL_SCAN_INTERVAL_HOURS}h* (era {current}h) — "
+                f"quota The Odds API e OddsPapi ripartite da zero."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Notifica reset mensile fallita: {e}")
 
 # ── Core scan ────────────────────────────────────────────────────────────────────
 async def run_signal_scan(app: Application, manual: bool = False, sport_override: str | None = None) -> int:
@@ -1130,6 +1171,8 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                 ],[
                     InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
                     InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
+                ],[
+                    InlineKeyboardButton("🚫 Annulla (sospesa)", callback_data=f"result_{sig_id}_void"),
                 ]]
                 await app.bot.send_message(
                     chat_id=ADMIN_ID,

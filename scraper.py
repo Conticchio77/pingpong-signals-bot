@@ -472,7 +472,8 @@ class SignalScraper:
         return matches
 
     async def _parse_oddspapi_fixture(
-        self, session: aiohttp.ClientSession, fix: dict, winner_market: dict, totals_market: dict | None = None
+        self, session: aiohttp.ClientSession, fix: dict, winner_market: dict,
+        totals_market: dict | None = None, default_sport_label: str = "Ping Pong",
     ) -> dict | None:
         try:
             p1 = (fix.get("participant1Name") or fix.get("home") or "").strip()
@@ -483,13 +484,19 @@ class SignalScraper:
             fid      = fix.get("fixtureId") or fix.get("id", "")
             start    = fix.get("startDate") or fix.get("startTime") or ""
             kickoff  = _iso_to_it(start) if start else _now_it().strftime("%d/%m %H:%M")
-            tourn    = (
-                fix.get("tournamentName")
-                or fix.get("league")
-                or fix.get("tournament", {}).get("name", "Ping Pong")
-                if isinstance(fix.get("tournament"), dict)
-                else fix.get("tournament", "Ping Pong")
-            )
+            tourn = fix.get("tournamentName")
+            if not tourn and isinstance(fix.get("tournament"), dict):
+                # FIX: era scritto come "A or B or C if isinstance(...) else D" — in
+                # Python il ternario ha PRECEDENZA PIÙ BASSA di "or", quindi l'intera
+                # espressione "A or B or C" veniva valutata solo SE fix["tournament"]
+                # era un dict. Ma il campo reale di OddsPapi è "tournamentName" piatto
+                # (non annidato in "tournament"), quindi quella condizione era sempre
+                # falsa e si finiva dritti nell'else col default "Ping Pong" fisso —
+                # anche per le partite di tennis. Ora leggiamo "tournamentName" per
+                # primo, sempre, col fallback annidato/label solo come extra sicurezza.
+                tourn = fix.get("tournament", {}).get("name")
+            if not tourn:
+                tourn = fix.get("league") or default_sport_label
 
             # Recupera quote
             odds_home, odds_away, over_odds, under_odds, totals_line = \
@@ -743,7 +750,9 @@ class SignalScraper:
                 return []
 
             for fix in fixtures:
-                parsed = await self._parse_oddspapi_fixture(session, fix, winner_market, totals_market)
+                parsed = await self._parse_oddspapi_fixture(
+                    session, fix, winner_market, totals_market, default_sport_label="Tennis"
+                )
                 if parsed:
                     # _parse_oddspapi_fixture marca tutto come ping pong: qui
                     # correggiamo sport/label/source per il tennis.
