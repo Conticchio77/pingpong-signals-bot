@@ -401,6 +401,7 @@ async def send_settings(fn):
 
     kb = [
         [InlineKeyboardButton(f"⏱ Scan tennis: ogni {s['scan_interval']}h", callback_data="pick_interval")],
+        [InlineKeyboardButton(f"🏓 Scan ping pong: ogni {s['pingpong_scan_interval']}h", callback_data="pick_interval_pp")],
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
         [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
@@ -411,14 +412,17 @@ async def send_settings(fn):
         [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
-    # Stima consumo crediti The Odds API
-    interval   = s["scan_interval"]
-    scan_day   = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
-    credits_mo = scan_day * 2 * 31  # ~2 crediti per scan
+    # Stima consumo crediti The Odds API + richieste OddsPapi (quota condivisa)
+    interval    = s["scan_interval"]
+    pp_interval = s["pingpong_scan_interval"]
+    scan_day    = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
+    credits_mo  = scan_day * 2 * 31  # ~2 crediti per scan
+    pp_scan_day = 15 // pp_interval + 1
+    pp_calls_mo = pp_scan_day * 5 * 31
     await fn(
         "⚙️ *Impostazioni*\n\n"
         f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n"
-        f"🏓 _OddsPapi ping pong: ~{4*31} req/mese su 250 disponibili_\n\n"
+        f"🏓 _OddsPapi ping pong: ~{pp_calls_mo} req/mese su 250 disponibili (quota condivisa col fallback tennis)_\n\n"
         "Tocca un'opzione per modificarla:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
@@ -496,7 +500,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Se noti giorni interi senza segnali tennis, prova ad abbassarlo.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏓 *Ping pong*: scan fisso alle 07:00, max 4 fixture fino alle 22:00.\n"
+            "🏓 *Ping pong*: scan configurabile come il tennis (07:00-22:00), max 4 fixture per scan.\n"
             "Controllo risultati 2 volte/giorno, solo sui giocatori con segnali aperti (max 6 fixture a controllo).\n"
             "Budget OddsPapi: ~150-200 req/mese su 250 disponibili (stima).\n"
             "The Odds API si resetta il 1° del mese. OddsPapi si resetta dalla data di attivazione della chiave (non necessariamente il 1°) — controlla su oddspapi.io/us/account."
@@ -746,10 +750,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif data.startswith("set_interval_"):
+    elif data.startswith("set_interval_") and not data.startswith("set_interval_pp_"):
         nxt = int(data.split("_")[-1])
         db.set_setting("scan_interval", nxt)
         _restart_scheduler(context.application, nxt)
+        await send_settings(query.edit_message_text)
+
+    # ── Scegli frequenza scan ping pong (stesso meccanismo del tennis) ────────────
+    elif data == "pick_interval_pp":
+        current = db.get_settings()["pingpong_scan_interval"]
+        opts = [24, 12, 8, 6, 4, 3]
+        kb = []
+        for o in opts:
+            scans_day  = 15 // o + 1  # +1: include sempre le 07:00 (07-22 inclusivo)
+            calls_mo   = scans_day * 5 * 31  # ~5 chiamate OddsPapi per scan (1 fixtures + 4 odds)
+            prefix = "✅ " if o == current else ""
+            warn = " ⚠️" if calls_mo > 200 else ""
+            label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo 07:00) — ~{calls_mo} req/mese"
+            kb.append([InlineKeyboardButton(label, callback_data=f"set_interval_pp_{o}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "🏓 *Frequenza scan ping pong*\n\n"
+            "Scan attivi solo tra 07:00 e 22:00 (come il tennis).\n"
+            "Quota condivisa con il fallback tennis: OddsPapi 250 richieste/mese gratuite.\n"
+            "⚠️ = rischio di esaurire la quota prima di fine mese.\n"
+            f"Attuale: ogni {current}h",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_interval_pp_"):
+        nxt = int(data.split("_")[-1])
+        db.set_setting("pingpong_scan_interval", nxt)
+        _restart_pingpong_scheduler(context.application, nxt)
         await send_settings(query.edit_message_text)
 
     # ── Scegli confidenza (picker visuale con descrizioni) ────────────────────────
@@ -933,30 +966,63 @@ def _schedule_coro(coro_factory):
 def _restart_scheduler(app: Application, hours: int):
     global _scheduler
     if _scheduler:
-        next_run = datetime.datetime.now(ROME) + datetime.timedelta(hours=hours)
+        from apscheduler.triggers.cron import CronTrigger
         _scheduler.add_job(
             lambda: _schedule_coro(lambda: run_signal_scan(app)),
-            trigger=IntervalTrigger(hours=hours, timezone=ROME),
+            trigger=CronTrigger(hour=_daytime_hours(hours), minute=0, timezone=ROME),
             id="signal_scan",
             replace_existing=True,
-            next_run_time=next_run,
         )
-        logger.info(f"⏰ Scheduler aggiornato: ogni {hours}h | prossimo scan: {next_run.strftime('%H:%M')}")
+        logger.info(f"⏰ Scheduler tennis aggiornato: 07-22h ogni {hours}h ({_daytime_hours(hours)})")
+
+def _restart_pingpong_scheduler(app: Application, hours: int):
+    global _scheduler
+    if _scheduler:
+        from apscheduler.triggers.cron import CronTrigger
+        _scheduler.add_job(
+            lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+            trigger=CronTrigger(hour=_daytime_hours(hours), minute=0, timezone=ROME),
+            id="pingpong_scan",
+            replace_existing=True,
+        )
+        logger.info(f"⏰ Scheduler ping pong aggiornato: 07-22h ogni {hours}h ({_daytime_hours(hours)})")
+
+def _daytime_hours(interval: int, start: int = 7, end: int = 22) -> str:
+    """Genera la lista di ore (per CronTrigger) da "start" a "end" distanziate
+    di "interval" ore — es. interval=3 → "7,10,13,16,19,22". Usata sia per il
+    tennis che per il ping pong: entrambi partono alle 07:00 e non superano le
+    22:00, ognuno col proprio intervallo impostato dal pannello."""
+    if interval <= 0:
+        interval = 24
+    hours = []
+    h = start
+    while h <= end:
+        hours.append(h)
+        h += interval
+    return ",".join(str(x) for x in hours)
+
 
 async def post_init(app: Application):
     global _scheduler, _main_loop
-    hours      = db.get_settings()["scan_interval"]
+    settings   = db.get_settings()
+    hours      = settings["scan_interval"]
+    pp_hours   = settings["pingpong_scan_interval"]
     now        = datetime.datetime.now(ROME)
     _main_loop = asyncio.get_running_loop()   # loop principale, usato dai job per agganciarsi correttamente
 
     _scheduler = AsyncIOScheduler(timezone=ROME)
+    from apscheduler.triggers.cron import CronTrigger
 
-    # Scan segnali: parte subito (next_run_time=now) poi ripete ogni X ore
+    # Scan tennis: parte alle 07:00 e ripete ogni "hours" ore fino alle 22:00
+    # (FIX: prima era un IntervalTrigger che partiva subito al boot e girava
+    # ogni N ore da quel momento, non ancorato alle 07:00 — la funzione dello
+    # scan si limitava a fare un no-op silenzioso se chiamata fuori 07-22,
+    # sprecando comunque il trigger. Ora è un CronTrigger con orari fissi,
+    # quindi parte sempre puntuale alle 07:00 e non spreca invocazioni a vuoto.)
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_signal_scan(app)),
-        trigger=IntervalTrigger(hours=hours, timezone=ROME),
+        trigger=CronTrigger(hour=_daytime_hours(hours), minute=0, timezone=ROME),
         id="signal_scan",
-        next_run_time=now + datetime.timedelta(seconds=5),  # 5 sec dopo boot
     )
 
     # Auto-risultati tennis: ogni 60 minuti (ridotto da 30 — insieme al filtro
@@ -972,36 +1038,47 @@ async def post_init(app: Application):
     # Auto-risultati ping pong: solo 2 volte al giorno (OddsPapi, 250
     # richieste/mese — un controllo ogni 30 min esaurirebbe la quota in
     # pochi giorni e bloccherebbe anche la ricerca di nuove partite)
-    from apscheduler.triggers.cron import CronTrigger
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_auto_results(app, sport="tabletennis")),
         trigger=CronTrigger(hour="14,22", minute=0, timezone=ROME),
         id="auto_results_pingpong",
     )
 
-    # Scan ping pong: ogni giorno alle 07:00 (CronTrigger, affidabile)
+    # Scan ping pong: stesso schema del tennis — 07:00 → 22:00, ogni "pp_hours"
+    # ore, configurabile dal pannello come per il tennis (era fisso solo 07:00).
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-        trigger=CronTrigger(hour=7, minute=0, timezone=ROME),
+        trigger=CronTrigger(hour=_daytime_hours(pp_hours), minute=0, timezone=ROME),
         id="pingpong_scan",
     )
 
-    # ── Recupero scan ping pong al boot ──────────────────────────────────────
+    # ── Recupero scan al boot ─────────────────────────────────────────────────
     # Se il bot riparte dopo le 07:00 (es. dopo un redeploy da GitHub) e lo
-    # scan ping pong di oggi non è ancora partito, il CronTrigger sopra
-    # aspetterebbe fino a domani alle 07:00. Qui lo recuperiamo subito.
+    # scan di oggi non è ancora partito, il CronTrigger aspetterebbe il
+    # prossimo orario utile in lista. Qui recuperiamo subito il primo scan
+    # mancato della giornata, per entrambi gli sport.
     today_str = now.strftime("%Y-%m-%d")
-    last_pp_row = db.conn.execute(
-        "SELECT value FROM settings WHERE key='last_pingpong_scan_date'"
-    ).fetchone()
-    last_pp = last_pp_row["value"] if last_pp_row else ""
-    if now.hour >= 7 and last_pp != today_str:
-        logger.info(f"🏓 Scan ping pong di oggi ({today_str}) non ancora eseguito — recupero al boot")
-        _scheduler.add_job(
-            lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-            id="pingpong_scan_catchup",
-            next_run_time=now + datetime.timedelta(seconds=20),
-        )
+    if now.hour >= 7:
+        last_pp_row = db.conn.execute(
+            "SELECT value FROM settings WHERE key='last_pingpong_scan_date'"
+        ).fetchone()
+        if (last_pp_row["value"] if last_pp_row else "") != today_str:
+            logger.info(f"🏓 Scan ping pong di oggi ({today_str}) non ancora eseguito — recupero al boot")
+            _scheduler.add_job(
+                lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+                id="pingpong_scan_catchup",
+                next_run_time=now + datetime.timedelta(seconds=20),
+            )
+        last_t_row = db.conn.execute(
+            "SELECT value FROM settings WHERE key='last_tennis_scan_date'"
+        ).fetchone()
+        if (last_t_row["value"] if last_t_row else "") != today_str:
+            logger.info(f"🎾 Scan tennis di oggi ({today_str}) non ancora eseguito — recupero al boot")
+            _scheduler.add_job(
+                lambda: _schedule_coro(lambda: run_signal_scan(app)),
+                id="signal_scan_catchup",
+                next_run_time=now + datetime.timedelta(seconds=35),
+            )
 
     # ── Reset automatico intervallo scan a inizio mese ───────────────────────
     # Quando The Odds API va a quota esaurita si abbassa la frequenza dello
@@ -1016,7 +1093,10 @@ async def post_init(app: Application):
     )
 
     _scheduler.start()
-    logger.info(f"⏰ Scheduler avviato — scan tennis ogni {hours}h | ping pong alle 07:00 | risultati ogni 60min")
+    logger.info(
+        f"⏰ Scheduler avviato — scan tennis 07-22h ogni {hours}h | "
+        f"ping pong 07-22h ogni {pp_hours}h | risultati ogni 60min"
+    )
 
 # Valore a cui torna scan_interval il 1° di ogni mese (vedi _monthly_reset_scan_interval)
 NORMAL_SCAN_INTERVAL_HOURS = 3
@@ -1059,6 +1139,8 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
         return 0
     logger.info("🔍 Avvio scan tennis..." if not sport_ov else "🏓 Avvio scan ping pong...")
     db.set_setting("last_scan", now_it_str())
+    if not sport_ov:
+        db.set_setting("last_tennis_scan_date", datetime.datetime.now(ROME).strftime("%Y-%m-%d"))
 
     # Settings e filtro sport PRIMA della fetch: evita di interrogare OddsPapi
     # (ping pong) quando serve solo il tennis, e viceversa — prima veniva

@@ -89,6 +89,7 @@ class Database:
             "min_hours_before": "1.0",   # ore minime al kickoff
             "max_edge_no_sharp":"20.0",  # cap edge% senza Pinnacle
             "min_value_pct":    "3.0",   # % minimo di edge per generare un segnale (era fisso al 5.0)
+            "pingpong_scan_interval": "24",  # ore tra uno scan ping pong e il successivo (24 = solo alle 07:00, come prima)
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -238,6 +239,7 @@ class Database:
             "min_hours_before": float(raw.get("min_hours_before", 1.0)),
             "max_edge_no_sharp":float(raw.get("max_edge_no_sharp", 20.0)),
             "min_value_pct":    float(raw.get("min_value_pct", 3.0)),
+            "pingpong_scan_interval": int(raw.get("pingpong_scan_interval", 24)),
         }
 
     def get_setting(self, key: str, default=None):
