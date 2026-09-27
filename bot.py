@@ -418,7 +418,7 @@ async def send_settings(fn):
     scan_day    = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
     credits_mo  = scan_day * 2 * 31  # ~2 crediti per scan
     pp_scan_day = 15 // pp_interval + 1
-    pp_calls_mo = pp_scan_day * 5 * 31
+    pp_calls_mo = pp_scan_day * 4 * 31
     await fn(
         "⚙️ *Impostazioni*\n\n"
         f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n"
@@ -500,7 +500,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Se noti giorni interi senza segnali tennis, prova ad abbassarlo.\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏓 *Ping pong*: scan configurabile come il tennis (07:00-22:00), max 4 fixture per scan.\n"
+            "🏓 *Ping pong*: scan configurabile come il tennis (07:00-22:00), 3 fixture per scan distribuite nel tempo (non le più vicine, per coprire più ore).\n"
             "Controllo risultati 2 volte/giorno, solo sui giocatori con segnali aperti (max 6 fixture a controllo).\n"
             "Budget OddsPapi: ~150-200 req/mese su 250 disponibili (stima).\n"
             "The Odds API si resetta il 1° del mese. OddsPapi si resetta dalla data di attivazione della chiave (non necessariamente il 1°) — controlla su oddspapi.io/us/account."
@@ -763,9 +763,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = []
         for o in opts:
             scans_day  = 15 // o + 1  # +1: include sempre le 07:00 (07-22 inclusivo)
-            calls_mo   = scans_day * 5 * 31  # ~5 chiamate OddsPapi per scan (1 fixtures + 4 odds)
+            calls_mo   = scans_day * 4 * 31  # ~4 chiamate OddsPapi per scan (1 fixtures + 3 odds, distribuite sulla giornata)
             prefix = "✅ " if o == current else ""
-            warn = " ⚠️" if calls_mo > 200 else ""
+            warn = " ⚠️" if calls_mo > 240 else ""
             label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo 07:00) — ~{calls_mo} req/mese"
             kb.append([InlineKeyboardButton(label, callback_data=f"set_interval_pp_{o}")])
         kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])

@@ -53,6 +53,48 @@ def _iso_to_it(iso: str) -> str:
     except Exception:
         return _now_it().strftime("%d/%m %H:%M")
 
+def _spread_pick_fixtures(fixtures: list, sort_key, n: int, window_start: datetime, window_end: datetime) -> list:
+    """Sceglie fino a n fixture DISTRIBUITE nel tempo tra window_start e
+    window_end, invece delle n più vicine nel tempo.
+
+    FIX: prima si prendevano semplicemente le prime N fixture per orario —
+    con un solo scan al giorno (ping pong 24/7) questo significava vedere
+    solo una fetta di ~30 minuti della giornata (es. le partite delle 08:15
+    quando lo scan gira alle 07:00) e ignorare completamente pomeriggio,
+    sera e notte, anche se ci sono centinaia di altre partite disponibili.
+    Dividendo la finestra in n fette uguali e prendendo una fixture per
+    fetta, lo stesso numero di chiamate /odds copre l'intero arco di tempo
+    fino al prossimo scan, invece che un unico istante.
+    """
+    in_window = sorted(
+        [f for f in fixtures if window_start <= sort_key(f) <= window_end], key=sort_key
+    )
+    if not in_window:
+        # Nessuna fixture nella finestra target (raro): ripiega sulle più
+        # vicine future, meglio di niente.
+        return sorted([f for f in fixtures if sort_key(f) >= window_start], key=sort_key)[:n]
+    if len(in_window) <= n:
+        return in_window
+
+    span   = (window_end - window_start) / n
+    picked = []
+    used   = set()
+    for i in range(n):
+        slice_start = window_start + span * i
+        slice_end   = window_start + span * (i + 1)
+        candidate = next(
+            (f for f in in_window if slice_start <= sort_key(f) < slice_end and id(f) not in used),
+            None,
+        )
+        if candidate is None:
+            # Fetta vuota (nessuna partita in quell'intervallo): prende la
+            # prima fixture disponibile non ancora scelta, per non sprecare lo slot.
+            candidate = next((f for f in in_window if id(f) not in used), None)
+        if candidate is not None:
+            picked.append(candidate)
+            used.add(id(candidate))
+    return picked
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 class SignalScraper:
@@ -454,11 +496,25 @@ class SignalScraper:
                     # chiediamo fixture che partono tra almeno 75 minuti (1h + un
                     # margine di sicurezza sul tempo che lo scan impiega) — così le
                     # quote recuperate hanno davvero una chance di diventare un segnale.
+                    #
+                    # FIX 3: invece delle 3 più vicine (tutte ammassate in mezz'ora),
+                    # le distribuiamo lungo tutta la finestra fino al prossimo scan
+                    # (pingpong_scan_interval ore) — copertura sull'intera giornata
+                    # invece che su un'unica fetta oraria, a parità di richieste.
                     now = _now_it()
                     min_start = now + timedelta(minutes=75)
-                    future_fixtures = [f for f in fixtures if _sort_key(f) >= min_start]
-                    fixtures = sorted(future_fixtures, key=_sort_key)[:4]  # max 4 per risparmiare quota OddsPapi
-                    logger.info(f"OddsPapi: limitate a {len(fixtures)} fixture future (>75min, evita rate limit)")
+                    pp_interval_h = 24
+                    if self.db is not None:
+                        try:
+                            pp_interval_h = self.db.get_settings().get("pingpong_scan_interval", 24)
+                        except Exception:
+                            pass
+                    window_end = now + timedelta(hours=pp_interval_h)
+                    fixtures = _spread_pick_fixtures(fixtures, _sort_key, 3, min_start, window_end)
+                    logger.info(
+                        f"OddsPapi: {len(fixtures)} fixture distribuite tra "
+                        f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} (evita rate limit)"
+                    )
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []
@@ -740,11 +796,23 @@ class SignalScraper:
                     # FIX 2: stesso margine di sicurezza del ping pong — richiediamo
                     # kickoff tra almeno 75 minuti, non semplicemente "nel futuro",
                     # perché l'analyzer scarta comunque tutto sotto 1h (min_hours_before).
+                    #
+                    # FIX 3: stessa distribuzione oraria del ping pong, invece delle
+                    # 3 più vicine ammassate insieme.
                     now = _now_it()
                     min_start = now + timedelta(minutes=75)
-                    future_fixtures = [f for f in fixtures if _sort_key(f) >= min_start]
-                    fixtures = sorted(future_fixtures, key=_sort_key)[:3]  # max 3: risparmia quota condivisa
-                    logger.info(f"OddsPapi tennis: limitate a {len(fixtures)} fixture future (>75min, fallback, risparmio quota)")
+                    tennis_interval_h = 3
+                    if self.db is not None:
+                        try:
+                            tennis_interval_h = self.db.get_settings().get("scan_interval", 3)
+                        except Exception:
+                            pass
+                    window_end = now + timedelta(hours=tennis_interval_h)
+                    fixtures = _spread_pick_fixtures(fixtures, _sort_key, 3, min_start, window_end)
+                    logger.info(
+                        f"OddsPapi tennis: {len(fixtures)} fixture distribuite tra "
+                        f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} (fallback, risparmio quota)"
+                    )
             except Exception as e:
                 logger.error(f"OddsPapi fixtures tennis errore: {e}")
                 return []
