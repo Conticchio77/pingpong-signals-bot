@@ -21,6 +21,7 @@ import hashlib
 import logging
 import math
 import random
+import statistics
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -48,6 +49,7 @@ MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
 MIN_HOURS_BEFORE     = 1.0    # default ore minime al kickoff
 MAX_EDGE_NO_SHARP    = 20.0   # default cap edge% senza Pinnacle
+MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senza sharp)
 
 
 class AIAnalyzer:
@@ -63,8 +65,7 @@ class AIAnalyzer:
     # ── Core ───────────────────────────────────────────────────────────────────
     def _analyze(self, match: dict, sport: str, settings: dict) -> list[dict]:
         signals   = []
-        raw_bm    = match.get("raw_bookmakers", {})   # da scraper arricchito
-        has_sharp = bool(raw_bm)
+        raw_bm    = match.get("raw_bookmakers") or {}   # da scraper arricchito
 
         # FIX: blocco esplicito, indipendente da qualunque altra logica a monte
         # (in bot.py) — un match con source "fallback" (dati demo/random, usati
@@ -107,155 +108,188 @@ class AIAnalyzer:
                 logger.warning(f"Impossibile parsare kickoff '{kickoff_str}': {e}")
 
         # ── Stima probabilità reale ──────────────────────────────────────────
-        if has_sharp:
-            fair_home, fair_away = self._devi_power(raw_bm, match)
-        else:
-            # Fallback: de-vig semplice sulle quote mediate già disponibili
-            oh = match.get("odds_home")
-            oa = match.get("odds_away")
-            if not oh or not oa:
-                return []
-            fair_home, fair_away = self._devi_simple(oh, oa)
+        # Riferimento: 1) book sharp (de-vig power); 2) altrimenti CONSENSO =
+        # mediana delle probabilità dei book, ognuno de-viggato per conto suo.
+        # Il vecchio fallback (de-vig sulle quote MIGLIORI) confrontava la quota
+        # migliore con se stessa: value ≤ 0 salvo arbitraggio, quindi non usciva
+        # mai un segnale.
+        fair_home, fair_away, ref_kind, n_ref = self._reference_probs(raw_bm)
+        if fair_home is None:
+            logger.info(
+                f"Nessun riferimento affidabile ({n_ref} book con quote, servono "
+                f"{MIN_REF_BOOKS} o uno sharp): {match.get('name','?')} — winner saltato"
+            )
+            ref_kind = None
+        has_sharp = ref_kind == "sharp"
+        source    = match.get("source", "")
 
-        if fair_home is None or fair_away is None:
-            return []
+        def _edge_ok(value: float, label: str) -> bool:
+            # Senza sharp un edge sopra il tetto è quasi sempre una quota
+            # vecchia/anomala di un singolo book: meglio scartarlo che mostrarlo
+            # "tagliato" al tetto come se fosse un segnale buono.
+            if not has_sharp and value > max_edge_cap:
+                logger.info(
+                    f"Edge {value:.1%} sopra il tetto {max_edge_cap:.0%} senza sharp "
+                    f"(quota sospetta): {match.get('name','?')} — {label}"
+                )
+                return False
+            return True
 
         p1 = match["player1"]
         p2 = match["player2"]
 
         # ── Winner ──────────────────────────────────────────────────────────
-        # Cerca la quota migliore nei soft book (o usa odds_home/away)
-        best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"))
-        best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"))
+        if ref_kind:
+            best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"))
+            best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"))
 
-        if best_h and MIN_ODDS <= best_h <= MAX_ODDS:
-            value_h = fair_home * best_h - 1
-            if not has_sharp:
-                value_h = min(value_h, max_edge_cap)
-            if value_h >= min_value:
-                conf = self._confidence(value_h, has_sharp, match.get("source",""))
+            for player, fair, best, book in (
+                (p1, fair_home, best_h, best_h_book),
+                (p2, fair_away, best_a, best_a_book),
+            ):
+                if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                    continue
+                value = fair * best - 1
+                if value < min_value or not _edge_ok(value, f"{player} vince"):
+                    continue
                 signals.append(self._build(
                     match     = match,
                     sig_type  = "winner",
-                    pick      = f"{p1} vince",
-                    odds      = best_h,
-                    fair_prob = fair_home,
-                    value_pct = round(value_h * 100, 2),
-                    confidence= conf,
-                    reasoning = self._reasoning_winner(p1, fair_home, best_h, best_h_book, has_sharp),
-                    book_note = f"Quota trovata su: {best_h_book or 'media mercato'}",
-                ))
-
-        if best_a and MIN_ODDS <= best_a <= MAX_ODDS:
-            value_a = fair_away * best_a - 1
-            if not has_sharp:
-                value_a = min(value_a, max_edge_cap)
-            if value_a >= min_value:
-                conf = self._confidence(value_a, has_sharp, match.get("source",""))
-                signals.append(self._build(
-                    match     = match,
-                    sig_type  = "winner",
-                    pick      = f"{p2} vince",
-                    odds      = best_a,
-                    fair_prob = fair_away,
-                    value_pct = round(value_a * 100, 2),
-                    confidence= conf,
-                    reasoning = self._reasoning_winner(p2, fair_away, best_a, best_a_book, has_sharp),
-                    book_note = f"Quota trovata su: {best_a_book or 'media mercato'}",
+                    pick      = f"{player} vince",
+                    odds      = best,
+                    fair_prob = fair,
+                    value_pct = round(value * 100, 2),
+                    confidence= self._confidence(value, ref_kind, source),
+                    reasoning = self._reasoning_winner(player, fair, best, book, ref_kind, n_ref),
+                    book_note = f"Quota trovata su: {book or 'media mercato'}",
                 ))
 
         # ── Over/Under ───────────────────────────────────────────────────────
-        ov   = match.get("over_odds")
-        un   = match.get("under_odds")
-        line = match.get("totals_line")
-        if ov and un and line and MIN_ODDS <= ov <= MAX_ODDS and MIN_ODDS <= un <= MAX_ODDS:
-            fair_ov, fair_un = self._devi_simple(ov, un)
-            if fair_ov and fair_un:
-                value_ov = fair_ov * ov - 1
-                value_un = fair_un * un - 1
-                if not has_sharp:
-                    value_ov = min(value_ov, max_edge_cap)
-                    value_un = min(value_un, max_edge_cap)
-
-                unit = "set" if sport == "tabletennis" else "games"
-
-                if value_ov >= min_value:
-                    conf = self._confidence(value_ov, has_sharp, match.get("source",""))
+        # Servono le quote PER BOOK sulla stessa linea (raw_totals). Prima si
+        # prendevano over e under migliori tra tutti i book, anche su linee
+        # diverse, e li si de-viggava insieme: falsi positivi.
+        tot = self._totals_reference(match.get("raw_totals") or {})
+        if tot:
+            unit = "set" if sport == "tabletennis" else "games"
+            line = tot["line"]
+            cand = []
+            for side, fair, best, book in (
+                ("over",  tot["fair_over"],  tot["best_over"],  tot["over_book"]),
+                ("under", tot["fair_under"], tot["best_under"], tot["under_book"]),
+            ):
+                if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                    continue
+                value = fair * best - 1
+                if value >= min_value:
+                    cand.append((value, side, fair, best, book))
+            if cand:
+                value, side, fair, best, book = max(cand)
+                tot_sharp = tot["kind"] == "sharp"
+                if tot_sharp or value <= max_edge_cap:
+                    method = "book sharp" if tot_sharp else f"consenso di {tot['n_books']} book (mediana)"
                     signals.append(self._build(
                         match     = match,
-                        sig_type  = "over",
-                        pick      = f"Over {line} {unit}",
-                        odds      = ov,
-                        fair_prob = fair_ov,
-                        value_pct = round(value_ov * 100, 2),
-                        confidence= conf,
+                        sig_type  = side,
+                        pick      = f"{side.capitalize()} {line} {unit}",
+                        odds      = best,
+                        fair_prob = fair,
+                        value_pct = round(value * 100, 2),
+                        confidence= self._confidence(value, tot["kind"], source),
                         reasoning = (
-                            f"De-vig Over {line} {unit}: probabilità fair {fair_ov:.1%} "
-                            f"vs quota {ov} (value +{value_ov*100:.1f}%)"
+                            f"{side.capitalize()} {line} {unit}: probabilità fair {fair:.1%} "
+                            f"({method}) vs quota {best} (value +{value*100:.1f}%)"
                         ),
-                        book_note = f"Linea: {line} {unit}",
+                        book_note = f"Linea: {line} {unit} | quota su: {book}",
                     ))
-
-                elif value_un >= min_value:
-                    conf = self._confidence(value_un, has_sharp, match.get("source",""))
-                    signals.append(self._build(
-                        match     = match,
-                        sig_type  = "under",
-                        pick      = f"Under {line} {unit}",
-                        odds      = un,
-                        fair_prob = fair_un,
-                        value_pct = round(value_un * 100, 2),
-                        confidence= conf,
-                        reasoning = (
-                            f"De-vig Under {line} {unit}: probabilità fair {fair_un:.1%} "
-                            f"vs quota {un} (value +{value_un*100:.1f}%)"
-                        ),
-                        book_note = f"Linea: {line} {unit}",
-                    ))
+                else:
+                    logger.info(
+                        f"Edge {value:.1%} sopra il tetto {max_edge_cap:.0%} senza sharp "
+                        f"(quota sospetta): {match.get('name','?')} — {side} {line}"
+                    )
 
         # Ordina per value decrescente, max 2 segnali per partita
         signals.sort(key=lambda x: x["value_pct"], reverse=True)
         return signals[:2]
 
+    # ── Riferimento di probabilità ─────────────────────────────────────────────
+    @staticmethod
+    def _is_sharp(book_name: str) -> bool:
+        name = (book_name or "").lower()
+        return any(s in name for s in SHARP_BOOKS)
+
+    @staticmethod
+    def _valid_pair(a, b) -> bool:
+        return (
+            isinstance(a, (int, float)) and isinstance(b, (int, float))
+            and a > 1.01 and b > 1.01
+        )
+
+    def _power_fair(self, oa: float, ob: float) -> tuple:
+        """Probabilità fair di un mercato a 2 esiti con power de-vig."""
+        pa, pb = 1 / oa, 1 / ob
+        k = self._solve_power_k(pa, pb)
+        fa = pa ** k / (pa ** k + pb ** k)
+        return fa, 1 - fa
+
+    def _reference_probs(self, raw_bm: dict) -> tuple:
+        """(fair_home, fair_away, kind, n_book). kind: 'sharp' | 'consensus' | None."""
+        for book, odds in raw_bm.items():
+            if self._is_sharp(book):
+                h, a = odds.get("home"), odds.get("away")
+                if self._valid_pair(h, a):
+                    logger.info(f"Sharp book trovato: {book} → {h}/{a}")
+                    fh, fa = self._power_fair(float(h), float(a))
+                    return round(fh, 4), round(fa, 4), "sharp", 1
+        fairs = [
+            self._power_fair(float(o["home"]), float(o["away"]))[0]
+            for o in raw_bm.values()
+            if self._valid_pair(o.get("home"), o.get("away"))
+        ]
+        if len(fairs) >= MIN_REF_BOOKS:
+            fh = statistics.median(fairs)
+            return round(fh, 4), round(1 - fh, 4), "consensus", len(fairs)
+        return None, None, None, len(fairs)
+
+    def _totals_reference(self, raw_totals: dict) -> dict | None:
+        """raw_totals = {linea: {book: {"over": x, "under": y}}}. Sceglie la linea
+        quotata da più book su entrambi i lati e ne ricava la probabilità fair."""
+        best_line, entries = None, {}
+        for line, books in raw_totals.items():
+            valid = {b: o for b, o in books.items() if self._valid_pair(o.get("over"), o.get("under"))}
+            if len(valid) > len(entries) or (
+                valid and len(valid) == len(entries) and best_line is not None and line < best_line
+            ):
+                best_line, entries = line, valid
+        if not entries:
+            return None
+
+        sharp = [b for b in entries if self._is_sharp(b)]
+        if sharp:
+            o = entries[sharp[0]]
+            fair_ov, fair_un = self._power_fair(float(o["over"]), float(o["under"]))
+            kind, playable = "sharp", {b: v for b, v in entries.items() if b not in sharp}
+        elif len(entries) >= MIN_REF_BOOKS:
+            fair_ov = statistics.median(
+                self._power_fair(float(o["over"]), float(o["under"]))[0] for o in entries.values()
+            )
+            fair_un = 1 - fair_ov
+            kind, playable = "consensus", entries
+        else:
+            logger.info(f"Over/Under: linea {best_line} con solo {len(entries)} book (servono {MIN_REF_BOOKS} o uno sharp) — saltato")
+            return None
+        if not playable:
+            return None
+
+        over_book  = max(playable, key=lambda b: playable[b]["over"])
+        under_book = max(playable, key=lambda b: playable[b]["under"])
+        return {
+            "line": best_line, "kind": kind, "n_books": len(entries),
+            "fair_over": round(fair_ov, 4), "fair_under": round(fair_un, 4),
+            "best_over": round(float(playable[over_book]["over"]), 3), "over_book": over_book,
+            "best_under": round(float(playable[under_book]["under"]), 3), "under_book": under_book,
+        }
+
     # ── De-vig Power (metodo professionale) ───────────────────────────────────
-    def _devi_power(self, raw_bm: dict, match: dict) -> tuple:
-        """
-        Power De-vig su Pinnacle.
-        Trova k tale che p1^k + p2^k = 1 (rimuove il margine non linearmente).
-        Molto più accurato del de-vig additivo semplice.
-        """
-        # Cerca sharp book in ordine di priorità
-        sharp_odds = None
-        for book_name, odds in raw_bm.items():
-            if any(s in book_name.lower() for s in SHARP_BOOKS):
-                h = odds.get("home") or odds.get(match.get("player1",""), {})
-                a = odds.get("away") or odds.get(match.get("player2",""), {})
-                if h and a and h > 1.01 and a > 1.01:
-                    sharp_odds = (float(h), float(a))
-                    logger.info(f"Sharp book trovato: {book_name} → {h}/{a}")
-                    break
-
-        if not sharp_odds:
-            # Nessun sharp book → de-vig semplice sulle quote migliori disponibili
-            oh = match.get("odds_home")
-            oa = match.get("odds_away")
-            if oh and oa:
-                return self._devi_simple(oh, oa)
-            return None, None
-
-        oh, oa = sharp_odds
-        p_raw_h = 1 / oh
-        p_raw_a = 1 / oa
-
-        # Risolvi k con Newton-Raphson: p_h^k + p_a^k = 1
-        k = self._solve_power_k(p_raw_h, p_raw_a)
-
-        fair_h = p_raw_h ** k / (p_raw_h ** k + p_raw_a ** k)
-        fair_a = 1 - fair_h
-
-        logger.debug(f"Power de-vig k={k:.4f}: fair_h={fair_h:.4f} fair_a={fair_a:.4f}")
-        return round(fair_h, 4), round(fair_a, 4)
-
     def _solve_power_k(self, p1: float, p2: float, iterations: int = 20) -> float:
         """Newton-Raphson per trovare k in p1^k + p2^k = 1."""
         k = 1.0
@@ -310,24 +344,25 @@ class AIAnalyzer:
         return (round(best_price, 3), best_book) if best_price else (fallback, None)
 
     # ── Confidenza ────────────────────────────────────────────────────────────
-    def _confidence(self, value: float, has_sharp: bool, source: str) -> int:
+    def _confidence(self, value: float, ref_kind: str, source: str) -> int:
         """
         Confidenza basata su:
         - Entità del value edge
-        - Se abbiamo usato Pinnacle (più affidabile) o de-vig semplice
+        - Riferimento usato: book sharp (più affidabile) o consenso dei book
         - Fonte dati (API reale vs fallback)
 
-        NOTA: senza sharp book il de-vig semplice non è affidabile →
-        confidenza cappata a 65 e penalità più alta.
+        Consenso (mediana di ≥3 book) = riferimento più debole di uno sharp:
+        penalità -6 e tetto 70, quindi serve un edge un po' più alto (~5.5%+
+        con min_confidence 55) rispetto ai segnali con sharp (3%).
         """
         # Base: da 50% (edge=2.5%) a 82% (edge=15%+)
         base = 50 + int(min(value * 200, 32))
 
-        if has_sharp:
-            base += 8   # dati Pinnacle reali → bonus affidabilità
+        if ref_kind == "sharp":
+            base += 8   # dati sharp reali → bonus affidabilità
         else:
-            base -= 12  # de-vig semplice → penalità forte
-            base = min(base, 65)  # mai sopra 65% senza sharp book
+            base -= 6
+            base = min(base, 70)
 
         # Penalità per fonte meno affidabile
         if source == "fallback":
@@ -363,11 +398,14 @@ class AIAnalyzer:
     # ── Reasoning leggibile ───────────────────────────────────────────────────
     def _reasoning_winner(
         self, player: str, fair_prob: float,
-        best_odd: float, book: str, has_sharp: bool
+        best_odd: float, book: str, ref_kind: str, n_ref: int = 0
     ) -> str:
-        method = "de-vig Pinnacle" if has_sharp else "de-vig mercato"
+        if ref_kind == "sharp":
+            method, note = "de-vig book sharp", ""
+        else:
+            method = f"consenso di {n_ref} book (mediana)"
+            note = " ⚠️ Nessuno sharp book — riferimento = consenso."
         fair_odd = round(1 / fair_prob, 2) if fair_prob > 0 else "?"
-        note = "" if has_sharp else " ⚠️ Nessun sharp book — edge stimato."
         return (
             f"Probabilità fair ({method}): {fair_prob:.1%} → quota fair {fair_odd}. "
             f"Quota disponibile: {best_odd} ({book or 'media'}) — "

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import random
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,27 @@ def _iso_to_it(iso: str) -> str:
         return dt.strftime("%d/%m %H:%M")
     except Exception:
         return _now_it().strftime("%d/%m %H:%M")
+
+def _pingpong_fixtures_per_scan(pp_interval_h: int) -> int:
+    """Quante fixture controllare per scan ping pong, in base a quanti scan
+    girano al giorno (stessa formula "scans_day" usata nel picker di bot.py:
+    15 // interval + 1, finestra attiva 07-22 inclusiva).
+
+    FIX: prima era un 3 fisso qualunque fosse l'intervallo. Con 1 scan/giorno
+    (default 24h) va benissimo (3 fixture/scan ≈ 124 richieste/mese). Ma se
+    l'utente passa a 2 scan/giorno (12h, per dividere la copertura mattina/
+    sera) 3 fixture/scan porta a 248 richieste/mese — quota OddsPapi (250)
+    praticamente esaurita, senza margine per il fallback tennis che la
+    condivide. Con 2 scan/giorno scendiamo a 2 fixture/scan (186 req/mese,
+    margine sano) — e nel complesso si controllano comunque più partite al
+    giorno (4) rispetto all'unico scan da 3."""
+    scans_day = 15 // max(pp_interval_h, 1) + 1
+    if scans_day <= 1:
+        return 3
+    if scans_day == 2:
+        return 2
+    return 1  # 3+ scan/giorno: tetto più stretto per restare in quota
+
 
 def _spread_pick_fixtures(fixtures: list, sort_key, n: int, window_start: datetime, window_end: datetime) -> list:
     """Sceglie fino a n fixture DISTRIBUITE nel tempo tra window_start e
@@ -97,12 +119,51 @@ def _spread_pick_fixtures(fixtures: list, sort_key, n: int, window_start: dateti
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Ogni quanto rileggere i tornei tennis attivi da The Odds API /sports/ (gratis)
+TENNIS_KEYS_TTL_S = 3 * 3600
+# Fallback tennis su OddsPapi (250 richieste/mese, condivise col ping pong): ogni
+# uso costa ~4 richieste, quindi al massimo N volte al giorno.
+TENNIS_FALLBACK_MAX_PER_DAY = 1
+
+# Risultati: non ha senso pagare /scores prima che la partita possa essere finita,
+# né dopo che l'API non copre più quel giorno (daysFrom=1 → ~24h; ping pong 36h).
+RESULT_GRACE_MIN  = {"tennis": 90, "tabletennis": 30}
+RESULT_MAX_AGE_H  = {"tennis": 30, "tabletennis": 40}
+
+def result_due(sig: dict) -> bool:
+    """True se vale la pena cercare il risultato di questo segnale adesso."""
+    sport  = sig.get("sport", "tennis")
+    ko_str = (sig.get("kickoff") or "").strip()
+    if not ko_str:
+        return True
+    now = _now_it()
+    try:
+        try:
+            ko = datetime.fromisoformat(ko_str)
+            if ko.tzinfo is None:
+                ko = ko.replace(tzinfo=IT_TZ)
+        except ValueError:
+            ko = datetime.strptime(f"{now.year}/{ko_str}", "%Y/%d/%m %H:%M").replace(tzinfo=IT_TZ)
+            if ko - now > timedelta(days=180):    # es. 31/12 letto a gennaio
+                ko = ko.replace(year=ko.year - 1)
+    except Exception:
+        return True
+    age = now - ko
+    return (
+        timedelta(minutes=RESULT_GRACE_MIN.get(sport, 90))
+        <= age
+        <= timedelta(hours=RESULT_MAX_AGE_H.get(sport, 30))
+    )
+
 class SignalScraper:
 
     def __init__(self, db=None):
         self._tt_sport_id: int | None = None   # cache ID OddsPapi per ping pong
         self._tennis_oddspapi_id: int | None = None  # cache ID OddsPapi per tennis (fallback)
         self._odds_tennis_keys: list[str] | None = None  # cache sport_key torneo tennis attivi (The Odds API)
+        self._odds_tennis_keys_ts: float = 0.0           # quando è stata riempita (time.monotonic)
+        self._fb_date: str = ""                          # fallback OddsPapi tennis: giorno e contatore
+        self._fb_count: int = 0
         self.db = db   # se presente, cache persistente su DB (evita 429 da troppe /sports)
         # Stato quota, aggiornato ad ogni chiamata reale alle API — usato da bot.py
         # per avvisare l'admin quando i segnali si fermano per quota esaurita.
@@ -330,6 +391,33 @@ class SignalScraper:
         return result
 
     # ── Entry point principale ─────────────────────────────────────────────────
+    def _tennis_fallback_allowed(self) -> bool:
+        today = _now_it().strftime("%Y-%m-%d")
+        date, count = self._fb_date, self._fb_count
+        if self.db is not None:
+            try:
+                date  = self.db.get_setting("oddspapi_tennis_fb_date", "") or ""
+                count = int(self.db.get_setting("oddspapi_tennis_fb_count", "0") or 0)
+            except Exception:
+                pass
+        if date != today:
+            count = 0
+        return count < TENNIS_FALLBACK_MAX_PER_DAY
+
+    def _tennis_fallback_register(self):
+        today = _now_it().strftime("%Y-%m-%d")
+        if self._fb_date != today:
+            self._fb_date, self._fb_count = today, 0
+        self._fb_count += 1
+        if self.db is not None:
+            try:
+                prev = int(self.db.get_setting("oddspapi_tennis_fb_count", "0") or 0) \
+                    if self.db.get_setting("oddspapi_tennis_fb_date", "") == today else 0
+                self.db.set_setting("oddspapi_tennis_fb_date", today)
+                self.db.set_setting("oddspapi_tennis_fb_count", prev + 1)
+            except Exception:
+                pass
+
     async def fetch_matches(self, sport: str = "both") -> list[dict]:
         """Restituisce partite. sport: "both" | "tennis" | "tabletennis" —
         limita le chiamate API al solo sport richiesto, per non consumare
@@ -360,11 +448,17 @@ class SignalScraper:
         # ODDS_API_KEY non è affatto configurata. Così la quota OddsPapi
         # condivisa (250 richieste/mese) resta protetta per il ping pong e
         # viene toccata dal tennis solo quando serve davvero.
-        if want_tennis and not tennis_matches and ODDSPAPI_KEY:
+        if want_tennis and not tennis_matches and ODDSPAPI_KEY and not self._tennis_fallback_allowed():
+            logger.info(
+                f"Tennis: nessuna partita da The Odds API; fallback OddsPapi già usato oggi "
+                f"(tetto {TENNIS_FALLBACK_MAX_PER_DAY}/giorno, quota condivisa col ping pong) — salto"
+            )
+        elif want_tennis and not tennis_matches and ODDSPAPI_KEY:
+            self._tennis_fallback_register()
             if not ODDS_KEY:
                 logger.info("ODDS_API_KEY non impostata — uso OddsPapi come fonte tennis primaria")
             else:
-                logger.warning("The Odds API tennis a quota esaurita/non disponibile — provo fallback OddsPapi")
+                logger.warning("The Odds API tennis: nessuna partita (quota esaurita, nessun torneo attivo o lista tornei vecchia) — provo fallback OddsPapi")
             tennis_matches = await self._fetch_oddspapi_tennis()
             logger.info(f"OddsPapi Tennis (fallback): {len(tennis_matches)} partite")
         elif want_tennis and not tennis_matches and not ODDS_KEY:
@@ -510,10 +604,12 @@ class SignalScraper:
                         except Exception:
                             pass
                     window_end = now + timedelta(hours=pp_interval_h)
-                    fixtures = _spread_pick_fixtures(fixtures, _sort_key, 3, min_start, window_end)
+                    n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
+                    fixtures = _spread_pick_fixtures(fixtures, _sort_key, n_fixtures, min_start, window_end)
                     logger.info(
                         f"OddsPapi: {len(fixtures)} fixture distribuite tra "
-                        f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} (evita rate limit)"
+                        f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} "
+                        f"({n_fixtures}/scan in base a pingpong_scan_interval={pp_interval_h}h, evita rate limit)"
                     )
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
@@ -558,6 +654,7 @@ class SignalScraper:
             odds_home, odds_away, over_odds, under_odds, totals_line = \
                 None, None, None, None, 3.5
             raw_bookmakers = {}
+            raw_totals: dict = {}
 
             if fid:
                 try:
@@ -582,6 +679,21 @@ class SignalScraper:
                                 self._extract_oddspapi_odds(data, winner_market, totals_market)
                             # Salva quote per bookmaker per de-vig Pinnacle
                             raw_bookmakers = self._extract_raw_bookmakers(data, winner_market)
+                            raw_totals = self._extract_oddspapi_totals(data, totals_market)
+                            # DIAGNOSTICA: ai_analyzer.py serve un book sharp (Pinnacle/Sbobet/
+                            # ecc. — mai presenti su OddsPapi) oppure il consenso di almeno
+                            # MIN_REF_BOOKS=3 book sulla stessa quota/linea per generare un
+                            # segnale (vincente o over/under). Logghiamo qui quanti book
+                            # arrivano davvero per fixture, per capire se è questo il motivo
+                            # per cui certi sport/leghe (es. ping pong su leghe minori) non
+                            # producono mai segnali anche quando la fixture viene trovata.
+                            n_tot_books = max((len(b) for b in raw_totals.values()), default=0)
+                            logger.info(
+                                f"OddsPapi [{default_sport_label}] book coverage: {p1} vs {p2} — "
+                                f"{len(raw_bookmakers)} book su mercato vincente {list(raw_bookmakers.keys())}, "
+                                f"{len(raw_totals)} linee totals disponibili, max {n_tot_books} book "
+                                f"sulla stessa linea (serve >=3 senza sharp per generare un segnale)"
+                            )
                             if odds_home is None:
                                 n_bm = len(data.get("bookmakerOdds") or {})
                                 logger.info(
@@ -622,6 +734,7 @@ class SignalScraper:
                 "over_odds":       round(over_odds,  3) if over_odds  else None,
                 "under_odds":      round(under_odds, 3) if under_odds else None,
                 "totals_line":     totals_line,
+                "raw_totals":      raw_totals,
                 "source":          source,
                 "sport":           "tabletennis",
                 "sport_label":     "🏓 Ping Pong",
@@ -630,6 +743,28 @@ class SignalScraper:
         except Exception as e:
             logger.debug(f"OddsPapi parse errore: {e}")
             return None
+
+    def _extract_oddspapi_totals(self, data: dict, totals_market: dict | None) -> dict:
+        """{linea: {book: {"over": x, "under": y}}} dal payload /odds di OddsPapi.
+        Stessa chiamata già pagata per il vincente: nessuna richiesta in più."""
+        if not totals_market:
+            return {}
+        tot_id = str(totals_market["market_id"])
+        oc_o, oc_u = str(totals_market["outcome_over"]), str(totals_market["outcome_under"])
+        line = totals_market.get("line")
+        out: dict = {}
+        for slug, bm_data in (data.get("bookmakerOdds") or {}).items():
+            mkt = (bm_data.get("markets") or {}).get(tot_id)
+            if not mkt:
+                continue
+            try:
+                ov = float(((mkt.get("outcomes") or {}).get(oc_o) or {}).get("players", {}).get("0", {}).get("price"))
+                un = float(((mkt.get("outcomes") or {}).get(oc_u) or {}).get("players", {}).get("0", {}).get("price"))
+            except (TypeError, ValueError):
+                continue
+            if ov and un and line:
+                out.setdefault(line, {})[slug.lower()] = {"over": ov, "under": un}
+        return out
 
     def _extract_oddspapi_odds(
         self, data: dict, winner_market: dict, totals_market: dict | None = None
@@ -864,6 +999,33 @@ class SignalScraper:
 
     # ══════════════════════════════════════════════════════════════════════════
 
+    async def _tournament_has_upcoming(
+        self, session: aiohttp.ClientSession, sport_key: str, min_start: datetime
+    ) -> bool | None:
+        """Usa /events (GRATIS, non consuma crediti) per sapere se il torneo ha
+        almeno una partita che parte dopo min_start. Se no, inutile pagare /odds
+        (2 crediti: h2h+totals). None = non so (errore) → si procede come prima."""
+        try:
+            async with session.get(
+                f"{ODDS_BASE}/sports/{sport_key}/events",
+                params={"apiKey": ODDS_KEY, "dateFormat": "iso"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    return None
+                events = await r.json()
+        except Exception as e:
+            logger.debug(f"/events {sport_key} errore: {e}")
+            return None
+        for ev in events or []:
+            try:
+                ct = datetime.fromisoformat(str(ev.get("commence_time", "")).replace("Z", "+00:00"))
+            except ValueError:
+                return True   # data illeggibile: meglio non perdere partite
+            if ct >= min_start:
+                return True
+        return False
+
     async def _fetch_odds_api_tennis(self) -> list[dict]:
         """Recupera partite di tennis da The Odds API.
 
@@ -886,7 +1048,23 @@ class SignalScraper:
                 logger.info("Odds tennis: nessun torneo attivo al momento — salto la chiamata /odds/")
                 return []
 
+            min_hours = 1.0
+            if self.db is not None:
+                try:
+                    min_hours = float(self.db.get_settings().get("min_hours_before", 1.0))
+                except Exception:
+                    pass
+            min_start = _now_it() + timedelta(hours=min_hours)
+            n_skipped = 0
+
             for sport_key in tennis_keys:
+                if await self._tournament_has_upcoming(session, sport_key, min_start) is False:
+                    n_skipped += 1
+                    logger.info(
+                        f"The Odds API ({sport_key}): nessuna partita utile (/events gratis) — "
+                        f"salto /odds, risparmio 2 crediti"
+                    )
+                    continue
                 url = (
                     f"{ODDS_BASE}/sports/{sport_key}/odds/"
                     f"?apiKey={ODDS_KEY}"
@@ -947,6 +1125,7 @@ class SignalScraper:
             best: dict[str, float] = {}
             raw_bookmakers: dict   = {}
             over_odds = under_odds = totals_line = None
+            raw_totals: dict = {}   # {linea: {book: {"over": x, "under": y}}}
 
             for bm in ev.get("bookmakers", []):
                 bm_slug = bm.get("key", "").lower()
@@ -965,6 +1144,14 @@ class SignalScraper:
                         if "home" in entry and "away" in entry:
                             raw_bookmakers[bm_slug] = entry
                     elif market["key"] == "totals":
+                        per_line: dict = {}
+                        for o in market.get("outcomes", []):
+                            nm_, pt_ = (o.get("name") or "").lower(), o.get("point")
+                            if pt_ is not None and nm_ in ("over", "under"):
+                                per_line.setdefault(pt_, {})[nm_] = float(o["price"])
+                        for pt_, d_ in per_line.items():
+                            if "over" in d_ and "under" in d_:
+                                raw_totals.setdefault(pt_, {})[bm_slug] = d_
                         for o in market.get("outcomes", []):
                             p   = float(o["price"])
                             pt  = o.get("point")
@@ -992,6 +1179,7 @@ class SignalScraper:
                 "over_odds":      round(over_odds,  3) if over_odds  else None,
                 "under_odds":     round(under_odds, 3) if under_odds else None,
                 "totals_line":    totals_line,
+                "raw_totals":     raw_totals,
                 "source":         "odds_api",
                 "sport":          "tennis",
                 "sport_label":    "🎾 Tennis",
@@ -1009,7 +1197,16 @@ class SignalScraper:
         """The Odds API: l'aggregatore 'tennis' funziona per /odds/ ma NON per /scores/
         (risponde 'Unknown sport'). /scores/ richiede il sport_key del singolo torneo
         attivo (es. tennis_atp_wimbledon). Li scopriamo da /sports/ (attivi = in season)."""
-        if self._odds_tennis_keys is not None:
+        # FIX: la cache non scadeva mai. Se il bot restava acceso con la lista di
+        # un torneo ormai finito (es. tennis_wta_singapore_open), gli scan
+        # interrogavano solo quello → 0 eventi → fallback su OddsPapi (quota
+        # condivisa col ping pong), con The Odds API ancora a 500 crediti. La
+        # lista arriva da /sports/ (non consuma crediti), quindi la rinfreschiamo
+        # ogni TENNIS_KEYS_TTL_S secondi. Una lista vuota non è mai "fresca".
+        if (
+            self._odds_tennis_keys
+            and (time.monotonic() - self._odds_tennis_keys_ts) < TENNIS_KEYS_TTL_S
+        ):
             return self._odds_tennis_keys
         try:
             async with session.get(
@@ -1027,6 +1224,7 @@ class SignalScraper:
                 ]
                 logger.info(f"The Odds API: torneo tennis attivi trovati: {keys}")
                 self._odds_tennis_keys = keys
+                self._odds_tennis_keys_ts = time.monotonic()
                 return keys
         except Exception as e:
             logger.error(f"The Odds API /sports errore: {e}")
@@ -1059,7 +1257,7 @@ class SignalScraper:
         if self.db and want_tennis:
             try:
                 for sig in self.db.get_signals_for_auto_result():
-                    if sig.get("sport") == "tennis" and sig.get("tournament"):
+                    if sig.get("sport") == "tennis" and sig.get("tournament") and result_due(sig):
                         pending_tournaments.add(sig["tournament"].strip().lower())
             except Exception as e:
                 logger.warning(f"Scores tennis: errore lettura segnali pendenti: {e}")
@@ -1073,10 +1271,12 @@ class SignalScraper:
                 # Non usiamo la cache in-memory per i scores: potrebbe essere vuota
                 # se il bot è appena ripartito. Forziamo un refetch diretto.
                 saved_cache = self._odds_tennis_keys
+                saved_ts    = self._odds_tennis_keys_ts
                 self._odds_tennis_keys = None
                 all_tennis_keys = await self._get_active_tennis_sport_keys(session)
                 if not all_tennis_keys:
                     self._odds_tennis_keys = saved_cache
+                    self._odds_tennis_keys_ts = saved_ts
                     logger.warning("Scores tennis: nessun torneo attivo trovato")
 
                 # Filtra: controlla solo i tornei per cui abbiamo segnali pendenti,
@@ -1161,7 +1361,7 @@ class SignalScraper:
         if self.db and want_pingpong:
             try:
                 for sig in self.db.get_signals_for_auto_result():
-                    if sig.get("sport") == "tabletennis":
+                    if sig.get("sport") == "tabletennis" and result_due(sig):
                         pending_pp_players.add(sig.get("player1", "").strip().lower())
                         pending_pp_players.add(sig.get("player2", "").strip().lower())
                 pending_pp_players.discard("")

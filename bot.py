@@ -13,7 +13,7 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from scraper import SignalScraper
+from scraper import SignalScraper, result_due
 from ai_analyzer import AIAnalyzer
 from database import Database
 
@@ -23,6 +23,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+# httpx a INFO logga ogni URL, token Telegram incluso (e un getUpdates ogni 10s
+# riempie i log di Railway) — a WARNING restano solo errori veri.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ROME         = ZoneInfo("Europe/Rome")
@@ -763,7 +767,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = []
         for o in opts:
             scans_day  = 15 // o + 1  # +1: include sempre le 07:00 (07-22 inclusivo)
-            calls_mo   = scans_day * 4 * 31  # ~4 chiamate OddsPapi per scan (1 fixtures + 3 odds, distribuite sulla giornata)
+            # Fixture/scan adattivo (vedi scraper._pingpong_fixtures_per_scan):
+            # 3 con 1 scan/giorno, 2 con 2 scan/giorno, 1 con 3+ scan/giorno —
+            # così la quota resta sotto controllo anche dividendo gli scan.
+            fixtures_per_scan = 3 if scans_day <= 1 else (2 if scans_day == 2 else 1)
+            calls_mo   = scans_day * (1 + fixtures_per_scan) * 31  # 1 /fixtures + N /odds per scan
             prefix = "✅ " if o == current else ""
             warn = " ⚠️" if calls_mo > 240 else ""
             label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo 07:00) — ~{calls_mo} req/mese"
@@ -1279,15 +1287,27 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
 PINGPONG_MAX_RETRIES = 2   # tentativi extra se lo scan mattutino fallisce
 PINGPONG_RETRY_DELAY_MIN = 45
 
-async def run_pingpong_scan(app: Application):
+async def run_pingpong_scan(app: Application, is_retry: bool = False):
     """
-    Scan ping pong giornaliero.
-    Normalmente parte alle 07:00 (CronTrigger). Se il bot si riavvia dopo le
-    07:00 (es. dopo un redeploy) e lo scan di oggi non è ancora partito,
-    post_init lo recupera automaticamente al boot (vedi "catchup" più sotto).
-    Se la chiamata fallisce (errore rete/API), riprova automaticamente dopo
-    ~45 minuti, fino a PINGPONG_MAX_RETRIES tentativi extra nello stesso giorno.
-    Scarica le migliori fixture del giorno, analizza e invia i segnali.
+    Scan ping pong — parte alle 07:00 (CronTrigger) e si ripete ogni
+    "pingpong_scan_interval" ore fino alle 22:00 (1 volta al giorno col
+    default 24h, di più se l'intervallo viene abbassato dal pannello).
+    Se il bot si riavvia dopo le 07:00 (es. dopo un redeploy) e lo scan di
+    oggi non è ancora partito, post_init lo recupera automaticamente al boot
+    (vedi "catchup" più sotto).
+    Se una chiamata fallisce (errore rete/API), riprova automaticamente dopo
+    ~45 minuti, fino a PINGPONG_MAX_RETRIES tentativi extra PER QUELLA chiamata.
+
+    FIX: prima "attempts_today" contava insieme i retry veri E le chiamate
+    legittime successive della giornata (quando pingpong_scan_interval < 24h,
+    es. ogni 6h = più scan/giorno via CronTrigger). Risultato: se una delle
+    scan regolari falliva per un 429 transitorio, il contatore saliva e dopo
+    2-3 chiamate il bot pensava di aver "esaurito i tentativi di oggi",
+    saltando scan successive già programmate che non erano affatto retry.
+    Ora il parametro esspito `is_retry` (passato solo dal job di retry
+    schedulato qui sotto) distingue i due casi: una chiamata regolare dal
+    CronTrigger (o dal catchup al boot) riparte sempre con un budget di
+    retry pulito, indipendentemente da quante scan sono già girate oggi.
     """
     settings = db.get_settings()
     if settings.get("sport_filter") == "tennis":
@@ -1296,21 +1316,28 @@ async def run_pingpong_scan(app: Application):
 
     today_str = datetime.datetime.now(ROME).strftime("%Y-%m-%d")
 
-    # Conta i tentativi già fatti oggi (reset automatico al cambio data)
+    # Conta i tentativi di retry della chiamata CORRENTE (reset ad ogni
+    # chiamata regolare, non solo al cambio data — vedi FIX sopra).
     retry_key = "pingpong_scan_attempts_date"
     count_key = "pingpong_scan_attempts_count"
-    last_attempt_date = db.conn.execute(
-        "SELECT value FROM settings WHERE key=?", (retry_key,)
-    ).fetchone()
-    last_attempt_date = last_attempt_date["value"] if last_attempt_date else ""
-    if last_attempt_date != today_str:
+    if is_retry:
+        last_attempt_date = db.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (retry_key,)
+        ).fetchone()
+        last_attempt_date = last_attempt_date["value"] if last_attempt_date else ""
+        if last_attempt_date != today_str:
+            attempts_today = 0
+            db.set_setting(retry_key, today_str)
+        else:
+            row = db.conn.execute("SELECT value FROM settings WHERE key=?", (count_key,)).fetchone()
+            attempts_today = int(row["value"]) if row and row["value"] else 0
+    else:
+        # Chiamata regolare (CronTrigger o catchup al boot): non è un retry,
+        # budget di tentativi pulito per questa chiamata.
         attempts_today = 0
         db.set_setting(retry_key, today_str)
-    else:
-        row = db.conn.execute("SELECT value FROM settings WHERE key=?", (count_key,)).fetchone()
-        attempts_today = int(row["value"]) if row and row["value"] else 0
 
-    logger.info(f"🏓 Avvio scan ping pong (tentativo {attempts_today + 1})...")
+    logger.info(f"🏓 Avvio scan ping pong (tentativo {attempts_today + 1}{', retry' if is_retry else ''})...")
 
     ok = False
     try:
@@ -1342,7 +1369,7 @@ async def run_pingpong_scan(app: Application):
             f"(tentativo {attempts_today + 1}/{PINGPONG_MAX_RETRIES + 1})"
         )
         _scheduler.add_job(
-            lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
+            lambda: _schedule_coro(lambda: run_pingpong_scan(app, is_retry=True)),
             id="pingpong_scan_retry",
             replace_existing=True,
             next_run_time=retry_time,
@@ -1359,11 +1386,15 @@ async def run_pingpong_scan(app: Application):
         except Exception:
             pass
     else:
-        logger.error("🏓 Scan ping pong: esauriti i tentativi per oggi, riprovo domani alle 07:00")
+        # Solo la catena di retry di QUESTA chiamata si ferma — se è
+        # schedulata un'altra scan regolare più tardi in giornata
+        # (pingpong_scan_interval < 24h) partirà comunque, con un budget di
+        # retry pulito (vedi FIX nel docstring della funzione).
+        logger.error("🏓 Scan ping pong: esauriti i retry per questa chiamata")
         try:
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
-                text="❌ *Scan ping pong*: falliti tutti i tentativi di oggi. Riprovo domani alle 07:00.",
+                text="❌ *Scan ping pong*: falliti tutti i retry per questa chiamata.",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -1388,6 +1419,9 @@ async def run_auto_results(app: Application, sport: str = "both"):
     pending = [s for s in pending if s.get("signal_type") == "winner"]
     if sport != "both":
         pending = [s for s in pending if s.get("sport") == sport]
+    # Quota: cerca i risultati solo dei segnali la cui partita può essere già finita
+    # (e che l'API copre ancora) — vedi result_due in scraper.py.
+    pending = [s for s in pending if result_due(s)]
     if not pending:
         return
 
