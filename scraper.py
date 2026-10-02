@@ -398,6 +398,83 @@ class SignalScraper:
                 logger.debug(f"OddsPapi: impossibile cachare totals market su DB: {e}")
         return result
 
+    async def _get_totals_markets_all(self, session: aiohttp.ClientSession, sport_id: int) -> list:
+        """Come _get_totals_market, ma ritorna TUTTE le linee totals candidate
+        per questo sport invece di sceglierne una sola ("di mezzo") in anticipo.
+
+        FIX: _get_totals_market sceglieva UNA linea fissa (es. 65.0 punti per
+        il ping pong) e la cercava identica su ogni fixture — ma linee diverse
+        (formato/durata diversi) sono quotate da bookmaker diversi a seconda
+        della partita, quindi quella fissa non combaciava quasi mai (confermato
+        nei log: "0 linee totals disponibili" su ogni fixture ping pong,
+        nonostante 19-72 book sul mercato vincente della stessa fixture). Qui
+        invece si prova OGNI linea candidata per fixture — _extract_oddspapi_totals
+        già supporta più linee contemporaneamente (dict {linea: {book: ...}}),
+        e _totals_reference in ai_analyzer.py sceglie da sola quella con più
+        copertura book per quella specifica partita."""
+        cache_attr = f"_totals_markets_all_{sport_id}"
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+
+        setting_key = f"oddspapi_totals_markets_all_v1_{sport_id}"
+        if self.db is not None:
+            raw = self.db.get_setting(setting_key)
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    setattr(self, cache_attr, parsed)
+                    logger.info(
+                        f"OddsPapi: {len(parsed)} linee totals candidate sportId={sport_id} "
+                        f"da cache DB → linee {[m.get('line') for m in parsed]}"
+                    )
+                    return parsed
+                except Exception:
+                    pass
+
+        markets = await self._get_all_markets(session)
+        if not markets:
+            return []
+
+        candidates = [
+            m for m in markets
+            if m.get("sportId") == sport_id
+            and str(m.get("marketType") or "").startswith("totals")
+            and m.get("marketLength") == 2
+            and not m.get("playerProp")
+            and (m.get("handicap") or 0) > 0
+        ]
+        result = []
+        for c in candidates:
+            outcomes = c.get("outcomes") or []
+            over_id = under_id = None
+            for o in outcomes:
+                name = (o.get("outcomeName") or "").strip().lower()
+                if name == "over":
+                    over_id = o.get("outcomeId")
+                elif name == "under":
+                    under_id = o.get("outcomeId")
+            if over_id is None or under_id is None:
+                continue
+            result.append({
+                "market_id":    c["marketId"],
+                "outcome_over": over_id,
+                "outcome_under": under_id,
+                "line":         c.get("handicap"),
+            })
+
+        setattr(self, cache_attr, result)
+        logger.info(
+            f"OddsPapi: {len(result)} linee totals candidate trovate per "
+            f"sportId={sport_id} → linee {[m['line'] for m in result]}"
+        )
+        if self.db is not None:
+            try:
+                self.db.set_setting(setting_key, json.dumps(result))
+            except Exception as e:
+                logger.debug(f"OddsPapi: impossibile cachare totals markets (tutte) su DB: {e}")
+        return result
+
     # ── Entry point principale ─────────────────────────────────────────────────
     def _tennis_fallback_allowed(self) -> bool:
         today = _now_it().strftime("%Y-%m-%d")
@@ -542,6 +619,7 @@ class SignalScraper:
                 logger.warning("OddsPapi: mercato vincente ping pong non trovato — ping pong non disponibile")
                 return []
             totals_market = await self._get_totals_market(session, sport_id)
+            totals_markets_all = await self._get_totals_markets_all(session, sport_id)
 
             # Fetch fixtures dei prossimi 2 giorni
             today     = _now_it().strftime("%Y-%m-%d")
@@ -625,7 +703,10 @@ class SignalScraper:
 
             # Per ogni fixture recupera le quote
             for fix in fixtures:
-                parsed = await self._parse_oddspapi_fixture(session, fix, winner_market, totals_market)
+                parsed = await self._parse_oddspapi_fixture(
+                    session, fix, winner_market, totals_market,
+                    totals_markets_all=totals_markets_all,
+                )
                 if parsed:
                     matches.append(parsed)
 
@@ -634,6 +715,7 @@ class SignalScraper:
     async def _parse_oddspapi_fixture(
         self, session: aiohttp.ClientSession, fix: dict, winner_market: dict,
         totals_market: dict | None = None, default_sport_label: str = "Ping Pong",
+        totals_markets_all: list | None = None,
     ) -> dict | None:
         try:
             p1 = (fix.get("participant1Name") or fix.get("home") or "").strip()
@@ -687,7 +769,9 @@ class SignalScraper:
                                 self._extract_oddspapi_odds(data, winner_market, totals_market)
                             # Salva quote per bookmaker per de-vig Pinnacle
                             raw_bookmakers = self._extract_raw_bookmakers(data, winner_market)
-                            raw_totals = self._extract_oddspapi_totals(data, totals_market)
+                            raw_totals = self._extract_oddspapi_totals(
+                                data, totals_markets_all or totals_market
+                            )
                             # DIAGNOSTICA: ai_analyzer.py serve un book sharp (Pinnacle/Sbobet/
                             # ecc. — mai presenti su OddsPapi) oppure il consenso di almeno
                             # MIN_REF_BOOKS=3 book sulla stessa quota/linea per generare un
@@ -752,26 +836,37 @@ class SignalScraper:
             logger.debug(f"OddsPapi parse errore: {e}")
             return None
 
-    def _extract_oddspapi_totals(self, data: dict, totals_market: dict | None) -> dict:
+    def _extract_oddspapi_totals(self, data: dict, totals_markets: list | dict | None) -> dict:
         """{linea: {book: {"over": x, "under": y}}} dal payload /odds di OddsPapi.
-        Stessa chiamata già pagata per il vincente: nessuna richiesta in più."""
-        if not totals_market:
+        Stessa chiamata già pagata per il vincente: nessuna richiesta in più.
+
+        FIX: prima accettava UNA sola linea (dict) — ora accetta anche una
+        LISTA di linee candidate (vedi _get_totals_markets_all) e le prova
+        tutte sulla fixture corrente, invece di scartare in blocco se la
+        fixture non offre esattamente quell'unica linea pre-scelta. Accetta
+        ancora il vecchio formato a dict singolo per compatibilità."""
+        if not totals_markets:
             return {}
-        tot_id = str(totals_market["market_id"])
-        oc_o, oc_u = str(totals_market["outcome_over"]), str(totals_market["outcome_under"])
-        line = totals_market.get("line")
+        markets_list = [totals_markets] if isinstance(totals_markets, dict) else totals_markets
+        bm_odds = data.get("bookmakerOdds") or {}
         out: dict = {}
-        for slug, bm_data in (data.get("bookmakerOdds") or {}).items():
-            mkt = (bm_data.get("markets") or {}).get(tot_id)
-            if not mkt:
+        for tm in markets_list:
+            tot_id = str(tm["market_id"])
+            oc_o, oc_u = str(tm["outcome_over"]), str(tm["outcome_under"])
+            line = tm.get("line")
+            if not line:
                 continue
-            try:
-                ov = float(((mkt.get("outcomes") or {}).get(oc_o) or {}).get("players", {}).get("0", {}).get("price"))
-                un = float(((mkt.get("outcomes") or {}).get(oc_u) or {}).get("players", {}).get("0", {}).get("price"))
-            except (TypeError, ValueError):
-                continue
-            if ov and un and line:
-                out.setdefault(line, {})[slug.lower()] = {"over": ov, "under": un}
+            for slug, bm_data in bm_odds.items():
+                mkt = (bm_data.get("markets") or {}).get(tot_id)
+                if not mkt:
+                    continue
+                try:
+                    ov = float(((mkt.get("outcomes") or {}).get(oc_o) or {}).get("players", {}).get("0", {}).get("price"))
+                    un = float(((mkt.get("outcomes") or {}).get(oc_u) or {}).get("players", {}).get("0", {}).get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if ov and un:
+                    out.setdefault(line, {})[slug.lower()] = {"over": ov, "under": un}
         return out
 
     def _extract_oddspapi_odds(
@@ -892,6 +987,7 @@ class SignalScraper:
                 logger.warning("OddsPapi: mercato vincente tennis non trovato — fallback tennis non disponibile")
                 return []
             totals_market = await self._get_totals_market(session, sport_id)
+            totals_markets_all = await self._get_totals_markets_all(session, sport_id)
 
             today    = _now_it().strftime("%Y-%m-%d")
             tomorrow = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -962,7 +1058,8 @@ class SignalScraper:
 
             for fix in fixtures:
                 parsed = await self._parse_oddspapi_fixture(
-                    session, fix, winner_market, totals_market, default_sport_label="Tennis"
+                    session, fix, winner_market, totals_market, default_sport_label="Tennis",
+                    totals_markets_all=totals_markets_all,
                 )
                 if parsed:
                     # _parse_oddspapi_fixture marca tutto come ping pong: qui
