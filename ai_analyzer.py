@@ -48,6 +48,7 @@ MIN_ODDS             = 1.40   # quota minima accettata
 MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
 MIN_HOURS_BEFORE     = 1.0    # default ore minime al kickoff
+SAME_DAY_ONLY        = True   # default: scarta segnali su partite non del giorno stesso
 MAX_EDGE_NO_SHARP    = 20.0   # default cap edge% senza Pinnacle
 MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senza sharp)
 
@@ -77,6 +78,7 @@ class AIAnalyzer:
 
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
+        same_day_only = bool(settings.get("same_day_only", SAME_DAY_ONLY))
         min_value    = float(settings.get("min_value_pct", MIN_VALUE_PCT)) / 100
         # Cap edge senza Pinnacle: più basso per ping pong (de-vig meno affidabile senza sharp)
         if sport == "tabletennis":
@@ -101,6 +103,20 @@ class AIAnalyzer:
                 if hours_to_ko < min_hours:
                     logger.info(
                         f"Segnale scartato (kickoff tra {hours_to_ko:.1f}h < min {min_hours}h): "
+                        f"{match.get('name','?')} — {kickoff_str}"
+                    )
+                    return []
+                # FIX: prima non c'era nessun tetto massimo — solo il minimo
+                # di 1h sopra. Una partita trovata oggi ma in programma tra 2-3
+                # giorni passava comunque il filtro, generando segnali su match
+                # troppo lontani nel tempo (quote non ancora definitive, lega
+                # che potrebbe rinviare, ecc.). Richiesto esplicitamente: solo
+                # partite dello stesso giorno solare (confronto per data, non
+                # per ore, quindi niente segnali anche solo per un match delle
+                # 00:30 di domani trovato in uno scan serale).
+                if same_day_only and ko.date() != now_it.date():
+                    logger.info(
+                        f"Segnale scartato (kickoff {ko.date()} non è oggi {now_it.date()}): "
                         f"{match.get('name','?')} — {kickoff_str}"
                     )
                     return []
@@ -147,10 +163,25 @@ class AIAnalyzer:
                 (p1, fair_home, best_h, best_h_book),
                 (p2, fair_away, best_a, best_a_book),
             ):
+                # DIAGNOSTICA: prima questi due scarti erano silenziosi (solo
+                # `continue`) — con 72 book di copertura ma zero segnali, non
+                # si riusciva a capire se la causa fosse "quota fuori range"
+                # (es. 1.15 per un favorito schiacciante, comune nel ping
+                # pong) o "edge sotto soglia". Ora entrambi i casi sono loggati.
                 if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                    logger.info(
+                        f"Winner scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
+                        f"{match.get('name','?')} — {player}"
+                    )
                     continue
                 value = fair * best - 1
-                if value < min_value or not _edge_ok(value, f"{player} vince"):
+                if value < min_value:
+                    logger.info(
+                        f"Winner scartato (edge {value:.1%} < min {min_value:.1%}): "
+                        f"{match.get('name','?')} — {player} @ {best}"
+                    )
+                    continue
+                if not _edge_ok(value, f"{player} vince"):
                     continue
                 signals.append(self._build(
                     match     = match,
@@ -178,10 +209,19 @@ class AIAnalyzer:
                 ("under", tot["fair_under"], tot["best_under"], tot["under_book"]),
             ):
                 if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                    logger.info(
+                        f"Totals scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
+                        f"{match.get('name','?')} — {side} {line}"
+                    )
                     continue
                 value = fair * best - 1
                 if value >= min_value:
                     cand.append((value, side, fair, best, book))
+                else:
+                    logger.info(
+                        f"Totals scartato (edge {value:.1%} < min {min_value:.1%}): "
+                        f"{match.get('name','?')} — {side} {line} @ {best}"
+                    )
             if cand:
                 value, side, fair, best, book = max(cand)
                 tot_sharp = tot["kind"] == "sharp"

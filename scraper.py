@@ -244,6 +244,10 @@ class SignalScraper:
                 try:
                     parsed = json.loads(raw)
                     setattr(self, cache_attr, parsed)
+                    logger.info(
+                        f"OddsPapi: mercato vincente sportId={sport_id} da cache DB → "
+                        f"marketId={parsed.get('market_id')}"
+                    )
                     return parsed
                 except Exception:
                     pass
@@ -320,6 +324,10 @@ class SignalScraper:
                 try:
                     parsed = json.loads(raw)
                     setattr(self, cache_attr, parsed)
+                    logger.info(
+                        f"OddsPapi: mercato totals sportId={sport_id} da cache DB → "
+                        f"marketId={parsed.get('market_id')}, linea={parsed.get('line')}"
+                    )
                     return parsed
                 except Exception:
                     pass

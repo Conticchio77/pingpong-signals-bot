@@ -313,7 +313,10 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt == "🔍 Scan":
         msg = await update.message.reply_text("🔍 Scansione in corso...")
         count = await run_signal_scan(context.application, manual=True)
-        await msg.edit_text(f"✅ Scan completato! Nuovi segnali: *{count}*", parse_mode="Markdown")
+        if count == -1:
+            await msg.edit_text("⏰ Scan disattivato fuori orario — attivo solo tra le 07:00 e le 22:00.")
+        else:
+            await msg.edit_text(f"✅ Scan completato! Nuovi segnali: *{count}*", parse_mode="Markdown")
         await update.message.reply_text(admin_panel_text(), parse_mode="Markdown", reply_markup=admin_panel_kb())
 
     elif txt == "📋 Segnali":
@@ -523,8 +526,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_scan":
         await query.edit_message_text("🔍 Scansione in corso... attendere.")
         count = await run_signal_scan(context.application, manual=True)
+        if count == -1:
+            text = "⏰ Scan disattivato fuori orario — attivo solo tra le 07:00 e le 22:00."
+        else:
+            text = f"✅ Scan completato!\n🆕 Nuovi segnali: *{count}*"
         await query.edit_message_text(
-            f"✅ Scan completato!\n🆕 Nuovi segnali: *{count}*",
+            text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
         )
@@ -1141,8 +1148,17 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
     """
     ora = datetime.datetime.now(ROME).hour
     sport_ov = sport_override
-    # Scan automatico tennis: solo tra 07:00 e 22:00
-    if not manual and not sport_ov and not (7 <= ora <= 21):
+    # Finestra 07-22: vale SEMPRE, anche per lo scan manuale dal pannello.
+    # FIX: prima "manual" bypassava del tutto il controllo orario, quindi
+    # premendo "🔍 Scan" di notte si generavano comunque segnali fuori
+    # orario (es. le 00:12) — oltre al rischio di beccare quote notturne
+    # meno liquide/affidabili. Ora lo scan manuale fuori 07-22 viene
+    # rifiutato come quello automatico, con un messaggio dedicato invece
+    # di restituire silenziosamente "0 segnali trovati".
+    if not sport_ov and not (7 <= ora <= 21):
+        if manual:
+            logger.info(f"Scan manuale rifiutato (ora {ora}:xx fuori finestra 07-22)")
+            return -1
         logger.info(f"Scan tennis saltato (ora {ora}:xx fuori finestra 07-22)")
         return 0
     logger.info("🔍 Avvio scan tennis..." if not sport_ov else "🏓 Avvio scan ping pong...")
