@@ -256,7 +256,7 @@ def admin_panel_text() -> str:
         f"{sport_breakdown}"
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
         f"⚙️ Scan ogni *{s['scan_interval']}h* | "
-        f"Confidenza min: *{s['min_confidence']}%* | "
+        f"Confidenza min: 🎾*{s['min_confidence']}%* 🏓*{s['min_confidence_pp']}%* | "
         f"Auto-VIP: *{'✅' if s['auto_send'] else '❌'}* | "
         f"Sport: *{sf_label}*"
     )
@@ -398,10 +398,12 @@ async def send_stats(fn):
 
 async def send_settings(fn):
     s = db.get_settings()
-    conf = s['min_confidence']
     conf_desc = {55: "Bassa (55%)", 60: "Media (60%)", 65: "Media-Alta (65%)",
                  70: "Alta (70%)", 75: "Molto Alta (75%)", 80: "Massima (80%)"}
+    conf = s['min_confidence']
     conf_label = conf_desc.get(conf, f"{conf}%")
+    conf_pp = s['min_confidence_pp']
+    conf_pp_label = conf_desc.get(conf_pp, f"{conf_pp}%")
 
     sf = s.get("sport_filter", "both")
     sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sf, "🏓🎾 Entrambi")
@@ -410,7 +412,8 @@ async def send_settings(fn):
         [InlineKeyboardButton(f"⏱ Scan tennis: ogni {s['scan_interval']}h", callback_data="pick_interval")],
         [InlineKeyboardButton(f"🏓 Scan ping pong: ogni {s['pingpong_scan_interval']}h", callback_data="pick_interval_pp")],
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
-        [InlineKeyboardButton(f"🎯 Confidenza: {conf_label}", callback_data="pick_confidence")],
+        [InlineKeyboardButton(f"🎯 Confidenza tennis: {conf_label}", callback_data="pick_confidence")],
+        [InlineKeyboardButton(f"🏓 Confidenza ping pong: {conf_pp_label}", callback_data="pick_confidence_pp")],
         [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
@@ -824,10 +827,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
+    # Nota: il check "set_conf_pp_" deve stare PRIMA di "set_conf_" sotto,
+    # perché "set_conf_pp_60".startswith("set_conf_") è vero e finirebbe
+    # intercettato dal ramo sbagliato (tennis) se l'ordine fosse invertito.
+    elif data.startswith("set_conf_pp_"):
+        nxt = int(data.split("_")[-1])
+        db.set_setting("min_confidence_pp", nxt)
+        await send_settings(query.edit_message_text)
+
     elif data.startswith("set_conf_"):
         nxt = int(data.split("_")[-1])
         db.set_setting("min_confidence", nxt)
         await send_settings(query.edit_message_text)
+
+    # ── Scegli confidenza ping pong (soglia separata: senza sharp book su ──────
+    # OddsPapi la confidenza è tappata a ~70, vedi _confidence in ai_analyzer.py)
+    elif data == "pick_confidence_pp":
+        current = db.get_settings()["min_confidence_pp"]
+        opts = [
+            (50, "50% — Bassa\n(più segnali, meno precisi)"),
+            (55, "55% — Media-Bassa"),
+            (60, "60% — Media\n(bilanciato ✓)"),
+            (65, "65% — Media-Alta"),
+            (70, "70% — Alta\n(quasi mai raggiunta senza sharp book)"),
+        ]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if val == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_conf_pp_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+        await query.edit_message_text(
+            "🏓 *Seleziona la confidenza minima dei segnali ping pong:*\n\n"
+            "OddsPapi non ha mai un book sharp (Pinnacle) per il ping pong, quindi "
+            "la confidenza dei segnali ping pong resta quasi sempre sotto il 70% "
+            "per costruzione — tenerla uguale al tennis significa avere pochissimi "
+            "(o nessun) segnale ping pong.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
     # ── Scegli filtro sport ───────────────────────────────────────────────────
     elif data == "pick_sport_filter":
@@ -1259,9 +1296,17 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
             signals = await analyzer.analyze(match, settings)
             signals.sort(key=lambda x: x["value_pct"], reverse=True)
             for sig in signals:
-                if sig["confidence"] < settings["min_confidence"]:
+                # Soglia separata per sport: senza sharp book il ping pong è
+                # tappato a ~70% di confidenza per costruzione (vedi
+                # _confidence in ai_analyzer.py), quindi usa min_confidence_pp
+                # invece della soglia tennis, altrimenti non passa quasi mai.
+                min_conf = (
+                    settings["min_confidence_pp"] if sig.get("sport") == "tabletennis"
+                    else settings["min_confidence"]
+                )
+                if sig["confidence"] < min_conf:
                     logger.info(
-                        f"Segnale scartato (confidenza {sig['confidence']}% < min {settings['min_confidence']}%): "
+                        f"Segnale scartato (confidenza {sig['confidence']}% < min {min_conf}%): "
                         f"{sig.get('match','?')} — {sig.get('pick','?')}"
                     )
                     continue

@@ -82,6 +82,11 @@ class Database:
             "scan_interval":    "3",
             "auto_send":        "0",
             "min_confidence":   "55",
+            # Soglia separata per il ping pong: senza Pinnacle/sharp su
+            # OddsPapi, la confidenza dei segnali consenso è tappata a ~70
+            # (vedi _confidence in ai_analyzer.py) — con la stessa soglia
+            # del tennis il ping pong non genera quasi mai nulla.
+            "min_confidence_pp": "60",
             "last_scan":        "mai",
             "sport_filter":     "both",
             "unit_value":       "10",
@@ -233,6 +238,7 @@ class Database:
             "scan_interval":    int(raw.get("scan_interval", 1)),
             "auto_send":        raw.get("auto_send", "0") == "1",
             "min_confidence":   int(raw.get("min_confidence", 60)),
+            "min_confidence_pp": int(raw.get("min_confidence_pp", 60)),
             "last_scan":        raw.get("last_scan", "mai"),
             "sport_filter":     raw.get("sport_filter", "both"),
             "unit_value":       float(raw.get("unit_value", 10)),
