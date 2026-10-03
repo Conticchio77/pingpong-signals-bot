@@ -262,6 +262,32 @@ class Database:
         )
         self.conn.commit()
 
+    def increment_api_calls(self, api_name: str, by: int = 1) -> int:
+        """Incrementa e ritorna il contatore mensile di chiamate reali per
+        un'API esterna (es. "oddspapi"), con reset automatico ad ogni nuovo
+        mese solare. Tracciato da noi indipendentemente da cosa riporta (o
+        non riporta) l'header di rate-limit dell'API — serve per il bottone
+        "Quota" nel pannello admin."""
+        period_key = f"{api_name}_calls_period"
+        count_key  = f"{api_name}_calls_count"
+        cur_period = datetime.now().strftime("%Y-%m")
+        stored_period = self.get_setting(period_key, "")
+        if stored_period != cur_period:
+            count = 0
+            self.set_setting(period_key, cur_period)
+        else:
+            count = int(self.get_setting(count_key, "0") or 0)
+        count += by
+        self.set_setting(count_key, count)
+        return count
+
+    def get_api_calls_this_month(self, api_name: str) -> int:
+        period_key = f"{api_name}_calls_period"
+        count_key  = f"{api_name}_calls_count"
+        if self.get_setting(period_key, "") != datetime.now().strftime("%Y-%m"):
+            return 0
+        return int(self.get_setting(count_key, "0") or 0)
+
     def toggle_setting(self, key: str):
         current = self.conn.execute(
             "SELECT value FROM settings WHERE key=?", (key,)

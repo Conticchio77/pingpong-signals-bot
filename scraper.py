@@ -178,6 +178,28 @@ class SignalScraper:
         # chiamate consecutive a OddsPapi, qualunque sia l'endpoint.
         self._oddspapi_min_interval = 0.8  # secondi
         self._last_oddspapi_call    = 0.0
+
+    def _save_quota_snapshot(self, key_prefix: str, **fields):
+        """Salva su DB l'ultima lettura nota della quota di un'API esterna
+        (header di rate-limit, se presente), così il pannello admin può
+        mostrarla senza dover fare una chiamata live apposta (che
+        consumerebbe quota a sua volta). Ignora i valori mancanti ("?"/None)."""
+        if self.db is None:
+            return
+        saved_any = False
+        for name, val in fields.items():
+            if val is None or val == "?":
+                continue
+            try:
+                self.db.set_setting(f"{key_prefix}_{name}", str(val))
+                saved_any = True
+            except Exception as e:
+                logger.debug(f"Impossibile salvare quota {key_prefix}_{name}: {e}")
+        if saved_any:
+            try:
+                self.db.set_setting(f"{key_prefix}_updated_at", _now_it().strftime("%Y-%m-%d %H:%M"))
+            except Exception:
+                pass
         self._oddspapi_lock         = asyncio.Lock()
         self._all_markets_cache     = None  # lista completa /markets, scaricata una volta
 
@@ -638,6 +660,9 @@ class SignalScraper:
                 ) as r:
                     rem = r.headers.get("X-RateLimit-Remaining", "?")
                     logger.info(f"OddsPapi fixtures — richieste rimaste: {rem}")
+                    self._save_quota_snapshot("quota_oddspapi", remaining=rem)
+                    if self.db is not None:
+                        self.db.increment_api_calls("oddspapi")
                     if r.status != 200:
                         txt = await r.text()
                         logger.warning(f"OddsPapi fixtures status {r.status}: {txt[:120]}")
@@ -763,6 +788,11 @@ class SignalScraper:
                         },
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as r:
+                        self._save_quota_snapshot(
+                            "quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?")
+                        )
+                        if self.db is not None:
+                            self.db.increment_api_calls("oddspapi")
                         if r.status == 200:
                             data = await r.json()
                             odds_home, odds_away, over_odds, under_odds, totals_line = \
@@ -1005,6 +1035,9 @@ class SignalScraper:
                 ) as r:
                     rem = r.headers.get("X-RateLimit-Remaining", "?")
                     logger.info(f"OddsPapi fixtures tennis — richieste rimaste: {rem}")
+                    self._save_quota_snapshot("quota_oddspapi", remaining=rem)
+                    if self.db is not None:
+                        self.db.increment_api_calls("oddspapi")
                     if r.status != 200:
                         txt = await r.text()
                         logger.warning(f"OddsPapi fixtures tennis status {r.status}: {txt[:120]}")
@@ -1187,6 +1220,7 @@ class SignalScraper:
                         logger.info(
                             f"The Odds API tennis ({sport_key}) — usate:{used} rimaste:{rem}"
                         )
+                        self._save_quota_snapshot("quota_oddsapi_tennis", used=used, remaining=rem)
                         if resp.status == 200:
                             self.tennis_quota_ok = True
                             events = await resp.json()

@@ -267,7 +267,52 @@ def admin_panel_kb():
          InlineKeyboardButton("📋 Segnali",           callback_data="admin_list")],
         [InlineKeyboardButton("📊 Statistiche",       callback_data="admin_stats"),
          InlineKeyboardButton("⚙️ Impostazioni",      callback_data="admin_settings")],
+        [InlineKeyboardButton("📡 Quota API",         callback_data="admin_quota")],
     ])
+
+async def send_quota(fn):
+    """Mostra, separatamente per sport, l'ultima lettura nota della quota
+    delle due API esterne. Legge solo valori già salvati da scraper.py ad
+    ogni chiamata reale — non fa nessuna chiamata live apposta (costerebbe
+    quota per controllare la quota)."""
+    get = db.get_setting
+
+    # 🎾 Tennis — The Odds API riporta used/remaining assoluti negli header
+    t_used = get("quota_oddsapi_tennis_used")
+    t_rem  = get("quota_oddsapi_tennis_remaining")
+    t_upd  = get("quota_oddsapi_tennis_updated_at")
+    if t_used is not None or t_rem is not None:
+        t_used_i = int(t_used) if t_used and t_used.isdigit() else None
+        t_rem_i  = int(t_rem)  if t_rem  and t_rem.isdigit()  else None
+        t_tot = f"{t_used_i + t_rem_i}" if (t_used_i is not None and t_rem_i is not None) else "?"
+        tennis_block = (
+            f"🎾 *Tennis* (The Odds API)\n"
+            f"   Usate: *{t_used or '?'}* / Totale: *{t_tot}*\n"
+            f"   Rimaste: *{t_rem or '?'}*\n"
+            f"   Ultimo aggiornamento: {t_upd or '—'}"
+        )
+    else:
+        tennis_block = "🎾 *Tennis* (The Odds API)\n   Nessun dato ancora — fai almeno uno scan."
+
+    # 🏓 Ping Pong — OddsPapi: header "remaining" (significato non documentato
+    # con certezza da OddsPapi — potrebbe essere per-minuto, non mensile) +
+    # un contatore mensile nostro, sempre affidabile, su 250/mese (piano).
+    pp_rem    = get("quota_oddspapi_remaining")
+    pp_upd    = get("quota_oddspapi_updated_at")
+    pp_ours   = db.get_api_calls_this_month("oddspapi")
+    pp_block = (
+        f"🏓 *Ping Pong* (OddsPapi)\n"
+        f"   Chiamate nostre questo mese: *{pp_ours}* / *250* (piano)\n"
+        f"   Rimaste restituite dall'header API: *{pp_rem or '?'}* "
+        f"(nota: significato non garantito — potrebbe non essere mensile)\n"
+        f"   Ultimo aggiornamento: {pp_upd or '—'}"
+    )
+
+    await fn(
+        f"📡 *Quota API — per sport*\n{'━' * 26}\n\n{tennis_block}\n\n{pp_block}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
+    )
 
 # ── /start e /menu ──────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -736,6 +781,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Impostazioni ─────────────────────────────────────────────────────────────
     elif data == "admin_settings":
         await send_settings(query.edit_message_text)
+
+    elif data == "admin_quota":
+        await send_quota(query.edit_message_text)
 
     elif data == "toggle_autosend":
         db.toggle_setting("auto_send")
