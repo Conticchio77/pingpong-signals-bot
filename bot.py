@@ -102,7 +102,7 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         f"💰 Quota: *{s['odds']}*\n"
         f"📊 Confidenza: *{s['confidence']}%* {stars}\n"
         f"💡 Value edge: *{vsign}*\n"
-        f"📌 Stake: *{s['stake']}/5*\n"
+        f"📌 Stake: *{s['stake']}/5* | 💹 Puntata: *{db.get_settings().get('stake_pct', 0.5)}% bankroll*\n"
         f"⏰ Inizio: *{s['kickoff']}*\n"
         f"🌍 Torneo: {s.get('tournament', default_tourn)}\n"
         f"🔗 Fonte: {src}\n"
@@ -122,19 +122,27 @@ def vip_signal_text(s: dict) -> str:
 def now_it_str() -> str:
     return datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
 
-def genera_grafico_bilancio() -> io.BytesIO | None:
-    """Genera un grafico PNG del bilancio nel tempo. Ritorna BytesIO o None."""
+def genera_grafico_bilancio(sport: str | None = None) -> io.BytesIO | None:
+    """Genera un grafico PNG del bilancio (in % di bankroll) nel tempo.
+    sport=None → totale su entrambi gli sport. Ritorna BytesIO o None."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
 
-        history = db.get_balance_history()
+        history = db.get_balance_history(sport=sport)
         if len(history) < 2:
             return None
+        # Bilancio cumulato ricalcolato sul sottoinsieme (sport) selezionato,
+        # non la colonna "balance" salvata (quella è sempre la cumulata globale).
+        running = 0.0
+        cum_balances = []
+        for r in history:
+            running += r["profit"]
+            cum_balances.append(running)
 
-        balances = [0.0] + [r["balance"] for r in history]
+        balances = [0.0] + cum_balances
         labels   = ["Start"] + [f"#{i+1}" for i in range(len(history))]
         colors   = ["#2ecc71" if b >= 0 else "#e74c3c" for b in balances[1:]]
 
@@ -155,7 +163,7 @@ def genera_grafico_bilancio() -> io.BytesIO | None:
             alpha=0.3, color="#e74c3c", label="Perdita"
         )
         ax1.axhline(0, color="white", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax1.set_ylabel("Profitto (€)", color="white")
+        ax1.set_ylabel("Bilancio (% bankroll)", color="white")
         ax1.tick_params(colors="white")
         ax1.spines[:].set_color("#444")
         ax1.set_xlim(0, len(balances) - 1)
@@ -165,7 +173,7 @@ def genera_grafico_bilancio() -> io.BytesIO | None:
         last_val = balances[-1]
         color_last = "#2ecc71" if last_val >= 0 else "#e74c3c"
         ax1.annotate(
-            f"€{last_val:+.0f}",
+            f"{last_val:+.2f}%",
             xy=(len(balances)-1, last_val),
             color=color_last, fontsize=12, fontweight="bold",
             xytext=(-40, 10), textcoords="offset points"
@@ -177,7 +185,7 @@ def genera_grafico_bilancio() -> io.BytesIO | None:
         bar_colors = ["#2ecc71" if p >= 0 else "#e74c3c" for p in profits]
         ax2.bar(range(len(profits)), profits, color=bar_colors, alpha=0.85, width=0.7)
         ax2.axhline(0, color="white", linewidth=0.8, linestyle="--", alpha=0.5)
-        ax2.set_ylabel("Profitto per bet (€)", color="white")
+        ax2.set_ylabel("Profitto per bet (% bankroll)", color="white")
         ax2.set_xlabel("Numero scommessa", color="white")
         ax2.tick_params(colors="white")
         ax2.spines[:].set_color("#444")
@@ -311,7 +319,11 @@ async def send_quota(fn):
     await fn(
         f"📡 *Quota API — per sport*\n{'━' * 26}\n\n{tennis_block}\n\n{pp_block}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📡 The Odds API", url="https://the-odds-api.com/account/"),
+             InlineKeyboardButton("📡 OddsPapi",     url="https://oddspapi.io/us/account")],
+            [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
+        ])
     )
 
 # ── /start e /menu ──────────────────────────────────────────────────────────────
@@ -409,11 +421,22 @@ async def send_signals_list(fn):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+def _fmt_balance_block(title: str, bal: dict) -> str:
+    if bal["total_bets"] == 0:
+        return f"{title}\n   Nessun risultato ancora registrato"
+    return (
+        f"{title}\n"
+        f"   Bilancio: *{bal['current_balance_pct']:+.2f}%* bankroll | "
+        f"ROI: *{bal['roi']:+.1f}%*\n"
+        f"   {bal['won']}V/{bal['lost']}P (Win {bal['winrate']}%) | "
+        f"Migliore: {bal['best_win_pct']:+.2f}% | Peggiore: {bal['worst_loss_pct']:+.2f}%"
+    )
+
 async def send_stats(fn):
     stats = db.get_stats()
-    bal   = db.get_balance_stats()
-    bal_str = f"€{bal['current_balance']:+.0f}" if bal["total_bets"] > 0 else "n/d"
-    roi_str = f"{bal['roi']:+.1f}%" if bal["total_bets"] > 0 else "n/d"
+    bal_tot = db.get_balance_stats()
+    bal_t   = db.get_balance_stats(sport="tennis")
+    bal_pp  = db.get_balance_stats(sport="tabletennis")
 
     kb = [
         [InlineKeyboardButton("📈 Grafico bilancio", callback_data="show_balance_chart")],
@@ -430,54 +453,89 @@ async def send_stats(fn):
         f"✅ Vinti: *{stats['won']}*\n"
         f"❌ Persi: *{stats['lost']}*\n"
         f"🏆 Win rate: *{stats['winrate']}%*\n\n"
-        f"💰 *Bilancio*\n"
+        f"💰 *Bilancio (in % di bankroll, stake {db.get_settings()['stake_pct']}%/segnale)*\n"
         f"{'━' * 22}\n"
-        f"💵 Bilancio attuale: *{bal_str}*\n"
-        f"📈 ROI: *{roi_str}*\n"
-        f"🏅 Migliore vincita: *€{bal['best_win']:+.0f}*\n"
-        f"📉 Peggiore perdita: *€{bal['worst_loss']:+.0f}*\n"
+        f"{_fmt_balance_block('📊 Totale (entrambi gli sport)', bal_tot)}\n\n"
+        f"{_fmt_balance_block('🎾 Tennis', bal_t)}\n\n"
+        f"{_fmt_balance_block('🏓 Ping Pong', bal_pp)}\n\n"
         f"🔄 Ultimo scan: *{stats['last_scan']}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-async def send_settings(fn):
-    s = db.get_settings()
+def _conf_label(conf: int) -> str:
     conf_desc = {55: "Bassa (55%)", 60: "Media (60%)", 65: "Media-Alta (65%)",
                  70: "Alta (70%)", 75: "Molto Alta (75%)", 80: "Massima (80%)"}
-    conf = s['min_confidence']
-    conf_label = conf_desc.get(conf, f"{conf}%")
-    conf_pp = s['min_confidence_pp']
-    conf_pp_label = conf_desc.get(conf_pp, f"{conf_pp}%")
+    return conf_desc.get(conf, f"{conf}%")
 
+# ── Impostazioni: schermata di scelta (sostituisce l'unica lista lunga con ──
+# 2 pagine separate, una per sport, più le voci davvero condivise qui sopra.
+async def send_settings(fn):
+    s = db.get_settings()
     sf = s.get("sport_filter", "both")
     sf_label = {"both": "🏓🎾 Entrambi", "tabletennis": "🏓 Solo Ping Pong", "tennis": "🎾 Solo Tennis"}.get(sf, "🏓🎾 Entrambi")
 
     kb = [
-        [InlineKeyboardButton(f"⏱ Scan tennis: ogni {s['scan_interval']}h", callback_data="pick_interval")],
-        [InlineKeyboardButton(f"🏓 Scan ping pong: ogni {s['pingpong_scan_interval']}h", callback_data="pick_interval_pp")],
+        [InlineKeyboardButton("🎾 Impostazioni Tennis",     callback_data="settings_tennis")],
+        [InlineKeyboardButton("🏓 Impostazioni Ping Pong",  callback_data="settings_pingpong")],
         [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
-        [InlineKeyboardButton(f"🎯 Confidenza tennis: {conf_label}", callback_data="pick_confidence")],
-        [InlineKeyboardButton(f"🏓 Confidenza ping pong: {conf_pp_label}", callback_data="pick_confidence_pp")],
-        [InlineKeyboardButton(f"🏅 Sport: {sf_label}", callback_data="pick_sport_filter")],
-        [InlineKeyboardButton(f"💶 Unità stake: €{int(s.get('unit_value', 10))}", callback_data="pick_unit_value")],
-        [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
-        [InlineKeyboardButton(f"📉 Cap edge tennis (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
-        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton(f"💹 Stake per segnale: {s['stake_pct']}% bankroll", callback_data="pick_stake_pct")],
+        [InlineKeyboardButton(f"🏅 Sport attivi: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
     ]
-    # Stima consumo crediti The Odds API + richieste OddsPapi (quota condivisa)
-    interval    = s["scan_interval"]
-    pp_interval = s["pingpong_scan_interval"]
-    scan_day    = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
-    credits_mo  = scan_day * 2 * 31  # ~2 crediti per scan
-    pp_scan_day = 15 // pp_interval + 1
-    pp_calls_mo = pp_scan_day * 4 * 31
     await fn(
         "⚙️ *Impostazioni*\n\n"
-        f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n"
-        f"🏓 _OddsPapi ping pong: ~{pp_calls_mo} req/mese su 250 disponibili (quota condivisa col fallback tennis)_\n\n"
+        "🎾/🏓 hanno pagine separate per scan e confidenza, specifiche per sport.\n"
+        "Le voci qui sotto sono condivise tra i due sport.\n\n"
+        "Tocca un'opzione per modificarla:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def send_settings_tennis(fn):
+    s = db.get_settings()
+    conf_label = _conf_label(s['min_confidence'])
+    interval   = s["scan_interval"]
+    scan_day   = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
+    credits_mo = scan_day * 2 * 31  # ~2 crediti per scan
+
+    kb = [
+        [InlineKeyboardButton(f"⏱ Scan: ogni {interval}h", callback_data="pick_interval")],
+        [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_label}", callback_data="pick_confidence")],
+        [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
+        [InlineKeyboardButton(f"📉 Cap edge (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
+        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
+    ]
+    await fn(
+        "🎾 *Impostazioni Tennis*\n"
+        f"{'━' * 22}\n\n"
+        f"📊 _Crediti The Odds API: ~{credits_mo} req/mese stimati su 500 disponibili_\n\n"
+        "Tocca un'opzione per modificarla:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def send_settings_pingpong(fn):
+    s = db.get_settings()
+    conf_pp_label = _conf_label(s['min_confidence_pp'])
+    pp_interval   = s["pingpong_scan_interval"]
+    pp_scan_day   = 15 // pp_interval + 1
+    pp_calls_mo   = pp_scan_day * 4 * 31
+
+    kb = [
+        [InlineKeyboardButton(f"⏱ Scan: ogni {pp_interval}h", callback_data="pick_interval_pp")],
+        [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_pp_label}", callback_data="pick_confidence_pp")],
+        [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
+        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
+    ]
+    await fn(
+        "🏓 *Impostazioni Ping Pong*\n"
+        f"{'━' * 22}\n\n"
+        f"📡 _OddsPapi: ~{pp_calls_mo} req/mese su 250 disponibili (quota condivisa col fallback tennis)_\n"
+        "ℹ️ Cap edge: fisso 15% (OddsPapi non ha mai un book sharp/Pinnacle per il ping pong)\n\n"
         "Tocca un'opzione per modificarla:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
@@ -530,10 +588,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Solo tennis → ignora ping pong\n"
             "• Solo ping pong → ignora tennis\n\n"
 
-            "💶 *Unità stake (€)*\n"
-            "Valore in € di 1 unità di stake.\n"
-            "Es. con €10: stake 3/5 = €30, stake 5/5 = €50.\n"
-            "Imposta in base al tuo bankroll.\n\n"
+            "💹 *Stake per segnale (% bankroll)*\n"
+            "% fissa del bankroll rischiata su ogni segnale (uguale per tutti, "
+            "il rating 1-5 resta solo informativo).\n"
+            "• 0.5% → conservativo ✅ _consigliato_\n"
+            "• 1% → medio\n"
+            "• 1.5% → più aggressivo\n"
+            "Bilancio e ROI sono sempre mostrati in %, mai in €.\n\n"
 
             "⏰ *Anticipo minimo kickoff*\n"
             "Scarta segnali troppo vicini all'inizio.\n"
@@ -564,6 +625,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             guida,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                # Link diretti ai siti delle due API usate — per controllare
+                # quota, fatturazione o rigenerare una chiave senza dover
+                # cercare l'URL a memoria.
+                [InlineKeyboardButton("📡 The Odds API", url="https://the-odds-api.com/account/"),
+                 InlineKeyboardButton("📡 OddsPapi",     url="https://oddspapi.io/us/account")],
                 [InlineKeyboardButton("⚙️ Vai alle impostazioni", callback_data="admin_settings")],
                 [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
             ])
@@ -667,8 +733,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if sig and result != "void":
             sport_label = sig.get("sport_label", "🏓")
-            bal = db.get_balance_stats()
-            bal_str = f"€{bal['current_balance']:+.0f}" if bal["total_bets"] > 0 else "n/d"
+            bal = db.get_balance_stats(sport=sig.get("sport"))
+            bal_str = f"{bal['current_balance_pct']:+.2f}% bankroll" if bal["total_bets"] > 0 else "n/d"
             await query.message.reply_text(
                 f"{emoji} *Risultato aggiornato*\n"
                 f"{'━' * 20}\n"
@@ -676,7 +742,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 {sig['pick']} @ {sig['odds']}\n"
                 f"📌 Stake: {sig['stake']}/5\n\n"
                 f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*\n\n"
-                f"💰 Bilancio: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*",
+                f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*",
                 parse_mode="Markdown"
             )
 
@@ -722,7 +788,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=(
                     f"📊 *Bilancio segnali*\n"
                     f"{'━'*20}\n"
-                    f"💵 Attuale: *€{bal['current_balance']:+.0f}*\n"
+                    f"💵 Attuale: *{bal['current_balance_pct']:+.2f}% bankroll*\n"
                     f"📈 ROI: *{bal['roi']:+.1f}%*\n"
                     f"✅ {bal['won']}V / ❌ {bal['lost']}P | "
                     f"Win%: *{bal['winrate']}%*"
@@ -744,7 +810,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Annulla",               callback_data="admin_stats")],
         ]
         await query.edit_message_text(
-            "⚠️ *Reset risultati*\n\nVengono azzerati vinti/persi. I segnali rimangono.",
+            "⚠️ *Reset risultati*\n\n"
+            "Vengono azzerati vinti/persi e il bilancio (ora in % bankroll). "
+            "I segnali rimangono.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -781,6 +849,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Impostazioni ─────────────────────────────────────────────────────────────
     elif data == "admin_settings":
         await send_settings(query.edit_message_text)
+
+    elif data == "settings_tennis":
+        await send_settings_tennis(query.edit_message_text)
+
+    elif data == "settings_pingpong":
+        await send_settings_pingpong(query.edit_message_text)
 
     elif data == "admin_quota":
         await send_quota(query.edit_message_text)
@@ -938,27 +1012,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_setting("sport_filter", val)
         await send_settings(query.edit_message_text)
 
-    # ── Scegli valore unità stake ─────────────────────────────────────────────
-    elif data == "pick_unit_value":
-        current = db.get_settings().get("unit_value", 10.0)
-        opts = [1, 2, 5, 10, 20, 25, 50, 100]
+    # ── Scegli stake per segnale (% di bankroll, flat — stesso valore per ──────
+    # ogni segnale indipendentemente dal rating 1-5, che resta solo
+    # un'indicazione di confidenza mostrata sul segnale)
+    elif data == "pick_stake_pct":
+        current = db.get_settings().get("stake_pct", 0.5)
+        opts = [0.5, 1.0, 1.5]
         kb = []
         for v in opts:
-            prefix = "✅ " if float(v) == current else ""
-            kb.append([InlineKeyboardButton(f"{prefix}€{v} per unità", callback_data=f"set_unit_{v}")])
+            prefix = "✅ " if v == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{v}% bankroll per segnale", callback_data=f"set_stakepct_{v}")])
         kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(
-            "💶 *Valore unità stake*\n\n"
-            "Ogni segnale ha uno stake da 1 a 5 unità.\n"
-            "Scegli quanto vale 1 unità in €:\n\n"
-            "_Es. €10 → stake 3 = €30 a rischio_",
+            "💹 *Stake per segnale (% bankroll)*\n\n"
+            "Ogni segnale rischia questa % fissa del tuo bankroll totale, "
+            "indipendentemente dal rating 1-5 (quello resta solo un'indicazione "
+            "di confidenza mostrata sul segnale).\n\n"
+            "_Es. bankroll €1000, stake 0.5% → €5 a segnale. "
+            "Bilancio e ROI sono sempre mostrati in % per restare indipendenti "
+            "dall'importo esatto del tuo bankroll._",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif data.startswith("set_unit_"):
-        val = float(data.replace("set_unit_", ""))
-        db.set_setting("unit_value", val)
+    elif data.startswith("set_stakepct_"):
+        val = float(data.replace("set_stakepct_", ""))
+        db.set_setting("stake_pct", val)
         await send_settings(query.edit_message_text)
 
 
@@ -1614,8 +1693,8 @@ async def run_auto_results(app: Application, sport: str = "both"):
             db.record_balance_entry(sig, result)
 
             emoji = "✅" if result == "won" else "❌"
-            bal_stats = db.get_balance_stats()
-            bal_str = f"€{bal_stats['current_balance']:+.0f}" if bal_stats["total_bets"] > 0 else "n/d"
+            bal_stats = db.get_balance_stats(sport=sig.get("sport"))
+            bal_str = f"{bal_stats['current_balance_pct']:+.2f}% bankroll" if bal_stats["total_bets"] > 0 else "n/d"
 
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -1626,7 +1705,7 @@ async def run_auto_results(app: Application, sport: str = "both"):
                     f"🎯 {sig['pick']} @ {sig['odds']}\n"
                     f"📌 Stake: {sig['stake']}/5\n\n"
                     f"{'✅ *VINTO!* 🎉' if result == 'won' else '❌ *Perso.*'}\n\n"
-                    f"💰 Bilancio attuale: *{bal_str}*\n"
+                    f"💰 Bilancio {sig.get('sport_label','')}: *{bal_str}*\n"
                     f"📊 W/L: {bal_stats['won']}V/{bal_stats['lost']}P | "
                     f"Win%: {bal_stats['winrate']}% | ROI: {bal_stats['roi']}%"
                 ),
@@ -1640,6 +1719,32 @@ async def run_auto_results(app: Application, sport: str = "both"):
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────────
+async def global_error_handler(update, context):
+    """Error handler di default per l'Application — prima NON ce n'era uno
+    ("No error handlers are registered, logging exception"), quindi un
+    crash in un bottone (es. edit_message_text su un testo identico a
+    quello già mostrato → BadRequest "Message is not modified", capitato
+    premendo "Impostazioni" quando il pannello era già aperto su quella
+    stessa schermata) veniva solo loggato e la richiesta finiva nel nulla
+    — il bottone sembrava non rispondere più, senza nessun avviso."""
+    err = context.error
+    from telegram.error import BadRequest
+    if isinstance(err, BadRequest) and "message is not modified" in str(err).lower():
+        # Contenuto già corretto, nulla da aggiornare — non è un errore reale.
+        logger.info("Edit ignorato (contenuto identico, nessuna modifica necessaria)")
+        return
+    logger.error(f"Errore non gestito: {err}", exc_info=err)
+    try:
+        if update and getattr(update, "effective_chat", None) and update.effective_chat.id == ADMIN_ID:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"⚠️ Si è verificato un errore interno: `{str(err)[:200]}`\nRiprova o torna a Home.",
+                parse_mode="Markdown",
+                reply_markup=PERSISTENT_KB,
+            )
+    except Exception:
+        pass
+
 def main():
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN non impostato!")
@@ -1654,6 +1759,7 @@ def main():
     app.add_handler(CommandHandler("menu",  menu))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kb_handler))
+    app.add_error_handler(global_error_handler)
 
     logger.info("🏓 Bot avviato")
     app.run_polling(drop_pending_updates=True)

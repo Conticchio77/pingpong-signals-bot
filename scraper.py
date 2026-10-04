@@ -178,6 +178,8 @@ class SignalScraper:
         # chiamate consecutive a OddsPapi, qualunque sia l'endpoint.
         self._oddspapi_min_interval = 0.8  # secondi
         self._last_oddspapi_call    = 0.0
+        self._oddspapi_lock         = asyncio.Lock()
+        self._all_markets_cache     = None  # lista completa /markets, scaricata una volta
 
     def _save_quota_snapshot(self, key_prefix: str, **fields):
         """Salva su DB l'ultima lettura nota della quota di un'API esterna
@@ -200,8 +202,6 @@ class SignalScraper:
                 self.db.set_setting(f"{key_prefix}_updated_at", _now_it().strftime("%Y-%m-%d %H:%M"))
             except Exception:
                 pass
-        self._oddspapi_lock         = asyncio.Lock()
-        self._all_markets_cache     = None  # lista completa /markets, scaricata una volta
 
     async def _throttle_oddspapi(self):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere."""

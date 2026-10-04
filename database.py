@@ -78,6 +78,21 @@ class Database:
             except Exception:
                 pass  # colonna già esistente
 
+        # Bilanci separati per sport: balance_history non aveva una colonna
+        # sport. La aggiungiamo e la ripopoliamo dal segnale collegato
+        # (sig_id → signals.sport) per le righe già esistenti.
+        try:
+            self.conn.execute("ALTER TABLE balance_history ADD COLUMN sport TEXT")
+            self.conn.commit()
+            self.conn.execute("""
+                UPDATE balance_history
+                SET sport = (SELECT sport FROM signals WHERE signals.id = balance_history.sig_id)
+                WHERE sport IS NULL
+            """)
+            self.conn.commit()
+        except Exception:
+            pass  # colonna già esistente
+
         defaults = {
             "scan_interval":    "3",
             "auto_send":        "0",
@@ -89,7 +104,8 @@ class Database:
             "min_confidence_pp": "60",
             "last_scan":        "mai",
             "sport_filter":     "both",
-            "unit_value":       "10",
+            "unit_value":       "10",   # legacy (€), non più usato per i calcoli dopo il passaggio a %
+            "stake_pct":        "0.5",  # % di bankroll puntata su ogni segnale (flat, non scalata su 1-5)
             "tt_sport_id":      "",
             "min_hours_before": "1.0",   # ore minime al kickoff
             "max_edge_no_sharp":"20.0",  # cap edge% senza Pinnacle
@@ -218,9 +234,14 @@ class Database:
         return cur.rowcount
 
     def reset_results(self):
-        """Azzera tutti i risultati (vinto/perso) senza cancellare i segnali."""
+        """Azzera tutti i risultati (vinto/perso) senza cancellare i segnali.
+        FIX: prima non svuotava balance_history — dopo il passaggio da stake
+        in € a stake in % di bankroll, i vecchi importi in € sarebbero
+        rimasti mescolati nella stessa tabella con i nuovi valori in %,
+        corrompendo bilancio/ROI. Il reset ora pulisce anche quello."""
         self.conn.execute("UPDATE signals SET result=NULL WHERE result IN ('won','lost')")
         self.conn.execute("UPDATE signals SET status='seen' WHERE status IN ('won','lost')")
+        self.conn.execute("DELETE FROM balance_history")
         self.conn.commit()
 
     def get_recent_signals(self, limit: int = 20) -> list[dict]:
@@ -239,6 +260,7 @@ class Database:
             "auto_send":        raw.get("auto_send", "0") == "1",
             "min_confidence":   int(raw.get("min_confidence", 60)),
             "min_confidence_pp": int(raw.get("min_confidence_pp", 60)),
+            "stake_pct":        float(raw.get("stake_pct", 0.5)),
             "last_scan":        raw.get("last_scan", "mai"),
             "sport_filter":     raw.get("sport_filter", "both"),
             "unit_value":       float(raw.get("unit_value", 10)),
@@ -331,71 +353,87 @@ class Database:
         ).fetchone()[0] > 0
 
     # ── Balance History ────────────────────────────────────────────────────────
-    def record_balance_entry(self, sig: dict, result: str, unit_value: float = None):
-        """Registra un'entry nel bilancio dopo un risultato."""
-        if unit_value is None:
-            unit_value = self.get_settings().get("unit_value", 10.0)
-        stake  = sig.get("stake", 1)
+    # FIX: passaggio da stake fisso in € (1-5 unità × unit_value) a stake
+    # flat in % di bankroll (stake_pct, uguale per ogni segnale indipendente
+    # dal rating 1-5, che resta solo un'indicazione di confidenza sul
+    # segnale). "profit" e "balance" ora sono in punti percentuali di
+    # bankroll, non più €. Aggiunta anche la colonna sport per poter
+    # calcolare bilanci separati per sport oltre al totale.
+    def record_balance_entry(self, sig: dict, result: str, stake_pct: float = None):
+        """Registra un'entry nel bilancio (in % di bankroll) dopo un risultato."""
+        if stake_pct is None:
+            stake_pct = self.get_settings().get("stake_pct", 0.5)
+        stake  = sig.get("stake", 1)  # rating 1-5, solo informativo, non incide più sul calcolo
         odds   = sig.get("odds", 1.0)
+        sport  = sig.get("sport", "tabletennis")
         if result == "won":
-            profit = round((odds - 1) * stake * unit_value, 2)
+            profit = round((odds - 1) * stake_pct, 4)
         else:
-            profit = round(-stake * unit_value, 2)
+            profit = round(-stake_pct, 4)
 
-        # Calcola balance corrente = somma di tutti i profit precedenti + questo
+        # Balance "globale" (tutti gli sport) — mantenuto per compatibilità
+        # col grafico storico complessivo.
         prev = self.conn.execute(
             "SELECT COALESCE(SUM(profit), 0) FROM balance_history"
         ).fetchone()[0]
-        balance = round(float(prev) + profit, 2)
+        balance = round(float(prev) + profit, 4)
 
         self.conn.execute(
             """INSERT INTO balance_history
-               (sig_id, match, pick, odds, stake, result, profit, balance, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (sig_id, match, pick, odds, stake, result, profit, balance, sport, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 sig.get("id"), sig.get("match",""), sig.get("pick",""),
-                odds, stake, result, profit, balance,
+                odds, stake, result, profit, balance, sport,
                 datetime.utcnow().isoformat()
             )
         )
         self.conn.commit()
 
-    def get_balance_history(self, limit: int = 50) -> list[dict]:
-        """Ultimi N risultati per il grafico bilancio."""
-        rows = self.conn.execute(
-            "SELECT * FROM balance_history ORDER BY id ASC"
-        ).fetchall()
+    def get_balance_history(self, limit: int = 50, sport: str | None = None) -> list[dict]:
+        """Risultati per il grafico bilancio. sport=None → tutti gli sport insieme."""
+        if sport:
+            rows = self.conn.execute(
+                "SELECT * FROM balance_history WHERE sport=? ORDER BY id ASC", (sport,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM balance_history ORDER BY id ASC"
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_balance_stats(self, unit_value: float = None) -> dict:
-        """Statistiche complete per il pannello bilancio."""
-        if unit_value is None:
-            unit_value = self.get_settings().get("unit_value", 10.0)
-        rows = self.get_balance_history()
+    def get_balance_stats(self, stake_pct: float = None, sport: str | None = None) -> dict:
+        """Statistiche bilancio in % di bankroll. sport=None → totale su
+        entrambi gli sport; sport="tennis"/"tabletennis" → solo quello."""
+        if stake_pct is None:
+            stake_pct = self.get_settings().get("stake_pct", 0.5)
+        rows = self.get_balance_history(sport=sport)
         if not rows:
             return {
                 "total_bets": 0, "won": 0, "lost": 0,
-                "winrate": 0, "profit": 0.0, "roi": 0.0,
-                "best_win": 0.0, "worst_loss": 0.0,
-                "current_balance": 0.0, "unit_value": unit_value,
+                "winrate": 0, "profit_pct": 0.0, "roi": 0.0,
+                "best_win_pct": 0.0, "worst_loss_pct": 0.0,
+                "current_balance_pct": 0.0, "stake_pct": stake_pct,
             }
         won   = sum(1 for r in rows if r["result"] == "won")
         lost  = sum(1 for r in rows if r["result"] == "lost")
         total = won + lost
-        profit = sum(r["profit"] for r in rows)
-        total_staked = sum(r["stake"] * unit_value for r in rows)
-        roi = round(profit / total_staked * 100, 1) if total_staked else 0
+        profit_pct = sum(r["profit"] for r in rows)
+        total_staked_pct = total * stake_pct  # stake flat: n° giocate × stake_pct
+        roi = round(profit_pct / total_staked_pct * 100, 1) if total_staked_pct else 0
         return {
-            "total_bets":       total,
-            "won":              won,
-            "lost":             lost,
-            "winrate":          round(won / total * 100, 1) if total else 0,
-            "profit":           round(profit, 2),
-            "roi":              roi,
-            "best_win":         round(max((r["profit"] for r in rows if r["result"]=="won"), default=0), 2),
-            "worst_loss":       round(min((r["profit"] for r in rows if r["result"]=="lost"), default=0), 2),
-            "current_balance":  round(rows[-1]["balance"] if rows else 0, 2),
-            "unit_value":       unit_value,
+            "total_bets":           total,
+            "won":                  won,
+            "lost":                 lost,
+            "winrate":              round(won / total * 100, 1) if total else 0,
+            "profit_pct":           round(profit_pct, 2),
+            "roi":                  roi,
+            "best_win_pct":         round(max((r["profit"] for r in rows if r["result"]=="won"), default=0), 2),
+            "worst_loss_pct":       round(min((r["profit"] for r in rows if r["result"]=="lost"), default=0), 2),
+            # Somma cumulativa ricalcolata sul sottoinsieme filtrato (non la
+            # colonna "balance", che è sempre la cumulata GLOBALE).
+            "current_balance_pct":  round(sum(r["profit"] for r in rows), 2),
+            "stake_pct":            stake_pct,
         }
 
     def purge_all_signals(self) -> int:
