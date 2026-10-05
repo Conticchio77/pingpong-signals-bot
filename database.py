@@ -106,6 +106,9 @@ class Database:
             "sport_filter":     "both",
             "unit_value":       "10",   # legacy (€), non più usato per i calcoli dopo il passaggio a %
             "stake_pct":        "0.5",  # % di bankroll puntata su ogni segnale (flat, non scalata su 1-5)
+            # Destinazione invii, separata per sport: "vip" / "free" / "both"
+            "send_dest_tennis":   "vip",
+            "send_dest_pingpong": "vip",
             "tt_sport_id":      "",
             "min_hours_before": "1.0",   # ore minime al kickoff
             "max_edge_no_sharp":"20.0",  # cap edge% senza Pinnacle
@@ -261,6 +264,8 @@ class Database:
             "min_confidence":   int(raw.get("min_confidence", 60)),
             "min_confidence_pp": int(raw.get("min_confidence_pp", 60)),
             "stake_pct":        float(raw.get("stake_pct", 0.5)),
+            "send_dest_tennis":   raw.get("send_dest_tennis", "vip"),
+            "send_dest_pingpong": raw.get("send_dest_pingpong", "vip"),
             "last_scan":        raw.get("last_scan", "mai"),
             "sport_filter":     raw.get("sport_filter", "both"),
             "unit_value":       float(raw.get("unit_value", 10)),

@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 ROME         = ZoneInfo("Europe/Rome")
 TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
-VIP_GROUP_ID = int(os.environ.get("VIP_GROUP_ID", "-1002950341972"))
+VIP_GROUP_ID  = int(os.environ.get("VIP_GROUP_ID",  "-1002950341972"))
+FREE_GROUP_ID = int(os.environ.get("FREE_GROUP_ID", "-1002520876408"))
 ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
 # ── Relay verso il bot "Segnali dal Futuro" (inoltro privato filtrato per utente) ──
@@ -56,6 +57,35 @@ async def relay_to_private(text: str, category: str = "ping_signal"):
                 logger.info(f"Relay privato ok: {resp.json()}")
     except Exception as e:
         logger.warning(f"Relay privato: errore di connessione: {e}")
+
+def _dest_label(sport: str) -> str:
+    settings = db.get_settings()
+    key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
+    return {"vip": "VIP", "free": "Free", "both": "VIP+Free"}.get(settings.get(key, "vip"), "VIP")
+
+def _dest_group_ids(sport: str) -> list[int]:
+    """Gruppi a cui inviare, in base alla destinazione scelta per quello
+    sport (vip/free/both) nelle impostazioni — vedi send_dest_tennis /
+    send_dest_pingpong."""
+    settings = db.get_settings()
+    key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
+    dest = settings.get(key, "vip")
+    if dest == "free":
+        return [FREE_GROUP_ID]
+    if dest == "both":
+        return [VIP_GROUP_ID, FREE_GROUP_ID]
+    return [VIP_GROUP_ID]
+
+async def send_signal_to_groups(bot, sig: dict, text: str):
+    """Invia il testo a tutti i gruppi configurati per lo sport del segnale
+    (VIP/Free/entrambi) più il relay privato. Sostituisce l'invio fisso al
+    solo VIP_GROUP_ID."""
+    for gid in _dest_group_ids(sig.get("sport", "tabletennis")):
+        try:
+            await bot.send_message(chat_id=gid, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Invio segnale al gruppo {gid} fallito: {e}")
+    await relay_to_private(text)
 
 db       = Database()
 scraper  = SignalScraper(db=db)
@@ -500,12 +530,14 @@ async def send_settings_tennis(fn):
     scan_day   = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
     credits_mo = scan_day * 2 * 31  # ~2 crediti per scan
 
+    dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_tennis"], "📤 VIP")
     kb = [
         [InlineKeyboardButton(f"⏱ Scan: ogni {interval}h", callback_data="pick_interval")],
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"📉 Cap edge (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
         [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_tennis")],
         [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
     ]
     await fn(
@@ -524,11 +556,13 @@ async def send_settings_pingpong(fn):
     pp_scan_day   = 15 // pp_interval + 1
     pp_calls_mo   = pp_scan_day * 4 * 31
 
+    dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_pingpong"], "📤 VIP")
     kb = [
         [InlineKeyboardButton(f"⏱ Scan: ogni {pp_interval}h", callback_data="pick_interval_pp")],
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_pp_label}", callback_data="pick_confidence_pp")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_pingpong")],
         [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
     ]
     await fn(
@@ -665,7 +699,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = []
         if s["status"] not in ("won", "lost", "sent"):
             kb.append([
-                InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
+                InlineKeyboardButton(f"📤 Invia ({_dest_label(s.get('sport'))}) ✅", callback_data=f"send_vip_{sig_id}"),
                 InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
             ])
         kb.append([
@@ -684,10 +718,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Segnale non trovato.")
             return
         try:
-            await context.application.bot.send_message(
-                chat_id=VIP_GROUP_ID, text=vip_signal_text(s), parse_mode="Markdown"
-            )
-            await relay_to_private(vip_signal_text(s))
+            await send_signal_to_groups(context.application.bot, s, vip_signal_text(s))
             db.update_signal_status(sig_id, "sent")
             kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
                    InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
@@ -1039,6 +1070,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = float(data.replace("set_stakepct_", ""))
         db.set_setting("stake_pct", val)
         await send_settings(query.edit_message_text)
+
+    # ── Destinazione invii (VIP/Free/Entrambi), separata per sport ─────────────
+    elif data in ("pick_dest_tennis", "pick_dest_pingpong"):
+        sport_key = "send_dest_tennis" if data == "pick_dest_tennis" else "send_dest_pingpong"
+        back_cb   = "settings_tennis" if data == "pick_dest_tennis" else "settings_pingpong"
+        current = db.get_settings()[sport_key]
+        opts = [("vip", "📤 Solo VIP"), ("free", "🆓 Solo Free"), ("both", "📤🆓 Entrambi")]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if val == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_{sport_key}_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Indietro", callback_data=back_cb)])
+        sport_name = "Tennis" if data == "pick_dest_tennis" else "Ping Pong"
+        await query.edit_message_text(
+            f"📨 *Destinazione invii — {sport_name}*\n\n"
+            "Dove inviare i segnali (e i risultati Vinto/Perso collegati) "
+            "per questo sport:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_send_dest_tennis_"):
+        val = data.replace("set_send_dest_tennis_", "")
+        db.set_setting("send_dest_tennis", val)
+        await send_settings_tennis(query.edit_message_text)
+
+    elif data.startswith("set_send_dest_pingpong_"):
+        val = data.replace("set_send_dest_pingpong_", "")
+        db.set_setting("send_dest_pingpong", val)
+        await send_settings_pingpong(query.edit_message_text)
 
 
     # ── Anticipo minimo kickoff ───────────────────────────────────────────────
@@ -1444,7 +1505,7 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
 
                 sport_label = sig.get("sport_label", "🏓 Ping Pong")
                 kb = [[
-                    InlineKeyboardButton("📤 Invia al VIP ✅", callback_data=f"send_vip_{sig_id}"),
+                    InlineKeyboardButton(f"📤 Invia ({_dest_label(sig.get('sport'))}) ✅", callback_data=f"send_vip_{sig_id}"),
                     InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
                 ],[
                     InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
@@ -1459,16 +1520,29 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
                 if settings["auto_send"]:
-                    await app.bot.send_message(
-                        chat_id=VIP_GROUP_ID, text=vip_signal_text(sig), parse_mode="Markdown"
-                    )
-                    await relay_to_private(vip_signal_text(sig))
+                    await send_signal_to_groups(app.bot, sig, vip_signal_text(sig))
                     db.update_signal_status(sig_id, "sent")
 
         except Exception as e:
             logger.error(f"Errore analisi {match.get('name','?')}: {e}")
 
     logger.info(f"✅ {new_signals} nuovi segnali")
+
+    # Ping leggero solo per gli scan AUTOMATICI (cron) a 0 segnali: prima
+    # restavano silenziosi se non trovavano nulla, e non c'era modo di
+    # distinguere "il bot non gira più" da "ha girato, nessun segnale
+    # valido". Lo scan manuale non ne ha bisogno: il bottone "Scan" mostra
+    # già il risultato in chat.
+    if not manual and new_signals == 0:
+        sport_ping_label = "🏓 Ping Pong" if sport_override == "tabletennis" else "🎾 Tennis"
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"✅ Scan concluso ({sport_ping_label}): 0 segnali",
+            )
+        except Exception as e:
+            logger.debug(f"Impossibile inviare ping scan-vuoto: {e}")
+
     return new_signals
 
 # ── Auto-aggiornamento risultati ─────────────────────────────────────────────────
