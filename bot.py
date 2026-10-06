@@ -13,7 +13,7 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from scraper import SignalScraper, result_due
+from scraper import SignalScraper, result_due, pingpong_scan_hours
 from ai_analyzer import AIAnalyzer
 from database import Database
 
@@ -329,34 +329,68 @@ async def _live_oddsapi_quota():
         return None
 
 
+def _find_key(obj, names):
+    """Cerca ricorsivamente la prima chiave (case-insensitive) tra `names` in dict/list annidati."""
+    names = {n.lower() for n in names}
+    stack = [obj]
+    while stack:
+        cur = stack.pop(0)
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if str(k).lower() in names and isinstance(v, (int, float, str)) and v != "":
+                    return v
+            stack.extend(v for v in cur.values() if isinstance(v, (dict, list)))
+        elif isinstance(cur, list):
+            stack.extend(x for x in cur if isinstance(x, (dict, list)))
+    return None
+
+
 async def _live_oddspapi_quota():
-    """OddsPapi: GET /v4/account è sempre accessibile e non consuma richieste.
-    Ritorna dict con request_count, request_limit, valid_until (o None)."""
+    """OddsPapi: legge l'uso reale dell'account (stessi numeri della dashboard,
+    es. 85/250). Prova più endpoint e più nomi di campo, e logga la risposta
+    grezza se non riesce a interpretarla, così il formato reale è visibile nei log.
+    Ritorna dict con count, limit, valid_until (o None)."""
     key = os.environ.get("ODDSPAPI_KEY", "")
     if not key:
+        logger.warning("Quota live OddsPapi: ODDSPAPI_KEY non impostata")
         return None
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://api.oddspapi.io/v4/account", params={"apiKey": key})
-        if r.status_code != 200:
-            logger.warning(f"Quota live OddsPapi: HTTP {r.status_code}")
-            return None
-        data = r.json()
-        subs = data.get("subscriptions") or []
-        cur_id = data.get("current_subscription_id")
-        sub = next((x for x in subs if x.get("subscription_id") == cur_id), None) \
-              or next((x for x in subs if x.get("is_active")), None) \
-              or (subs[0] if subs else None)
-        if not sub:
-            return None
-        return {
-            "count":       sub.get("request_count"),
-            "limit":       sub.get("request_limit"),
-            "valid_until": sub.get("valid_until"),
-        }
-    except Exception as e:
-        logger.warning(f"Quota live OddsPapi fallita: {e}")
-        return None
+    count_names = {"request_count", "requests_count", "requests_used", "request_used", "used", "usage", "count"}
+    limit_names = {"request_limit", "requests_limit", "limit", "quota", "max_requests"}
+    until_names = {"valid_until", "validuntil", "expires_at"}
+    for path in ("/v4/account", "/v4/account/usage", "/v4/usage"):
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"https://api.oddspapi.io{path}", params={"apiKey": key})
+            if r.status_code != 200:
+                logger.warning(f"Quota live OddsPapi {path}: HTTP {r.status_code} — {r.text[:200]}")
+                continue
+            data = r.json()
+            sub = data
+            if isinstance(data, dict) and isinstance(data.get("subscriptions"), list) and data["subscriptions"]:
+                subs = data["subscriptions"]
+                cur_id = data.get("current_subscription_id")
+                sub = next((x for x in subs if x.get("subscription_id") == cur_id), None) \
+                      or next((x for x in subs if x.get("is_active")), None) \
+                      or subs[0]
+            cnt = _find_key(sub, count_names)
+            lim = _find_key(sub, limit_names)
+            if lim is None:
+                logger.warning(f"Quota live OddsPapi {path}: formato non riconosciuto — {str(data)[:400]}")
+                continue
+            try:
+                cnt = int(float(cnt)) if cnt is not None else None
+                lim = int(float(lim))
+            except (TypeError, ValueError):
+                logger.warning(f"Quota live OddsPapi {path}: valori non numerici — {str(data)[:400]}")
+                continue
+            until = _find_key(sub, until_names)
+            db.set_setting("quota_oddspapi_count", cnt if cnt is not None else "")
+            db.set_setting("quota_oddspapi_limit", lim)
+            db.set_setting("quota_oddspapi_updated_at", datetime.datetime.now(ROME).strftime("%d/%m %H:%M"))
+            return {"count": cnt, "limit": lim, "valid_until": until}
+        except Exception as e:
+            logger.warning(f"Quota live OddsPapi {path} fallita: {e}")
+    return None
 
 
 async def send_quota(fn):
@@ -410,9 +444,12 @@ async def send_quota(fn):
         )
     else:
         pp_upd = get("quota_oddspapi_updated_at")
+        s_cnt, s_lim = get("quota_oddspapi_count"), get("quota_oddspapi_limit")
+        saved = f"   Ultimo dato salvato: *{s_cnt}* / *{s_lim}*\n" if (s_cnt and s_lim) else ""
         pp_block = (
             f"🏓 *Ping Pong* (OddsPapi) — ⚪ lettura live non riuscita\n"
-            f"   Chiamate nostre questo mese: *{pp_ours}*\n"
+            f"{saved}"
+            f"   Chiamate fatte dal bot questo mese: *{pp_ours}*\n"
             f"   Ultimo aggiornamento: {pp_upd or '—'}"
         )
 
@@ -1295,11 +1332,11 @@ def _restart_pingpong_scheduler(app: Application, hours: int):
         from apscheduler.triggers.cron import CronTrigger
         _scheduler.add_job(
             lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-            trigger=CronTrigger(hour=_daytime_hours(hours), minute=0, timezone=ROME),
+            trigger=CronTrigger(hour=",".join(map(str, pingpong_scan_hours(hours))), minute=0, timezone=ROME),
             id="pingpong_scan",
             replace_existing=True,
         )
-        logger.info(f"⏰ Scheduler ping pong aggiornato: 07-22h ogni {hours}h ({_daytime_hours(hours)})")
+        logger.info(f"⏰ Scheduler ping pong aggiornato: ore {pingpong_scan_hours(hours)}")
 
 def _daytime_hours(interval: int, start: int = 7, end: int = 22) -> str:
     """Genera la lista di ore (per CronTrigger) da "start" a "end" distanziate
@@ -1362,7 +1399,7 @@ async def post_init(app: Application):
     # ore, configurabile dal pannello come per il tennis (era fisso solo 07:00).
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: run_pingpong_scan(app)),
-        trigger=CronTrigger(hour=_daytime_hours(pp_hours), minute=0, timezone=ROME),
+        trigger=CronTrigger(hour=",".join(map(str, pingpong_scan_hours(pp_hours))), minute=0, timezone=ROME),
         id="pingpong_scan",
     )
 

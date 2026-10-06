@@ -48,7 +48,8 @@ MIN_ODDS             = 1.40   # quota minima accettata
 MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
 MIN_HOURS_BEFORE     = 1.0    # default ore minime al kickoff
-SAME_DAY_ONLY        = True   # default: scarta segnali su partite non del giorno stesso
+SAME_DAY_ONLY        = False  # default: NON limitare al giorno solare (vedi MAX_HOURS_AHEAD)
+MAX_HOURS_AHEAD      = 18.0   # scarta partite oltre N ore da adesso (copre lo scan serale per i match asiatici del mattino dopo)
 MAX_EDGE_NO_SHARP    = 20.0   # default cap edge% senza Pinnacle
 MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senza sharp)
 
@@ -79,6 +80,7 @@ class AIAnalyzer:
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
         same_day_only = bool(settings.get("same_day_only", SAME_DAY_ONLY))
+        max_hours_ahead = float(settings.get("max_hours_ahead", MAX_HOURS_AHEAD))
         min_value    = float(settings.get("min_value_pct", MIN_VALUE_PCT)) / 100
         # Cap edge senza Pinnacle: più basso per ping pong (de-vig meno affidabile senza sharp)
         if sport == "tabletennis":
@@ -114,6 +116,12 @@ class AIAnalyzer:
                 # partite dello stesso giorno solare (confronto per data, non
                 # per ore, quindi niente segnali anche solo per un match delle
                 # 00:30 di domani trovato in uno scan serale).
+                if hours_to_ko > max_hours_ahead:
+                    logger.info(
+                        f"Segnale scartato (kickoff tra {hours_to_ko:.1f}h > max {max_hours_ahead:.0f}h): "
+                        f"{match.get('name','?')} — {kickoff_str}"
+                    )
+                    return []
                 if same_day_only and ko.date() != now_it.date():
                     logger.info(
                         f"Segnale scartato (kickoff {ko.date()} non è oggi {now_it.date()}): "
