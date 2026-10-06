@@ -96,7 +96,7 @@ PERSISTENT_KB = ReplyKeyboardMarkup(
     [
         ["🔍 Scan",  "📋 Segnali"],
         ["📊 Stats", "⚙️ Impostazioni"],
-        ["🏠 Home"],
+        ["📡 Quota", "🏠 Home"],
     ],
     resize_keyboard=True,
 )
@@ -308,48 +308,119 @@ def admin_panel_kb():
         [InlineKeyboardButton("📡 Quota API",         callback_data="admin_quota")],
     ])
 
-async def send_quota(fn):
-    """Mostra, separatamente per sport, l'ultima lettura nota della quota
-    delle due API esterne. Legge solo valori già salvati da scraper.py ad
-    ogni chiamata reale — non fa nessuna chiamata live apposta (costerebbe
-    quota per controllare la quota)."""
-    get = db.get_setting
+async def _live_oddsapi_quota():
+    """The Odds API: /v4/sports è GRATUITO (non consuma crediti) e restituisce
+    negli header x-requests-used / x-requests-remaining del TUO account.
+    Ritorna (used, remaining) come int, oppure None se non disponibile."""
+    key = os.environ.get("ODDS_API_KEY", "")
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://api.the-odds-api.com/v4/sports/", params={"apiKey": key})
+        used = r.headers.get("x-requests-used")
+        rem  = r.headers.get("x-requests-remaining")
+        if used is None and rem is None:
+            return None
+        return (int(float(used)) if used is not None else None,
+                int(float(rem))  if rem  is not None else None)
+    except Exception as e:
+        logger.warning(f"Quota live The Odds API fallita: {e}")
+        return None
 
-    # 🎾 Tennis — The Odds API riporta used/remaining assoluti negli header
-    t_used = get("quota_oddsapi_tennis_used")
-    t_rem  = get("quota_oddsapi_tennis_remaining")
-    t_upd  = get("quota_oddsapi_tennis_updated_at")
-    if t_used is not None or t_rem is not None:
-        t_used_i = int(t_used) if t_used and t_used.isdigit() else None
-        t_rem_i  = int(t_rem)  if t_rem  and t_rem.isdigit()  else None
-        t_tot = f"{t_used_i + t_rem_i}" if (t_used_i is not None and t_rem_i is not None) else "?"
+
+async def _live_oddspapi_quota():
+    """OddsPapi: GET /v4/account è sempre accessibile e non consuma richieste.
+    Ritorna dict con request_count, request_limit, valid_until (o None)."""
+    key = os.environ.get("ODDSPAPI_KEY", "")
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://api.oddspapi.io/v4/account", params={"apiKey": key})
+        if r.status_code != 200:
+            logger.warning(f"Quota live OddsPapi: HTTP {r.status_code}")
+            return None
+        data = r.json()
+        subs = data.get("subscriptions") or []
+        cur_id = data.get("current_subscription_id")
+        sub = next((x for x in subs if x.get("subscription_id") == cur_id), None) \
+              or next((x for x in subs if x.get("is_active")), None) \
+              or (subs[0] if subs else None)
+        if not sub:
+            return None
+        return {
+            "count":       sub.get("request_count"),
+            "limit":       sub.get("request_limit"),
+            "valid_until": sub.get("valid_until"),
+        }
+    except Exception as e:
+        logger.warning(f"Quota live OddsPapi fallita: {e}")
+        return None
+
+
+async def send_quota(fn):
+    """Quota API LIVE dai tuoi account: legge i dati reali con le tue chiavi
+    (ODDS_API_KEY / ODDSPAPI_KEY) usando endpoint gratuiti che non consumano
+    crediti. Se la lettura live fallisce, ripiega sull'ultimo valore salvato."""
+    get = db.get_setting
+    now = datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
+
+    live_t, live_p = await asyncio.gather(_live_oddsapi_quota(), _live_oddspapi_quota())
+
+    # 🎾 Tennis — The Odds API
+    if live_t is not None:
+        used, rem = live_t
+        tot = (used + rem) if (used is not None and rem is not None) else None
         tennis_block = (
-            f"🎾 *Tennis* (The Odds API)\n"
-            f"   Usate: *{t_used or '?'}* / Totale: *{t_tot}*\n"
-            f"   Rimaste: *{t_rem or '?'}*\n"
-            f"   Ultimo aggiornamento: {t_upd or '—'}"
+            f"🎾 *Tennis* (The Odds API) — 🟢 live\n"
+            f"   Usate: *{used if used is not None else '?'}* / Totale: *{tot if tot is not None else '?'}*\n"
+            f"   Rimaste: *{rem if rem is not None else '?'}*\n"
+            f"   Aggiornato: {now}"
         )
     else:
-        tennis_block = "🎾 *Tennis* (The Odds API)\n   Nessun dato ancora — fai almeno uno scan."
+        t_used = get("quota_oddsapi_tennis_used")
+        t_rem  = get("quota_oddsapi_tennis_remaining")
+        t_upd  = get("quota_oddsapi_tennis_updated_at")
+        if t_used is not None or t_rem is not None:
+            t_used_i = int(t_used) if t_used and t_used.isdigit() else None
+            t_rem_i  = int(t_rem)  if t_rem  and t_rem.isdigit()  else None
+            t_tot = f"{t_used_i + t_rem_i}" if (t_used_i is not None and t_rem_i is not None) else "?"
+            tennis_block = (
+                f"🎾 *Tennis* (The Odds API) — ⚪ ultimo dato salvato\n"
+                f"   Usate: *{t_used or '?'}* / Totale: *{t_tot}*\n"
+                f"   Rimaste: *{t_rem or '?'}*\n"
+                f"   Ultimo aggiornamento: {t_upd or '—'}"
+            )
+        else:
+            tennis_block = "🎾 *Tennis* (The Odds API)\n   Nessun dato (chiave ODDS_API_KEY mancante o API non raggiungibile)."
 
-    # 🏓 Ping Pong — OddsPapi: header "remaining" (significato non documentato
-    # con certezza da OddsPapi — potrebbe essere per-minuto, non mensile) +
-    # un contatore mensile nostro, sempre affidabile, su 250/mese (piano).
-    pp_rem    = get("quota_oddspapi_remaining")
-    pp_upd    = get("quota_oddspapi_updated_at")
-    pp_ours   = db.get_api_calls_this_month("oddspapi")
-    pp_block = (
-        f"🏓 *Ping Pong* (OddsPapi)\n"
-        f"   Chiamate nostre questo mese: *{pp_ours}* / *250* (piano)\n"
-        f"   Rimaste restituite dall'header API: *{pp_rem or '?'}* "
-        f"(nota: significato non garantito — potrebbe non essere mensile)\n"
-        f"   Ultimo aggiornamento: {pp_upd or '—'}"
-    )
+    # 🏓 Ping Pong — OddsPapi
+    pp_ours = db.get_api_calls_this_month("oddspapi")
+    if live_p is not None and live_p.get("limit") is not None:
+        cnt, lim = live_p.get("count"), live_p["limit"]
+        rem = (lim - cnt) if isinstance(cnt, (int, float)) else None
+        vu  = (live_p.get("valid_until") or "")[:10]
+        pp_block = (
+            f"🏓 *Ping Pong* (OddsPapi) — 🟢 live\n"
+            f"   Usate: *{cnt if cnt is not None else '?'}* / Totale: *{lim}*\n"
+            f"   Rimaste: *{rem if rem is not None else '?'}*\n"
+            + (f"   Valido fino al: {vu}\n" if vu else "")
+            + f"   Aggiornato: {now}"
+        )
+    else:
+        pp_upd = get("quota_oddspapi_updated_at")
+        pp_block = (
+            f"🏓 *Ping Pong* (OddsPapi) — ⚪ lettura live non riuscita\n"
+            f"   Chiamate nostre questo mese: *{pp_ours}*\n"
+            f"   Ultimo aggiornamento: {pp_upd or '—'}"
+        )
 
     await fn(
-        f"📡 *Quota API — per sport*\n{'━' * 26}\n\n{tennis_block}\n\n{pp_block}",
+        f"📡 *Quota API — dai tuoi account*\n{'━' * 26}\n\n{tennis_block}\n\n{pp_block}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Aggiorna", callback_data="admin_quota")],
             [InlineKeyboardButton("📡 The Odds API", url="https://the-odds-api.com/account/"),
              InlineKeyboardButton("📡 OddsPapi",     url="https://oddspapi.io/us/account")],
             [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
@@ -414,6 +485,9 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif txt == "⚙️ Impostazioni":
         await send_settings(update.message.reply_text)
+
+    elif txt == "📡 Quota":
+        await send_quota(update.message.reply_text)
 
     elif txt == "🏠 Home":
         await update.message.reply_text(
