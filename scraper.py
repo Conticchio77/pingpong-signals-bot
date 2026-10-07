@@ -54,6 +54,33 @@ def _iso_to_it(iso: str) -> str:
     except Exception:
         return _now_it().strftime("%d/%m %H:%M")
 
+def pingpong_scan_hours(interval_h: int) -> list:
+    """Ore (Europe/Rome) in cui gira lo scan ping pong. Con intervallo 12h
+    (2 scan/giorno) NON si usa 07+19: lo scan delle 19:00 copriva la notte, quando
+    si dorme. Si usano invece 07:00 e 14:00, così le partite scelte cadono
+    tra le 08:15 e le 22:00. Altri intervalli: 07..22 ogni N ore come prima."""
+    if interval_h == 12:
+        return [7, 14]
+    if interval_h <= 0:
+        interval_h = 24
+    hours, h = [], 7
+    while h <= 22:
+        hours.append(h)
+        h += interval_h
+    return hours
+
+
+def _pingpong_window_end(now: datetime, min_start: datetime, interval_h: int) -> datetime:
+    """Fine della finestra di scelta: il prossimo scan utile (almeno 30 min dopo
+    min_start), altrimenti le 22:00 — mai oltre, così non si pescano partite notturne."""
+    day_end = now.replace(hour=22, minute=0, second=0, microsecond=0)
+    for h in pingpong_scan_hours(interval_h):
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t > now and t >= min_start + timedelta(minutes=30):
+            return min(t, day_end)
+    return day_end
+
+
 def _pingpong_fixtures_per_scan(pp_interval_h: int) -> int:
     """Quante fixture controllare per scan ping pong, in base a quanti scan
     girano al giorno (stessa formula "scans_day" usata nel picker di bot.py:
@@ -754,7 +781,7 @@ class SignalScraper:
                             pp_interval_h = self.db.get_settings().get("pingpong_scan_interval", 24)
                         except Exception:
                             pass
-                    window_end = now + timedelta(hours=pp_interval_h)
+                    window_end = _pingpong_window_end(now, min_start, pp_interval_h)
                     n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
                     fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, n_fixtures), _sort_key, n_fixtures, min_start, window_end)
                     logger.info(
