@@ -71,6 +71,9 @@ class Database:
             ("source",      "TEXT DEFAULT 'n/d'"),
             ("sport",       "TEXT DEFAULT 'tabletennis'"),
             ("sport_label", "TEXT DEFAULT '🏓 Ping Pong'"),
+            ("sent_to_vip",     "INTEGER DEFAULT 0"),   # inviato al gruppo VIP
+            ("sent_to_free",    "INTEGER DEFAULT 0"),   # inviato al gruppo FREE
+            ("result_reminded", "INTEGER DEFAULT 0"),   # promemoria "risultato mancante" già mandato
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {definition}")
@@ -169,6 +172,26 @@ class Database:
         )
         self.conn.commit()
 
+    def mark_signal_sent(self, sig_id: int, vip: bool, free: bool):
+        """Segna il segnale come inviato e ricorda A QUALE gruppo (VIP/FREE).
+        Non declassa uno stato won/lost già assegnato."""
+        self.conn.execute(
+            """UPDATE signals
+               SET status = CASE WHEN status IN ('won','lost') THEN status ELSE 'sent' END,
+                   sent_to_vip  = MAX(COALESCE(sent_to_vip, 0),  ?),
+                   sent_to_free = MAX(COALESCE(sent_to_free, 0), ?)
+               WHERE id = ?""",
+            (1 if vip else 0, 1 if free else 0, sig_id)
+        )
+        self.conn.commit()
+
+    def mark_result_reminded(self, sig_ids: list):
+        if not sig_ids:
+            return
+        marks = ",".join("?" * len(sig_ids))
+        self.conn.execute(f"UPDATE signals SET result_reminded=1 WHERE id IN ({marks})", list(sig_ids))
+        self.conn.commit()
+
     def get_stats(self) -> dict:
         total     = self.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
         sent      = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='sent'").fetchone()[0]
@@ -176,6 +199,8 @@ class Database:
         discarded = self.conn.execute("SELECT COUNT(*) FROM signals WHERE status='discarded'").fetchone()[0]
         won       = self.conn.execute("SELECT COUNT(*) FROM signals WHERE result='won'").fetchone()[0]
         lost      = self.conn.execute("SELECT COUNT(*) FROM signals WHERE result='lost'").fetchone()[0]
+        sent_to_vip  = self.conn.execute("SELECT COALESCE(SUM(sent_to_vip),0)  FROM signals").fetchone()[0]
+        sent_to_free = self.conn.execute("SELECT COALESCE(SUM(sent_to_free),0) FROM signals").fetchone()[0]
 
         total_results = won + lost
         winrate = round(won / total_results * 100, 1) if total_results > 0 else 0
@@ -194,7 +219,9 @@ class Database:
                       COUNT(*) AS total,
                       SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                       SUM(CASE WHEN result='won'  THEN 1 ELSE 0 END) AS won,
-                      SUM(CASE WHEN result='lost' THEN 1 ELSE 0 END) AS lost
+                      SUM(CASE WHEN result='lost' THEN 1 ELSE 0 END) AS lost,
+                      COALESCE(SUM(sent_to_vip),0)  AS sent_vip,
+                      COALESCE(SUM(sent_to_free),0) AS sent_free
                FROM signals GROUP BY sport"""
         ).fetchall()
         for r in sport_rows:
@@ -207,11 +234,15 @@ class Database:
                 "won":         s_won,
                 "lost":        s_lost,
                 "winrate":     round(s_won / s_total_res * 100, 1) if s_total_res > 0 else 0,
+                "sent_vip":    r["sent_vip"] or 0,
+                "sent_free":   r["sent_free"] or 0,
             }
 
         return {
             "total":     total,
-            "sent_vip":  sent,
+            "sent_vip":  sent,            # legacy: segnali ancora in stato 'sent'
+            "sent_to_vip":  sent_to_vip,   # inviati al gruppo VIP (cumulativo)
+            "sent_to_free": sent_to_free,  # inviati al gruppo FREE (cumulativo)
             "pending":   pending,
             "discarded": discarded,
             "won":       won,
