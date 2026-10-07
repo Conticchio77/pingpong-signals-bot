@@ -102,30 +102,50 @@ def _pingpong_fixtures_per_scan(pp_interval_h: int) -> int:
     return 1  # 3+ scan/giorno: tetto più stretto per restare in quota
 
 
-_COVERAGE_KEYS = ("pinnacleId", "sofascoreId", "flashscoreId", "betgeniusId", "oddinId")
-_coverage_sample_logged = False
+_coverage_sample_logged = 0
+
+
+def _provider_entries(f: dict) -> dict:
+    """Appiattisce f["externalProviders"] (dict, oppure lista di dict) in
+    {nome_provider_minuscolo: valore}, tenendo solo i valori non vuoti."""
+    prov = f.get("externalProviders")
+    flat = {}
+    def add(k, v):
+        if v not in (None, "", 0, False, [], {}):
+            flat[str(k).lower()] = v
+    if isinstance(prov, dict):
+        for k, v in prov.items():
+            add(k, v)
+    elif isinstance(prov, list):
+        for item in prov:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    add(k, v)
+            elif item:
+                add(item, True)
+    return flat
 
 
 def _fixture_coverage_score(f: dict) -> int:
     """Stima GRATIS (dai soli dati di /fixtures, nessuna richiesta extra) di
-    quanti bookmaker prezzeranno la partita. Nei log le partite ping pong con
-    molti book (71-75) hanno vincente + over/under valutabili, quelle con 0-10
-    book no, e ogni /odds consuma quota. Segnali di buona copertura: l'ID
-    Pinnacle (book sharp: edge vero invece di consenso) e/o almeno 3 ID di
-    provider esterni. Ritorna -1 se hasOdds è esplicitamente False (inutile
-    spendere una richiesta), altrimenti un punteggio >= 0."""
+    quanti bookmaker prezzeranno la partita. Le partite ping pong con molti
+    book (23-75 nei log) hanno vincente + over/under valutabili, quelle con 0-10
+    no, e ogni /odds consuma quota. Segnali di buona copertura: un provider
+    Pinnacle (book sharp: edge vero invece di consenso) e/o almeno 3 provider
+    esterni mappati. Ritorna -1 se hasOdds è esplicitamente False, altrimenti
+    un punteggio >= 0 (>= 3 = probabilmente ben coperta)."""
     global _coverage_sample_logged
-    if not _coverage_sample_logged:
-        _coverage_sample_logged = True
-        logger.info(f"OddsPapi: esempio campi fixture (diagnostica copertura): {sorted(f.keys())}")
+    if _coverage_sample_logged < 3:
+        _coverage_sample_logged += 1
+        logger.info(
+            f"OddsPapi: diagnostica copertura fixture {f.get('fixtureId')}: "
+            f"hasOdds={f.get('hasOdds')} externalProviders={str(f.get('externalProviders'))[:300]}"
+        )
     if f.get("hasOdds") is False:
         return -1
-    prov = f.get("externalProviders") or f.get("providers") or {}
-    if not isinstance(prov, dict):
-        prov = {}
-    present = {k: (prov.get(k) if prov.get(k) is not None else f.get(k)) for k in _COVERAGE_KEYS}
-    n = sum(1 for v in present.values() if v)
-    return n + (3 if present["pinnacleId"] else 0)
+    flat = _provider_entries(f)
+    pinnacle = any("pinnacle" in k for k in flat)
+    return len(flat) + (3 if pinnacle else 0)
 
 
 def _prefer_covered(fixtures: list, n: int) -> list:
