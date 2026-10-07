@@ -2,6 +2,7 @@ import os
 import io
 import logging
 import asyncio
+import time
 import datetime
 from zoneinfo import ZoneInfo
 
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 ROME         = ZoneInfo("Europe/Rome")
 TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
-VIP_GROUP_ID  = int(os.environ.get("VIP_GROUP_ID",  "-1002950341972"))
+VIP_GROUP_ID  = int(os.environ.get("VIP_GROUP_ID",  "-1004272035660"))
 FREE_GROUP_ID = int(os.environ.get("FREE_GROUP_ID", "-1002520876408"))
 ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
@@ -63,18 +64,71 @@ def _dest_label(sport: str) -> str:
     key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
     return {"vip": "VIP", "free": "Free", "both": "VIP+Free"}.get(settings.get(key, "vip"), "VIP")
 
-def _dest_group_ids(sport: str) -> list[int]:
+def _sport_short(sport: str) -> str:
+    return "tennis" if sport == "tennis" else "pingpong"
+
+def _dest_setting(kind: str, short: str) -> str:
+    """Destinazione (vip/free/both/none) per un tipo di messaggio e uno sport.
+    kind: "send" (segnali), "result" (vinto/perso), "stats" (statistiche
+    mensili). Per result/stats, se non è mai stata scelta, segue la
+    destinazione dei segnali di quello sport."""
+    base = db.get_settings().get(f"send_dest_{short}", "vip")
+    if kind == "send":
+        return base
+    return db.get_setting(f"{kind}_dest_{short}") or base
+
+_DEST_NAMES = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi", "none": "🚫 Nessuno"}
+
+def _dest_group_ids(sport: str, kind: str = "send") -> list[int]:
     """Gruppi a cui inviare, in base alla destinazione scelta per quello
-    sport (vip/free/both) nelle impostazioni — vedi send_dest_tennis /
-    send_dest_pingpong."""
-    settings = db.get_settings()
-    key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
-    dest = settings.get(key, "vip")
+    sport e tipo di messaggio (segnali / risultati / statistiche)."""
+    dest = _dest_setting(kind, _sport_short(sport))
+    if dest == "none":
+        return []
     if dest == "free":
         return [FREE_GROUP_ID]
     if dest == "both":
         return [VIP_GROUP_ID, FREE_GROUP_ID]
     return [VIP_GROUP_ID]
+
+def _group_name(gid: int) -> str:
+    return "VIP" if gid == VIP_GROUP_ID else ("Free" if gid == FREE_GROUP_ID else str(gid))
+
+async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=None) -> list[int]:
+    """Invia text ai gruppi scelti per (sport, kind). Ritorna gli ID dove è
+    arrivato davvero (gli errori, es. bot non nel gruppo, sono solo loggati)."""
+    sent = []
+    for gid in _dest_group_ids(sport, kind):
+        try:
+            await bot.send_message(chat_id=gid, text=text, parse_mode="Markdown", reply_markup=reply_markup)
+            sent.append(gid)
+        except Exception as e:
+            logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
+    return sent
+
+def _sent_note(sport: str, kind: str, sent: list[int]) -> str:
+    """Riga di conferma per l'admin su dove è arrivato il messaggio."""
+    wanted = _dest_group_ids(sport, kind)
+    if not wanted:
+        return "📨 Gruppi: nessuno (destinazione disattivata)"
+    names = ", ".join(_group_name(g) for g in sent) or "—"
+    failed = [g for g in wanted if g not in sent]
+    extra = f" ⚠️ non riuscito: {', '.join(_group_name(g) for g in failed)}" if failed else ""
+    return f"📨 Inviato a: {names}{extra}"
+
+def _result_group_text(sig: dict, result: str, bal: dict) -> str:
+    emoji = "✅" if result == "won" else "❌"
+    sport_label = sig.get("sport_label", "🏓")
+    bal_str = f"{bal['current_balance_pct']:+.2f}% bankroll" if bal["total_bets"] > 0 else "n/d"
+    return (
+        f"{emoji} *Risultato*\n"
+        f"{'━' * 20}\n"
+        f"{sport_label} {sig['match']}\n"
+        f"🎯 {sig['pick']} @ {sig['odds']}\n"
+        f"📌 Stake: {sig['stake']}/5\n\n"
+        f"{emoji} *{'VINTO! 🎉' if result == 'won' else 'Perso.'}*\n\n"
+        f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*"
+    )
 
 async def send_signal_to_groups(bot, sig: dict, text: str):
     """Invia il testo a tutti i gruppi configurati per lo sport del segnale
@@ -152,7 +206,15 @@ def vip_signal_text(s: dict) -> str:
 def now_it_str() -> str:
     return datetime.datetime.now(ROME).strftime("%d/%m %H:%M")
 
-def genera_grafico_bilancio(sport: str | None = None) -> io.BytesIO | None:
+def _row_month(r: dict) -> str:
+    """Mese (YYYYMM, fuso Roma) di una riga di balance_history (created_at è UTC)."""
+    try:
+        dt = datetime.datetime.fromisoformat(str(r.get("created_at", "")))
+        return dt.replace(tzinfo=datetime.timezone.utc).astimezone(ROME).strftime("%Y%m")
+    except Exception:
+        return ""
+
+def genera_grafico_bilancio(sport: str | None = None, month: str | None = None) -> io.BytesIO | None:
     """Genera un grafico PNG del bilancio (in % di bankroll) nel tempo.
     sport=None → totale su entrambi gli sport. Ritorna BytesIO o None."""
     try:
@@ -162,6 +224,8 @@ def genera_grafico_bilancio(sport: str | None = None) -> io.BytesIO | None:
         import matplotlib.patches as mpatches
 
         history = db.get_balance_history(sport=sport)
+        if month:
+            history = [r for r in history if _row_month(r) == month]
         if len(history) < 2:
             return None
         # Bilancio cumulato ricalcolato sul sottoinsieme (sport) selezionato,
@@ -177,7 +241,7 @@ def genera_grafico_bilancio(sport: str | None = None) -> io.BytesIO | None:
         colors   = ["#2ecc71" if b >= 0 else "#e74c3c" for b in balances[1:]]
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), facecolor="#1a1a2e")
-        fig.suptitle("📊 Bilancio Segnali", color="white", fontsize=16, fontweight="bold", y=0.98)
+        fig.suptitle("📊 Bilancio Segnali" + (f" — {month[4:]}/{month[:4]}" if month else ""), color="white", fontsize=16, fontweight="bold", y=0.98)
 
         # ── Grafico linea bilancio ─────────────────────────────────────────
         ax1.set_facecolor("#16213e")
@@ -581,6 +645,11 @@ async def send_stats(fn):
 
     kb = [
         [InlineKeyboardButton("📈 Grafico bilancio", callback_data="show_balance_chart")],
+        [InlineKeyboardButton("🧪 Test stats (solo a me)", callback_data="test_monthly_now")],
+        [InlineKeyboardButton(
+            f"⏰ Stats automatiche di fine mese: {'🟢 ATTIVE' if _monthly_auto_on() else '🔴 SPENTE'}",
+            callback_data="toggle_monthly_auto")],
+        [InlineKeyboardButton("📅 Invia stats del mese ai gruppi", callback_data="send_monthly_now")],
         [InlineKeyboardButton("🗑 Reset risultati (mantieni segnali)", callback_data="confirm_reset_stats")],
         [InlineKeyboardButton("💣 Reset COMPLETO (cancella tutto)", callback_data="confirm_purge_all")],
         [InlineKeyboardButton("🔙 Home", callback_data="admin_home")],
@@ -649,6 +718,8 @@ async def send_settings_tennis(fn):
         [InlineKeyboardButton(f"📉 Cap edge (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
         [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
         [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_tennis")],
+        [InlineKeyboardButton(f"🏁 Risultati vinto/perso: {_DEST_NAMES.get(_dest_setting('result', 'tennis'), '📤 VIP')}", callback_data="pick_resdest_tennis")],
+        [InlineKeyboardButton(f"📅 Stats di fine mese: {_DEST_NAMES.get(_dest_setting('stats', 'tennis'), '📤 VIP')}", callback_data="pick_statsdest_tennis")],
         [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
     ]
     await fn(
@@ -674,6 +745,8 @@ async def send_settings_pingpong(fn):
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
         [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_pingpong")],
+        [InlineKeyboardButton(f"🏁 Risultati vinto/perso: {_DEST_NAMES.get(_dest_setting('result', 'pingpong'), '📤 VIP')}", callback_data="pick_resdest_pingpong")],
+        [InlineKeyboardButton(f"📅 Stats di fine mese: {_DEST_NAMES.get(_dest_setting('stats', 'pingpong'), '📤 VIP')}", callback_data="pick_statsdest_pingpong")],
         [InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")],
     ]
     await fn(
@@ -684,6 +757,141 @@ async def send_settings_pingpong(fn):
         "Tocca un'opzione per modificarla:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+# ── Statistiche di fine mese (per sport, ognuna col suo tasto grafico) ──────────
+MONTHS_IT = ["", "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+             "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
+_STATS_SPORTS = (("tennis", "🎾 Tennis"), ("tabletennis", "🏓 Ping Pong"))
+
+def _month_balance(sport: str, ym: str) -> dict:
+    """Statistiche del solo mese ym (YYYYMM, fuso Roma) per uno sport."""
+    stake_pct = db.get_settings().get("stake_pct", 0.5)
+    rows = [r for r in db.get_balance_history(sport=sport) if _row_month(r) == ym]
+    won  = sum(1 for r in rows if r["result"] == "won")
+    lost = sum(1 for r in rows if r["result"] == "lost")
+    total = won + lost
+    profit = sum(r["profit"] for r in rows)
+    staked = total * stake_pct
+    return {
+        "total_bets": total, "won": won, "lost": lost,
+        "winrate": round(won / total * 100, 1) if total else 0,
+        "profit_pct": round(profit, 2),
+        "roi": round(profit / staked * 100, 1) if staked else 0.0,
+        "best": round(max((r["profit"] for r in rows if r["result"] == "won"), default=0), 2),
+        "worst": round(min((r["profit"] for r in rows if r["result"] == "lost"), default=0), 2),
+    }
+
+async def send_monthly_stats(app: Application, ym: str | None = None, test: bool = False):
+    """Invia le statistiche del mese (default: mese corrente), un messaggio
+    per sport, ognuno col proprio tasto grafico, ai gruppi scelti per quello
+    sport (VIP/Free/Entrambi/Nessuno). Poi riepilogo all'admin.
+    test=True: manda i messaggi SOLO all'admin (nessun gruppo), per provarli."""
+    now = datetime.datetime.now(ROME)
+    ym = ym or now.strftime("%Y%m")
+    mese = f"{MONTHS_IT[int(ym[4:])]} {ym[:4]}"
+    lines = []
+    for sport, label in _STATS_SPORTS:
+        st = _month_balance(sport, ym)
+        if st["total_bets"] == 0:
+            lines.append(f"{label}: nessun risultato nel mese")
+            continue
+        text = (
+            f"📅 *Statistiche {mese} — {label}*\n"
+            f"{'━' * 22}\n"
+            f"🎯 Segnali conclusi: *{st['total_bets']}* ({st['won']}V / {st['lost']}P)\n"
+            f"🏆 Win rate: *{st['winrate']}%*\n"
+            f"💰 Bilancio: *{st['profit_pct']:+.2f}%* bankroll | ROI: *{st['roi']:+.1f}%*\n"
+            f"⭐ Migliore: {st['best']:+.2f}% | Peggiore: {st['worst']:+.2f}%"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📈 Grafico {label}", callback_data=f"pubchart_{sport}_{ym}")]])
+        if test:
+            try:
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID, text="🧪 *TEST — solo per te, nessun gruppo*\n\n" + text,
+                    parse_mode="Markdown", reply_markup=kb,
+                )
+            except Exception as e:
+                logger.error(f"Test stats all'admin fallito: {e}")
+            continue
+        sent = await send_to_groups(app.bot, sport, "stats", text, kb)
+        lines.append(f"{label}: {_sent_note(sport, 'stats', sent)}")
+    if test:
+        if all("nessun risultato" in l for l in lines) and len(lines) == len(_STATS_SPORTS):
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"🧪 Test stats {mese}: nessun risultato registrato nel mese, niente da mostrare.")
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"📅 *Stats {mese}*\n" + "\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Riepilogo stats mensili all'admin fallito: {e}")
+
+def _monthly_auto_on() -> bool:
+    """Invio automatico di fine mese attivo? (default: sì)"""
+    return (db.get_setting("monthly_stats_auto", "1") or "1") == "1"
+
+def _stats_dest_summary() -> str:
+    """Riga per sport con i gruppi di destinazione delle stats mensili."""
+    out = []
+    for sport, label in _STATS_SPORTS:
+        gids = _dest_group_ids(sport, "stats")
+        out.append(f"{label}: " + (", ".join(_group_name(g) for g in gids) if gids else "nessuno"))
+    return "\n".join(out)
+
+async def _monthly_stats_job(app: Application):
+    """Job schedulato (ultimo giorno del mese): invia solo se l'automatico è attivo."""
+    if not _monthly_auto_on():
+        logger.info("Stats mensili automatiche: disattivate, non inviate")
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=("⏰ *Stats di fine mese NON inviate*: l'invio automatico è spento.\n"
+                      "Puoi mandarle a mano da Statistiche → 📅 Invia stats del mese ai gruppi."),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Avviso stats mensili spente fallito: {e}")
+        return
+    await send_monthly_stats(app)
+
+_chart_cache: dict = {}   # (sport, ym) -> bytes del PNG
+_chart_last_sent: dict = {}  # (chat_id, sport, ym) -> timestamp ultimo invio
+
+async def public_chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tasto grafico sotto le stats mensili: usabile da CHIUNQUE nel gruppo
+    (la callback_handler generale è solo per l'admin)."""
+    query = update.callback_query
+    try:
+        _, sport, ym = query.data.split("_", 2)
+    except ValueError:
+        await query.answer()
+        return
+    if sport not in ("tennis", "tabletennis") or len(ym) != 6:
+        await query.answer()
+        return
+    chat_id = query.message.chat_id
+    last = _chart_last_sent.get((chat_id, sport, ym), 0)
+    if time.time() - last < 600:
+        await query.answer("📈 Il grafico è già stato inviato qui sotto da poco.", show_alert=False)
+        return
+    png = _chart_cache.get((sport, ym))
+    if png is None:
+        buf = genera_grafico_bilancio(sport, month=ym)
+        if buf is None:
+            await query.answer("Grafico non disponibile: servono almeno 2 risultati nel mese.", show_alert=True)
+            return
+        png = buf.getvalue()
+        _chart_cache[(sport, ym)] = png
+    _chart_last_sent[(chat_id, sport, ym)] = time.time()
+    await query.answer()
+    label = "🎾 Tennis" if sport == "tennis" else "🏓 Ping Pong"
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=io.BytesIO(png),
+        caption=f"📈 Bilancio {label} — {MONTHS_IT[int(ym[4:])]} {ym[:4]}",
     )
 
 # ── CALLBACK HANDLER ─────────────────────────────────────────────────────────────
@@ -877,6 +1085,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sport_label = sig.get("sport_label", "🏓")
             bal = db.get_balance_stats(sport=sig.get("sport"))
             bal_str = f"{bal['current_balance_pct']:+.2f}% bankroll" if bal["total_bets"] > 0 else "n/d"
+            _sp = sig.get("sport", "tabletennis")
+            _sent = await send_to_groups(context.application.bot, _sp, "result", _result_group_text(sig, result, bal))
             await query.message.reply_text(
                 f"{emoji} *Risultato aggiornato*\n"
                 f"{'━' * 20}\n"
@@ -884,7 +1094,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 {sig['pick']} @ {sig['odds']}\n"
                 f"📌 Stake: {sig['stake']}/5\n\n"
                 f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*\n\n"
-                f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*",
+                f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*\n\n"
+                f"{_sent_note(_sp, 'result', _sent)}",
                 parse_mode="Markdown"
             )
 
@@ -1196,8 +1407,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_name = "Tennis" if data == "pick_dest_tennis" else "Ping Pong"
         await query.edit_message_text(
             f"📨 *Destinazione invii — {sport_name}*\n\n"
-            "Dove inviare i segnali (e i risultati Vinto/Perso collegati) "
-            "per questo sport:",
+            "Dove inviare i segnali per questo sport.\n"
+            "(Risultati e statistiche mensili hanno la loro scelta nelle impostazioni dello sport.)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -1212,6 +1423,60 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_setting("send_dest_pingpong", val)
         await send_settings_pingpong(query.edit_message_text)
 
+
+    # ── Destinazione risultati vinto/perso e stats di fine mese (per sport) ─────
+    elif data.startswith(("pick_resdest_", "pick_statsdest_")):
+        kind  = "result" if data.startswith("pick_resdest_") else "stats"
+        short = data.rsplit("_", 1)[1]            # tennis | pingpong
+        current = _dest_setting(kind, short)
+        kb = []
+        for val in ("vip", "free", "both", "none"):
+            prefix = "✅ " if val == current else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{_DEST_NAMES[val]}", callback_data=f"set_{kind}dest_{short}_{val}")])
+        kb.append([InlineKeyboardButton("🔙 Indietro", callback_data=f"settings_{short}")])
+        sport_name = "Tennis" if short == "tennis" else "Ping Pong"
+        what = ("i messaggi Vinto/Perso (automatici e manuali)" if kind == "result"
+                else "le statistiche di fine mese (con il tasto del grafico)")
+        await query.edit_message_text(
+            f"📨 *Destinazione — {sport_name}*\n\nDove inviare {what} per questo sport:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith(("set_resultdest_", "set_statsdest_")):
+        _, kindname, short, val = data.split("_", 3)
+        kind = "result" if kindname == "resultdest" else "stats"
+        db.set_setting(f"{kind}_dest_{short}", val)
+        if short == "tennis":
+            await send_settings_tennis(query.edit_message_text)
+        else:
+            await send_settings_pingpong(query.edit_message_text)
+
+    elif data == "test_monthly_now":
+        await send_monthly_stats(context.application, test=True)
+
+    elif data == "send_monthly_now":
+        now_m = datetime.datetime.now(ROME)
+        mese = f"{MONTHS_IT[now_m.month]} {now_m.year}"
+        await query.edit_message_text(
+            f"⚠️ *Confermi l'invio ai gruppi?*\n\n"
+            f"Stai per mandare le statistiche di *{mese}* a:\n{_stats_dest_summary()}\n\n"
+            f"I messaggi saranno visibili ai membri dei gruppi.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Sì, invia ai gruppi", callback_data="send_monthly_confirm")],
+                [InlineKeyboardButton("❌ Annulla", callback_data="admin_stats")],
+            ])
+        )
+
+    elif data == "send_monthly_confirm":
+        # Toglie subito i bottoni, così un doppio tocco non invia due volte.
+        await query.edit_message_text("⏳ Invio delle statistiche ai gruppi in corso…")
+        await send_monthly_stats(context.application)
+
+    elif data == "toggle_monthly_auto":
+        db.set_setting("monthly_stats_auto", "0" if _monthly_auto_on() else "1")
+        await send_stats(query.edit_message_text)
 
     # ── Anticipo minimo kickoff ───────────────────────────────────────────────
     elif data == "pick_hours_before":
@@ -1441,6 +1706,17 @@ async def post_init(app: Application):
         lambda: _schedule_coro(lambda: _monthly_reset_scan_interval(app)),
         trigger=CronTrigger(day=1, hour=0, minute=5, timezone=ROME),
         id="monthly_reset_scan_interval",
+    )
+
+    # Statistiche di fine mese ai gruppi (per sport, con tasto grafico):
+    # ultimo giorno del mese alle 22:30 ora di Roma.
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: _monthly_stats_job(app)),
+        trigger=CronTrigger(day="last", hour=22, minute=30, timezone=ROME),
+        id="monthly_stats",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
 
     _scheduler.start()
@@ -1881,6 +2157,8 @@ async def run_auto_results(app: Application, sport: str = "both"):
             bal_stats = db.get_balance_stats(sport=sig.get("sport"))
             bal_str = f"{bal_stats['current_balance_pct']:+.2f}% bankroll" if bal_stats["total_bets"] > 0 else "n/d"
 
+            _sp = sig.get("sport", "tabletennis")
+            _sent = await send_to_groups(app.bot, _sp, "result", _result_group_text(sig, result, bal_stats))
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
@@ -1892,7 +2170,8 @@ async def run_auto_results(app: Application, sport: str = "both"):
                     f"{'✅ *VINTO!* 🎉' if result == 'won' else '❌ *Perso.*'}\n\n"
                     f"💰 Bilancio {sig.get('sport_label','')}: *{bal_str}*\n"
                     f"📊 W/L: {bal_stats['won']}V/{bal_stats['lost']}P | "
-                    f"Win%: {bal_stats['winrate']}% | ROI: {bal_stats['roi']}%"
+                    f"Win%: {bal_stats['winrate']}% | ROI: {bal_stats['roi']}%\n\n"
+                    f"{_sent_note(_sp, 'result', _sent)}"
                 ),
                 parse_mode="Markdown"
             )
@@ -1942,6 +2221,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu",  menu))
+    app.add_handler(CallbackQueryHandler(public_chart_handler, pattern=r"^pubchart_"))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kb_handler))
     app.add_error_handler(global_error_handler)
