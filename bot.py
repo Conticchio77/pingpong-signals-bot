@@ -130,16 +130,46 @@ def _result_group_text(sig: dict, result: str, bal: dict) -> str:
         f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*"
     )
 
-async def send_signal_to_groups(bot, sig: dict, text: str):
-    """Invia il testo a tutti i gruppi configurati per lo sport del segnale
-    (VIP/Free/entrambi) più il relay privato. Sostituisce l'invio fisso al
-    solo VIP_GROUP_ID."""
-    for gid in _dest_group_ids(sig.get("sport", "tabletennis")):
+async def send_signal_to_groups(bot, sig: dict, text: str, dest: str | None = None) -> list[int]:
+    """Invia il segnale ai gruppi. dest: "vip" | "free" | "both"; se None usa la
+    destinazione impostata per lo sport. Il relay privato (DM agli iscritti VIP)
+    parte solo se tra le destinazioni c'è il VIP. Ritorna gli ID dei gruppi in
+    cui il messaggio è arrivato davvero (vuoto = invio fallito ovunque)."""
+    if dest is None:
+        dest = _dest_setting("send", _sport_short(sig.get("sport", "tabletennis")))
+    gids = {"free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(dest, [VIP_GROUP_ID])
+    sent = []
+    for gid in gids:
         try:
             await bot.send_message(chat_id=gid, text=text, parse_mode="Markdown")
+            sent.append(gid)
         except Exception as e:
             logger.warning(f"Invio segnale al gruppo {gid} fallito: {e}")
-    await relay_to_private(text)
+    if VIP_GROUP_ID in gids:
+        await relay_to_private(text)
+    return sent
+
+def _send_rows(s: dict) -> list:
+    """Bottoni di invio manuale: VIP / FREE / ENTRAMBI (o solo il gruppo
+    mancante se il segnale è già stato inviato a uno dei due)."""
+    sid = s["id"]
+    vip, free = bool(s.get("sent_to_vip")), bool(s.get("sent_to_free"))
+    if s.get("status") in ("won", "lost"):
+        return []
+    if vip and free:
+        return []
+    if vip:
+        return [[InlineKeyboardButton("🆓 Invia anche a FREE", callback_data=f"sendto_free_{sid}")]]
+    if free:
+        return [[InlineKeyboardButton("📤 Invia anche a VIP", callback_data=f"sendto_vip_{sid}")]]
+    if s.get("status") == "sent":      # inviato prima del tracciamento per gruppo: non so dove
+        return []
+    return [
+        [InlineKeyboardButton("📤 VIP", callback_data=f"sendto_vip_{sid}"),
+         InlineKeyboardButton("🆓 FREE", callback_data=f"sendto_free_{sid}"),
+         InlineKeyboardButton("📤🆓 ENTRAMBI", callback_data=f"sendto_both_{sid}")],
+        [InlineKeyboardButton("🗑 Scarta", callback_data=f"discard_{sid}")],
+    ]
 
 db       = Database()
 scraper  = SignalScraper(db=db)
@@ -658,7 +688,9 @@ async def send_stats(fn):
         f"📊 *Statistiche*\n"
         f"{'━' * 22}\n"
         f"📨 Totali: *{stats['total']}*\n"
-        f"📤 Inviati VIP: *{stats['sent_vip']}*\n"
+        f"📤 Inviati VIP: *{stats['sent_to_vip']}* | 🆓 Inviati FREE: *{stats['sent_to_free']}*\n"
+        f"   🎾 Tennis → VIP {stats['by_sport'].get('tennis', {}).get('sent_vip', 0)} | FREE {stats['by_sport'].get('tennis', {}).get('sent_free', 0)}\n"
+        f"   🏓 Ping Pong → VIP {stats['by_sport'].get('tabletennis', {}).get('sent_vip', 0)} | FREE {stats['by_sport'].get('tabletennis', {}).get('sent_free', 0)}\n"
         f"⏳ Pendenti: *{stats['pending']}*\n"
         f"✅ Vinti: *{stats['won']}*\n"
         f"❌ Persi: *{stats['lost']}*\n"
@@ -1015,12 +1047,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Segnale non trovato.")
             return
         db.update_signal_status(sig_id, "seen")
-        kb = []
-        if s["status"] not in ("won", "lost", "sent"):
-            kb.append([
-                InlineKeyboardButton(f"📤 Invia ({_dest_label(s.get('sport'))}) ✅", callback_data=f"send_vip_{sig_id}"),
-                InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
-            ])
+        kb = list(_send_rows(s))
         kb.append([
             InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
             InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
@@ -1029,24 +1056,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton("🔙 Lista", callback_data="admin_list")])
         await query.edit_message_text(signal_text(s), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    # ── Invia VIP ────────────────────────────────────────────────────────────────
-    elif data.startswith("send_vip_"):
-        sig_id = int(data.split("_")[-1])
+    # ── Invio manuale: VIP / FREE / ENTRAMBI (sendto_*) e vecchio send_vip_* ──
+    elif data.startswith(("sendto_", "send_vip_")):
+        if data.startswith("sendto_"):
+            _, dest, sid = data.split("_", 2)
+        else:                               # vecchi messaggi: usa la destinazione impostata
+            dest, sid = None, data.split("_")[-1]
+        sig_id = int(sid)
         s = db.get_signal(sig_id)
         if not s:
             await query.edit_message_text("❌ Segnale non trovato.")
             return
-        try:
-            await send_signal_to_groups(context.application.bot, s, vip_signal_text(s))
-            db.update_signal_status(sig_id, "sent")
-            kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
-                   InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
+        sent = await send_signal_to_groups(context.application.bot, s, vip_signal_text(s), dest=dest)
+        wanted = {"vip": [VIP_GROUP_ID], "free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(
+            dest or _dest_setting("send", _sport_short(s.get("sport", "tabletennis"))), [VIP_GROUP_ID])
+        failed = [g for g in wanted if g not in sent]
+        kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
+               InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
+        if not sent:
             await query.edit_message_text(
-                f"✅ Inviato al VIP!\n\n{vip_signal_text(s)}",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
+                f"❌ Invio fallito su: {', '.join(_group_name(g) for g in failed)}.\n"
+                f"Controlla che il bot sia nel gruppo (admin o con permesso di scrivere).\n\n{vip_signal_text(s)}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(_send_rows(s) + kb),
             )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Errore invio VIP: {e}")
+            return
+        db.mark_signal_sent(sig_id, VIP_GROUP_ID in sent, FREE_GROUP_ID in sent)
+        s = db.get_signal(sig_id)
+        extra = f"\n⚠️ Non riuscito: {', '.join(_group_name(g) for g in failed)}" if failed else ""
+        await query.edit_message_text(
+            f"✅ Inviato a: {', '.join(_group_name(g) for g in sent)}{extra}\n\n{vip_signal_text(s)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(_send_rows(s) + kb),
+        )
 
     # ── Scarta ───────────────────────────────────────────────────────────────────
     elif data.startswith("discard_"):
@@ -1645,7 +1687,7 @@ async def post_init(app: Application):
     # per tornei con segnali pendenti in scraper.py, taglia drasticamente il
     # consumo di crediti The Odds API che si stava esaurendo in 2-3 giorni)
     _scheduler.add_job(
-        lambda: _schedule_coro(lambda: run_auto_results(app, sport="tennis")),
+        lambda: _schedule_coro(lambda: _results_job(app, "tennis")),
         trigger=IntervalTrigger(minutes=60, timezone=ROME),
         id="auto_results_tennis",
         next_run_time=now + datetime.timedelta(minutes=10),
@@ -1655,7 +1697,7 @@ async def post_init(app: Application):
     # richieste/mese — un controllo ogni 30 min esaurirebbe la quota in
     # pochi giorni e bloccherebbe anche la ricerca di nuove partite)
     _scheduler.add_job(
-        lambda: _schedule_coro(lambda: run_auto_results(app, sport="tabletennis")),
+        lambda: _schedule_coro(lambda: _results_job(app, "tabletennis")),
         trigger=CronTrigger(hour="14,22", minute=0, timezone=ROME),
         id="auto_results_pingpong",
     )
@@ -1891,10 +1933,7 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                 new_signals += 1
 
                 sport_label = sig.get("sport_label", "🏓 Ping Pong")
-                kb = [[
-                    InlineKeyboardButton(f"📤 Invia ({_dest_label(sig.get('sport'))}) ✅", callback_data=f"send_vip_{sig_id}"),
-                    InlineKeyboardButton("🗑 Scarta",          callback_data=f"discard_{sig_id}"),
-                ],[
+                kb = _send_rows({"id": sig_id, "status": "pending"}) + [[
                     InlineKeyboardButton("✅ Vinto", callback_data=f"result_{sig_id}_won"),
                     InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
                 ],[
@@ -1907,8 +1946,9 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
                 if settings["auto_send"]:
-                    await send_signal_to_groups(app.bot, sig, vip_signal_text(sig))
-                    db.update_signal_status(sig_id, "sent")
+                    sent_g = await send_signal_to_groups(app.bot, sig, vip_signal_text(sig))
+                    if sent_g:
+                        db.mark_signal_sent(sig_id, VIP_GROUP_ID in sent_g, FREE_GROUP_ID in sent_g)
 
         except Exception as e:
             logger.error(f"Errore analisi {match.get('name','?')}: {e}")
@@ -2050,6 +2090,81 @@ async def run_pingpong_scan(app: Application, is_retry: bool = False):
             pass
 
 
+
+# ── Promemoria "risultato mancante" ──────────────────────────────────────────────
+# Dopo quante ore dal kickoff, se il segnale è ancora senza risultato, ti avviso
+# (una sola volta per segnale). Gli over/under non si aggiornano mai da soli.
+REMIND_AFTER_H = {"tennis": 6, "tabletennis": 3}
+REMIND_AFTER_H_TOTALS = 3
+
+def _hours_since_kickoff(sig: dict) -> float | None:
+    """Ore trascorse dal kickoff del segnale (None se non leggibile)."""
+    ko_str = (sig.get("kickoff") or "").strip()
+    if not ko_str:
+        return None
+    now = datetime.datetime.now(ROME)
+    try:
+        try:
+            ko = datetime.datetime.fromisoformat(ko_str)
+            if ko.tzinfo is None:
+                ko = ko.replace(tzinfo=ROME)
+        except ValueError:
+            ko = datetime.datetime.strptime(f"{now.year}/{ko_str}", "%Y/%d/%m %H:%M").replace(tzinfo=ROME)
+            if ko - now > datetime.timedelta(days=180):
+                ko = ko.replace(year=ko.year - 1)
+    except Exception:
+        return None
+    return (now - ko).total_seconds() / 3600
+
+async def remind_pending_results(app: Application, sport: str):
+    """Avvisa l'admin dei segnali inviati/visti che non hanno ancora un
+    risultato dopo REMIND_AFTER_H ore dal kickoff, con i tasti Vinto/Perso."""
+    due = []
+    for sig in db.get_signals_for_auto_result():
+        if sig.get("sport") != sport or sig.get("status") not in ("sent", "seen"):
+            continue
+        if sig.get("result_reminded"):
+            continue
+        age = _hours_since_kickoff(sig)
+        if age is None:
+            continue
+        limit = REMIND_AFTER_H.get(sport, 4) if sig.get("signal_type") == "winner" else REMIND_AFTER_H_TOTALS
+        if age >= limit:
+            due.append(sig)
+    if not due:
+        return
+    for i in range(0, len(due), 8):
+        chunk = due[i:i + 8]
+        lines, kb = [], []
+        for sig in chunk:
+            lines.append(f"• {sig.get('sport_label', '')} {sig['match']} — {sig['pick']} @ {sig['odds']} (inizio {sig.get('kickoff', '?')})")
+            short = (sig["match"] or "")[:14]
+            kb.append([
+                InlineKeyboardButton(f"✅ {short}", callback_data=f"result_{sig['id']}_won"),
+                InlineKeyboardButton(f"❌ {short}", callback_data=f"result_{sig['id']}_lost"),
+            ])
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=("⏰ *Risultato mancante*\n"
+                      "Questi segnali non hanno ancora un risultato. Gli over/under si segnano sempre a mano; "
+                      "per i vincente il bot continua a cercarlo da solo, ma puoi segnarlo tu:\n\n" + "\n".join(lines)),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            db.mark_result_reminded([sig["id"] for sig in chunk])
+        except Exception as e:
+            logger.error(f"Promemoria risultati fallito: {e}")
+
+async def _results_job(app: Application, sport: str):
+    """Job orario: cerca i risultati e poi manda i promemoria per quelli mancanti."""
+    try:
+        await run_auto_results(app, sport=sport)
+    finally:
+        try:
+            await remind_pending_results(app, sport)
+        except Exception as e:
+            logger.error(f"Promemoria risultati ({sport}) errore: {e}")
 
 async def run_auto_results(app: Application, sport: str = "both"):
     """
