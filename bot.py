@@ -79,10 +79,11 @@ def _dest_setting(kind: str, short: str) -> str:
 
 _DEST_NAMES = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi", "none": "🚫 Nessuno"}
 
-def _dest_group_ids(sport: str, kind: str = "send") -> list[int]:
+def _dest_group_ids(sport: str, kind: str = "send", override: str | None = None) -> list[int]:
     """Gruppi a cui inviare, in base alla destinazione scelta per quello
-    sport e tipo di messaggio (segnali / risultati / statistiche)."""
-    dest = _dest_setting(kind, _sport_short(sport))
+    sport e tipo di messaggio (segnali / risultati / statistiche).
+    override ("vip"|"free"|"both") sostituisce la scelta salvata, solo per questa volta."""
+    dest = override or _dest_setting(kind, _sport_short(sport))
     if dest == "none":
         return []
     if dest == "free":
@@ -94,11 +95,11 @@ def _dest_group_ids(sport: str, kind: str = "send") -> list[int]:
 def _group_name(gid: int) -> str:
     return "VIP" if gid == VIP_GROUP_ID else ("Free" if gid == FREE_GROUP_ID else str(gid))
 
-async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=None) -> list[int]:
+async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=None, override: str | None = None) -> list[int]:
     """Invia text ai gruppi scelti per (sport, kind). Ritorna gli ID dove è
     arrivato davvero (gli errori, es. bot non nel gruppo, sono solo loggati)."""
     sent = []
-    for gid in _dest_group_ids(sport, kind):
+    for gid in _dest_group_ids(sport, kind, override):
         try:
             await bot.send_message(chat_id=gid, text=text, parse_mode="Markdown", reply_markup=reply_markup)
             sent.append(gid)
@@ -106,9 +107,9 @@ async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=Non
             logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
     return sent
 
-def _sent_note(sport: str, kind: str, sent: list[int]) -> str:
+def _sent_note(sport: str, kind: str, sent: list[int], override: str | None = None) -> str:
     """Riga di conferma per l'admin su dove è arrivato il messaggio."""
-    wanted = _dest_group_ids(sport, kind)
+    wanted = _dest_group_ids(sport, kind, override)
     if not wanted:
         return "📨 Gruppi: nessuno (destinazione disattivata)"
     names = ", ".join(_group_name(g) for g in sent) or "—"
@@ -688,7 +689,7 @@ async def send_stats(fn):
         [InlineKeyboardButton("📈 Grafico bilancio", callback_data="show_balance_chart")],
         [InlineKeyboardButton("🧪 Test stats (solo a me)", callback_data="test_monthly_now")],
         [InlineKeyboardButton(
-            f"⏰ Stats automatiche di fine mese: {'🟢 ATTIVE' if _monthly_auto_on() else '🔴 SPENTE'}",
+            f"⏰ Stats fine mese → gruppi (auto): {'🟢 ATTIVO' if _monthly_auto_on() else '🔴 SPENTO'}",
             callback_data="toggle_monthly_auto")],
         [InlineKeyboardButton("📅 Invia stats del mese ai gruppi", callback_data="send_monthly_now")],
         [InlineKeyboardButton("🗑 Reset risultati (mantieni segnali)", callback_data="confirm_reset_stats")],
@@ -826,11 +827,14 @@ def _month_balance(sport: str, ym: str) -> dict:
         "worst": round(min((r["profit"] for r in rows if r["result"] == "lost"), default=0), 2),
     }
 
-async def send_monthly_stats(app: Application, ym: str | None = None, test: bool = False):
+async def send_monthly_stats(app: Application, ym: str | None = None, test: bool = False, to_groups: bool = True, dest: str | None = None):
     """Invia le statistiche del mese (default: mese corrente), un messaggio
     per sport, ognuno col proprio tasto grafico, ai gruppi scelti per quello
-    sport (VIP/Free/Entrambi/Nessuno). Poi riepilogo all'admin.
-    test=True: manda i messaggi SOLO all'admin (nessun gruppo), per provarli."""
+    sport (VIP/Free/Entrambi/Nessuno). L'ADMIN riceve sempre una copia di ogni
+    messaggio (con il tasto grafico) e la riga su dove è stato inviato.
+    test=True: manda i messaggi SOLO all'admin (nessun gruppo), per provarli.
+    to_groups=False: solo copia all'admin (usato quando l'invio automatico è spento).
+    dest ("vip"|"free"|"both"): destinazione una tantum, al posto di quella salvata per sport."""
     now = datetime.datetime.now(ROME)
     ym = ym or now.strftime("%Y%m")
     mese = f"{MONTHS_IT[int(ym[4:])]} {ym[:4]}"
@@ -857,21 +861,25 @@ async def send_monthly_stats(app: Application, ym: str | None = None, test: bool
                 )
             except Exception as e:
                 logger.error(f"Test stats all'admin fallito: {e}")
+            lines.append(label)
             continue
-        sent = await send_to_groups(app.bot, sport, "stats", text, kb)
-        lines.append(f"{label}: {_sent_note(sport, 'stats', sent)}")
-    if test:
-        if all("nessun risultato" in l for l in lines) and len(lines) == len(_STATS_SPORTS):
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"🧪 Test stats {mese}: nessun risultato registrato nel mese, niente da mostrare.")
-        return
-    try:
-        await app.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📅 *Stats {mese}*\n" + "\n".join(lines),
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.error(f"Riepilogo stats mensili all'admin fallito: {e}")
+        if to_groups:
+            sent = await send_to_groups(app.bot, sport, "stats", text, kb, override=dest)
+            note = _sent_note(sport, "stats", sent, override=dest)
+        else:
+            note = "📨 Gruppi: NON inviato (invio automatico spento)"
+        lines.append(label)
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID, text=f"{text}\n\n{note}",
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"Copia stats mensili all'admin fallita: {e}")
+    sent_any = [l for l in lines if "nessun risultato" not in l]
+    if not sent_any:
+        prefix = "🧪 Test stats" if test else "📅 Stats"
+        await app.bot.send_message(chat_id=ADMIN_ID, text=f"{prefix} {mese}: nessun risultato registrato nel mese, niente da mostrare.")
 
 def _monthly_auto_on() -> bool:
     """Invio automatico di fine mese attivo? (default: sì)"""
@@ -886,18 +894,11 @@ def _stats_dest_summary() -> str:
     return "\n".join(out)
 
 async def _monthly_stats_job(app: Application):
-    """Job schedulato (ultimo giorno del mese): invia solo se l'automatico è attivo."""
+    """Job schedulato (ultimo giorno del mese): all'admin arriva sempre la
+    copia; ai gruppi solo se l'invio automatico è attivo."""
     if not _monthly_auto_on():
-        logger.info("Stats mensili automatiche: disattivate, non inviate")
-        try:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=("⏰ *Stats di fine mese NON inviate*: l'invio automatico è spento.\n"
-                      "Puoi mandarle a mano da Statistiche → 📅 Invia stats del mese ai gruppi."),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error(f"Avviso stats mensili spente fallito: {e}")
+        logger.info("Stats mensili: invio automatico ai gruppi spento, solo copia all'admin")
+        await send_monthly_stats(app, to_groups=False)
         return
     await send_monthly_stats(app)
 
@@ -1517,20 +1518,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_m = datetime.datetime.now(ROME)
         mese = f"{MONTHS_IT[now_m.month]} {now_m.year}"
         await query.edit_message_text(
-            f"⚠️ *Confermi l'invio ai gruppi?*\n\n"
-            f"Stai per mandare le statistiche di *{mese}* a:\n{_stats_dest_summary()}\n\n"
-            f"I messaggi saranno visibili ai membri dei gruppi.",
+            f"⚠️ *Invio statistiche ai gruppi*\n\n"
+            f"Statistiche di *{mese}*. Destinazioni salvate per sport:\n{_stats_dest_summary()}\n\n"
+            f"Scegli come inviare questa volta (i messaggi saranno visibili ai membri):",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Sì, invia ai gruppi", callback_data="send_monthly_confirm")],
+                [InlineKeyboardButton("✅ Come impostato (per sport)", callback_data="send_monthly_confirm")],
+                [InlineKeyboardButton("📤 Solo VIP",  callback_data="send_monthly_to_vip"),
+                 InlineKeyboardButton("🆓 Solo FREE", callback_data="send_monthly_to_free")],
+                [InlineKeyboardButton("📤🆓 Entrambi i gruppi", callback_data="send_monthly_to_both")],
                 [InlineKeyboardButton("❌ Annulla", callback_data="admin_stats")],
             ])
         )
 
-    elif data == "send_monthly_confirm":
+    elif data in ("send_monthly_confirm", "send_monthly_to_vip", "send_monthly_to_free", "send_monthly_to_both"):
+        once = None if data == "send_monthly_confirm" else data.rsplit("_", 1)[1]   # vip | free | both
         # Toglie subito i bottoni, così un doppio tocco non invia due volte.
         await query.edit_message_text("⏳ Invio delle statistiche ai gruppi in corso…")
-        await send_monthly_stats(context.application)
+        await send_monthly_stats(context.application, dest=once)
 
     elif data == "toggle_monthly_auto":
         db.set_setting("monthly_stats_auto", "0" if _monthly_auto_on() else "1")
