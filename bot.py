@@ -149,6 +149,17 @@ async def send_signal_to_groups(bot, sig: dict, text: str, dest: str | None = No
         await relay_to_private(text)
     return sent
 
+def _auto_send_on(group: str) -> bool:
+    """Auto-invio attivo per un gruppo ("vip" | "free")? Se non è mai stato
+    impostato, eredita il vecchio interruttore unico (auto_send)."""
+    v = db.get_setting(f"auto_send_{group}")
+    if v is None:
+        return bool(db.get_settings().get("auto_send"))
+    return v == "1"
+
+def _onoff(b: bool) -> str:
+    return "✅ ON" if b else "❌ OFF"
+
 def _send_rows(s: dict) -> list:
     """Bottoni di invio manuale: VIP / FREE / ENTRAMBI (o solo il gruppo
     mancante se il segnale è già stato inviato a uno dei due)."""
@@ -389,7 +400,7 @@ def admin_panel_text() -> str:
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
         f"⚙️ Scan ogni *{s['scan_interval']}h* | "
         f"Confidenza min: 🎾*{s['min_confidence']}%* 🏓*{s['min_confidence_pp']}%* | "
-        f"Auto-VIP: *{'✅' if s['auto_send'] else '❌'}* | "
+        f"Auto: VIP *{'✅' if _auto_send_on('vip') else '❌'}* FREE *{'✅' if _auto_send_on('free') else '❌'}* | "
         f"Sport: *{sf_label}*"
     )
 
@@ -720,7 +731,8 @@ async def send_settings(fn):
     kb = [
         [InlineKeyboardButton("🎾 Impostazioni Tennis",     callback_data="settings_tennis")],
         [InlineKeyboardButton("🏓 Impostazioni Ping Pong",  callback_data="settings_pingpong")],
-        [InlineKeyboardButton(f"📤 Auto-invio VIP: {'✅ ON' if s['auto_send'] else '❌ OFF'}", callback_data="toggle_autosend")],
+        [InlineKeyboardButton(f"📤 Auto-invio VIP: {_onoff(_auto_send_on('vip'))}", callback_data="toggle_autosend_vip")],
+        [InlineKeyboardButton(f"🆓 Auto-invio FREE: {_onoff(_auto_send_on('free'))}", callback_data="toggle_autosend_free")],
         [InlineKeyboardButton(f"💹 Stake per segnale: {s['stake_pct']}% bankroll", callback_data="pick_stake_pct")],
         [InlineKeyboardButton(f"🏅 Sport attivi: {sf_label}", callback_data="pick_sport_filter")],
         [InlineKeyboardButton("📖 Guida impostazioni", callback_data="admin_guide")],
@@ -955,8 +967,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 1h → ~930 crediti/mese ❌\n"
             "Budget disponibile: 500 crediti/mese gratuiti.\n\n"
 
-            "📤 *Auto-invio VIP*\n"
-            "Se ON, i segnali vengono inviati automaticamente al gruppo VIP senza approvazione manuale.\n"
+            "📤🆓 *Auto-invio VIP / FREE*\n"
+            "Due interruttori separati: se ON, i segnali vanno da soli a quel gruppo senza approvazione.\n"
+            "L'auto-invio vale solo per i gruppi inclusi nella destinazione dello sport "
+            "(Impostazioni sport → Destinazione invii). Il gruppo con auto OFF resta manuale: "
+            "usi i tasti VIP / FREE sul segnale.\n"
             "• OFF → rivedi ogni segnale prima di inviarlo ✅ _consigliato_\n"
             "• ON → invio immediato, meno controllo\n\n"
 
@@ -1254,8 +1269,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_quota":
         await send_quota(query.edit_message_text)
 
-    elif data == "toggle_autosend":
-        db.toggle_setting("auto_send")
+    elif data in ("toggle_autosend", "toggle_autosend_vip", "toggle_autosend_free"):
+        grp = "free" if data == "toggle_autosend_free" else "vip"   # il vecchio bottone unico = VIP
+        db.set_setting(f"auto_send_{grp}", "0" if _auto_send_on(grp) else "1")
         await send_settings(query.edit_message_text)
 
     # ── Scegli intervallo scan (picker visuale) ───────────────────────────────────
@@ -1939,16 +1955,28 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                 ],[
                     InlineKeyboardButton("🚫 Annulla (sospesa)", callback_data=f"result_{sig_id}_void"),
                 ]]
-                await app.bot.send_message(
+                admin_msg = await app.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=f"🆕 *Nuovo segnale {sport_label}!*\n\n{signal_text(sig)}",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
-                if settings["auto_send"]:
-                    sent_g = await send_signal_to_groups(app.bot, sig, vip_signal_text(sig))
+                # Auto-invio distinto: solo i gruppi con auto ON che sono anche
+                # nella destinazione scelta per quello sport; gli altri restano manuali.
+                dest = _dest_setting("send", _sport_short(sig.get("sport", "tabletennis")))
+                eligible = {"free": ["free"], "both": ["vip", "free"]}.get(dest, ["vip"])
+                auto_groups = [g for g in eligible if _auto_send_on(g)]
+                if auto_groups:
+                    auto_dest = "both" if len(auto_groups) == 2 else auto_groups[0]
+                    sent_g = await send_signal_to_groups(app.bot, sig, vip_signal_text(sig), dest=auto_dest)
                     if sent_g:
                         db.mark_signal_sent(sig_id, VIP_GROUP_ID in sent_g, FREE_GROUP_ID in sent_g)
+                        # aggiorna i tasti del messaggio admin: niente doppio invio
+                        try:
+                            await admin_msg.edit_reply_markup(InlineKeyboardMarkup(
+                                _send_rows(db.get_signal(sig_id)) + kb[len(_send_rows({"id": sig_id, "status": "pending"})):]))
+                        except Exception as e:
+                            logger.warning(f"Aggiornamento tasti dopo auto-invio fallito: {e}")
 
         except Exception as e:
             logger.error(f"Errore analisi {match.get('name','?')}: {e}")
