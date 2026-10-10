@@ -802,6 +802,23 @@ class SignalScraper:
                         except Exception:
                             pass
                     window_end = _pingpong_window_end(now, min_start, pp_interval_h)
+
+                    # Metodo principale: UNA richiesta con le quote di tutte le partite dei
+                    # tornei migliori (vedi _fetch_pp_by_tournaments). Se non va, si ripiega
+                    # sul vecchio metodo per-partita qui sotto.
+                    if os.environ.get("PP_USE_TOURNAMENT_ODDS", "1") == "1":
+                        try:
+                            tm = await self._fetch_pp_by_tournaments(
+                                session, fixtures, winner_market, totals_market,
+                                totals_markets_all, min_start, window_end,
+                            )
+                        except Exception as e:
+                            logger.warning(f"OddsPapi by-tournaments errore: {e}")
+                            tm = None
+                        if tm:
+                            return tm
+                        logger.info("OddsPapi by-tournaments: nessun risultato utile — ripiego sul metodo per-partita")
+
                     n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
                     fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, n_fixtures), _sort_key, n_fixtures, min_start, window_end)
                     logger.info(
@@ -824,11 +841,115 @@ class SignalScraper:
 
         return matches
 
+    async def _fetch_pp_by_tournaments(
+        self, session: aiohttp.ClientSession, fixtures: list, winner_market: dict,
+        totals_market: dict | None, totals_markets_all: list | None,
+        min_start: datetime, window_end: datetime,
+    ) -> list[dict] | None:
+        """Ping pong: UNA richiesta /v4/odds-by-tournaments restituisce le quote di
+        TUTTE le partite dei tornei richiesti (invece di 1 richiesta per partita).
+        Sceglie i tornei con più partite ben coperte nella finestra di scan, scarica
+        le quote e le trasforma negli stessi dict del metodo per-partita.
+        Ritorna None se qualcosa non va (il chiamante ripiega sul vecchio metodo).
+        Variabili d'ambiente opzionali su Railway:
+          PP_USE_TOURNAMENT_ODDS=0        → disattiva (torna al metodo per-partita)
+          PP_TOURNAMENTS_PER_REQUEST=2    → quanti tornei per richiesta (default 2)
+          PP_MAX_FIXTURES=40              → massimo partite analizzate per scan
+          PP_BOOKMAKERS=a,b,c             → limita i bookmaker (payload più leggero)
+        """
+        def _start(f):
+            s_ = f.get("startDate") or f.get("startTime") or ""
+            try:
+                dt = datetime.fromisoformat(str(s_).replace("Z", "+00:00"))
+                return dt if dt.tzinfo else dt.replace(tzinfo=IT_TZ)
+            except Exception:
+                return None
+
+        by_t: dict = {}
+        for f in fixtures:
+            tid, st = f.get("tournamentId"), _start(f)
+            if tid is None or st is None or _fixture_coverage_score(f) < 3:
+                continue
+            if min_start <= st <= window_end:
+                by_t.setdefault(tid, []).append(f)
+        if not by_t:
+            logger.info("OddsPapi by-tournaments: nessun torneo con partite ben coperte nella finestra")
+            return None
+
+        n_t = max(1, int(os.environ.get("PP_TOURNAMENTS_PER_REQUEST", "2")))
+        top = sorted(by_t.items(), key=lambda kv: len(kv[1]), reverse=True)[:n_t]
+        tids = [str(k) for k, _ in top]
+        n_cand = sum(len(v) for _, v in top)
+        params = {"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids)}
+        bm = os.environ.get("PP_BOOKMAKERS", "").strip()
+        if bm:
+            params["bookmakers"] = bm
+
+        await self._throttle_oddspapi()
+        t0 = time.time()
+        async with session.get(
+            f"{ODDSPAPI_BASE}/odds-by-tournaments", params=params,
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as r:
+            self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
+            if self.db is not None:
+                self.db.increment_api_calls("oddspapi")
+            if r.status != 200:
+                body = await r.text()
+                logger.warning(f"OddsPapi odds-by-tournaments status {r.status}: {body[:200]}")
+                return None
+            raw = await r.read()
+        data = json.loads(raw)
+        n_bytes = len(raw)
+        del raw
+        if isinstance(data, dict):
+            data = data.get("data") or data.get("fixtures") or []
+        if not isinstance(data, list):
+            logger.warning("OddsPapi odds-by-tournaments: formato risposta inatteso")
+            return None
+
+        base = {str(f.get("fixtureId")): f for f in fixtures}
+        in_window = []
+        for fx in data:
+            if not isinstance(fx, dict) or fx.get("hasOdds") is False:
+                continue
+            merged = {**base.get(str(fx.get("fixtureId")), {}),
+                      **{k: v for k, v in fx.items() if v not in (None, "")}}
+            st = _start(merged)
+            if st is not None and min_start <= st <= window_end:
+                in_window.append((st, merged))
+        in_window.sort(key=lambda x: x[0])
+        cap = max(1, int(os.environ.get("PP_MAX_FIXTURES", "40")))
+        in_window = in_window[:cap]
+
+        matches = []
+        for _, merged in in_window:
+            m = await self._parse_oddspapi_fixture(
+                session, merged, winner_market, totals_market,
+                totals_markets_all=totals_markets_all, odds_data=merged, quiet=True,
+            )
+            if m:
+                matches.append(m)
+
+        books = [len(m.get("raw_bookmakers") or {}) for m in matches]
+        with_totals = sum(1 for m in matches if m.get("raw_totals"))
+        logger.info(
+            f"OddsPapi by-tournaments: tornei {tids} ({n_cand} partite candidate) → "
+            f"{len(data)} fixture ricevute, {len(in_window)} in finestra, {len(matches)} con quote "
+            f"({with_totals} con over/under), book vincente medi "
+            f"{(sum(books) / len(books)) if books else 0:.0f}, {n_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
+        )
+        return matches or None
+
     async def _parse_oddspapi_fixture(
         self, session: aiohttp.ClientSession, fix: dict, winner_market: dict,
         totals_market: dict | None = None, default_sport_label: str = "Ping Pong",
         totals_markets_all: list | None = None,
+        odds_data: dict | None = None, quiet: bool = False,
     ) -> dict | None:
+        """odds_data: payload quote già in mano (es. da /odds-by-tournaments) —
+        se presente NON si fa la chiamata /odds per-partita (zero richieste).
+        quiet: il log "book coverage" per partita va a DEBUG (scan con tante partite)."""
         try:
             p1 = (fix.get("participant1Name") or fix.get("home") or "").strip()
             p2 = (fix.get("participant2Name") or fix.get("away") or "").strip()
@@ -858,7 +979,8 @@ class SignalScraper:
             raw_bookmakers = {}
             raw_totals: dict = {}
 
-            if fid:
+            data = odds_data
+            if data is None and fid:
                 try:
                     await self._throttle_oddspapi()
                     async with session.get(
@@ -882,35 +1004,6 @@ class SignalScraper:
                             self.db.increment_api_calls("oddspapi")
                         if r.status == 200:
                             data = await r.json()
-                            odds_home, odds_away, over_odds, under_odds, totals_line = \
-                                self._extract_oddspapi_odds(data, winner_market, totals_market)
-                            # Salva quote per bookmaker per de-vig Pinnacle
-                            raw_bookmakers = self._extract_raw_bookmakers(data, winner_market)
-                            raw_totals = self._extract_oddspapi_totals(
-                                data, totals_markets_all or totals_market
-                            )
-                            # DIAGNOSTICA: ai_analyzer.py serve un book sharp (Pinnacle/Sbobet/
-                            # ecc. — mai presenti su OddsPapi) oppure il consenso di almeno
-                            # MIN_REF_BOOKS=3 book sulla stessa quota/linea per generare un
-                            # segnale (vincente o over/under). Logghiamo qui quanti book
-                            # arrivano davvero per fixture, per capire se è questo il motivo
-                            # per cui certi sport/leghe (es. ping pong su leghe minori) non
-                            # producono mai segnali anche quando la fixture viene trovata.
-                            n_tot_books = max((len(b) for b in raw_totals.values()), default=0)
-                            logger.info(
-                                f"OddsPapi [{default_sport_label}] book coverage: {p1} vs {p2} — "
-                                f"{len(raw_bookmakers)} book su mercato vincente {list(raw_bookmakers.keys())}, "
-                                f"{len(raw_totals)} linee totals disponibili, max {n_tot_books} book "
-                                f"sulla stessa linea (serve >=3 senza sharp per generare un segnale)"
-                            )
-                            if odds_home is None:
-                                n_bm = len(data.get("bookmakerOdds") or {})
-                                logger.info(
-                                    f"OddsPapi: nessun bookmaker ha quotato il mercato "
-                                    f"vincente per {p1} vs {p2} (fixtureId={fid}, "
-                                    f"{n_bm} bookmaker nel payload ma nessuno su "
-                                    f"marketId={winner_market['market_id']})"
-                                )
                         else:
                             body = await r.text()
                             logger.warning(
@@ -919,6 +1012,37 @@ class SignalScraper:
                             )
                 except Exception as e:
                     logger.warning(f"OddsPapi /odds eccezione fixture {fid} ({p1} vs {p2}): {e}")
+
+            if data is not None:
+                try:
+                    odds_home, odds_away, over_odds, under_odds, totals_line = \
+                        self._extract_oddspapi_odds(data, winner_market, totals_market)
+                    # Salva quote per bookmaker per de-vig Pinnacle
+                    raw_bookmakers = self._extract_raw_bookmakers(data, winner_market)
+                    raw_totals = self._extract_oddspapi_totals(
+                        data, totals_markets_all or totals_market
+                    )
+                    # DIAGNOSTICA: ai_analyzer.py serve un book sharp oppure il consenso
+                    # di almeno MIN_REF_BOOKS=3 book sulla stessa quota/linea per
+                    # generare un segnale (vincente o over/under). Logghiamo quanti book
+                    # arrivano davvero per fixture.
+                    n_tot_books = max((len(b) for b in raw_totals.values()), default=0)
+                    (logger.debug if quiet else logger.info)(
+                        f"OddsPapi [{default_sport_label}] book coverage: {p1} vs {p2} — "
+                        f"{len(raw_bookmakers)} book su mercato vincente {list(raw_bookmakers.keys())}, "
+                        f"{len(raw_totals)} linee totals disponibili, max {n_tot_books} book "
+                        f"sulla stessa linea (serve >=3 senza sharp per generare un segnale)"
+                    )
+                    if odds_home is None:
+                        n_bm = len(data.get("bookmakerOdds") or {})
+                        (logger.debug if quiet else logger.info)(
+                            f"OddsPapi: nessun bookmaker ha quotato il mercato "
+                            f"vincente per {p1} vs {p2} (fixtureId={fid}, "
+                            f"{n_bm} bookmaker nel payload ma nessuno su "
+                            f"marketId={winner_market['market_id']})"
+                        )
+                except Exception as e:
+                    logger.warning(f"OddsPapi estrazione quote fixture {fid} ({p1} vs {p2}): {e}")
 
             # FIX: prima qui si inventavano quote con random.uniform() quando
             # OddsPapi non restituiva quote reali per la fixture — un "segnale"
