@@ -899,26 +899,38 @@ class SignalScraper:
         t0 = time.time()
         for i, slug in enumerate(books):
             await self._throttle_oddspapi()
-            async with session.get(
-                f"{ODDSPAPI_BASE}/odds-by-tournaments",
-                params={"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids), "bookmaker": slug},
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as r:
-                self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
-                if self.db is not None:
-                    self.db.increment_api_calls("oddspapi")
-                if r.status != 200:
+            # Questo endpoint ha un cooldown di 1000 ms (docs OddsPapi): la seconda
+            # richiesta ravvicinata veniva rifiutata con 429 "Please wait 0.20 seconds".
+            if i > 0:
+                await asyncio.sleep(1.3)
+            raw = None
+            for attempt in (1, 2):
+                async with session.get(
+                    f"{ODDSPAPI_BASE}/odds-by-tournaments",
+                    params={"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids), "bookmaker": slug},
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as r:
+                    self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
+                    if self.db is not None:
+                        self.db.increment_api_calls("oddspapi")
+                    if r.status == 200:
+                        raw = await r.read()
+                        break
                     body = await r.text()
                     logger.warning(f"OddsPapi odds-by-tournaments (bookmaker={slug}) status {r.status}: {body[:200]}")
+                    if r.status == 429 and attempt == 1:
+                        await asyncio.sleep(1.5)       # rate limit momentaneo: un solo nuovo tentativo
+                        continue
                     if r.status in (400, 401, 403, 404, 422):
                         # errore di configurazione: inutile ritentare (e sprecare quota) a ogni scan
                         self._pp_tourn_disabled = True
                         logger.warning("OddsPapi by-tournaments disattivato fino al riavvio del bot")
                         return None
-                    if i == 0:
-                        return None
-                    continue
-                raw = await r.read()
+                    break
+            if raw is None:
+                if i == 0:
+                    return None
+                continue
             total_bytes += len(raw)
             data = json.loads(raw)
             del raw
