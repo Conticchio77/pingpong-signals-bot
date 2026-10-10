@@ -846,17 +846,25 @@ class SignalScraper:
         totals_market: dict | None, totals_markets_all: list | None,
         min_start: datetime, window_end: datetime,
     ) -> list[dict] | None:
-        """Ping pong: UNA richiesta /v4/odds-by-tournaments restituisce le quote di
-        TUTTE le partite dei tornei richiesti (invece di 1 richiesta per partita).
-        Sceglie i tornei con più partite ben coperte nella finestra di scan, scarica
-        le quote e le trasforma negli stessi dict del metodo per-partita.
+        """Ping pong: /v4/odds-by-tournaments restituisce le quote di TUTTE le partite
+        dei tornei richiesti, ma per UN SOLO bookmaker a chiamata (parametro
+        "bookmaker", obbligatorio: con 0 o più di uno risponde 400). Quindi: 1 richiesta
+        per bookmaker, e ogni richiesta copre decine di partite invece di una.
+        Si usano pochi bookmaker: il primo è lo sharp di riferimento (sbobet), gli altri
+        sono i soft su cui cercare valore (bwin). Costo per scan: 1 (elenco partite)
+        + 1 per bookmaker (default 2) = 3 richieste, come il vecchio metodo che però
+        controllava solo 2 partite.
         Ritorna None se qualcosa non va (il chiamante ripiega sul vecchio metodo).
         Variabili d'ambiente opzionali su Railway:
           PP_USE_TOURNAMENT_ODDS=0        → disattiva (torna al metodo per-partita)
-          PP_TOURNAMENTS_PER_REQUEST=2    → quanti tornei per richiesta (default 2)
+          PP_BOOKMAKERS=sbobet,bwin       → bookmaker da interrogare (il primo = sharp)
+          PP_MAX_BOOK_REQUESTS=3          → massimo bookmaker (= richieste) per scan
+          PP_TOURNAMENTS_PER_REQUEST=3    → quanti tornei per richiesta
           PP_MAX_FIXTURES=40              → massimo partite analizzate per scan
-          PP_BOOKMAKERS=a,b,c             → limita i bookmaker (payload più leggero)
         """
+        if getattr(self, "_pp_tourn_disabled", False):
+            return None
+
         def _start(f):
             s_ = f.get("startDate") or f.get("startTime") or ""
             try:
@@ -876,48 +884,67 @@ class SignalScraper:
             logger.info("OddsPapi by-tournaments: nessun torneo con partite ben coperte nella finestra")
             return None
 
-        n_t = max(1, int(os.environ.get("PP_TOURNAMENTS_PER_REQUEST", "2")))
+        n_t = max(1, int(os.environ.get("PP_TOURNAMENTS_PER_REQUEST", "3")))
         top = sorted(by_t.items(), key=lambda kv: len(kv[1]), reverse=True)[:n_t]
         tids = [str(k) for k, _ in top]
         n_cand = sum(len(v) for _, v in top)
-        params = {"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids)}
-        bm = os.environ.get("PP_BOOKMAKERS", "").strip()
-        if bm:
-            params["bookmakers"] = bm
 
-        await self._throttle_oddspapi()
-        t0 = time.time()
-        async with session.get(
-            f"{ODDSPAPI_BASE}/odds-by-tournaments", params=params,
-            timeout=aiohttp.ClientTimeout(total=90),
-        ) as r:
-            self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
-            if self.db is not None:
-                self.db.increment_api_calls("oddspapi")
-            if r.status != 200:
-                body = await r.text()
-                logger.warning(f"OddsPapi odds-by-tournaments status {r.status}: {body[:200]}")
-                return None
-            raw = await r.read()
-        data = json.loads(raw)
-        n_bytes = len(raw)
-        del raw
-        if isinstance(data, dict):
-            data = data.get("data") or data.get("fixtures") or []
-        if not isinstance(data, list):
-            logger.warning("OddsPapi odds-by-tournaments: formato risposta inatteso")
-            return None
+        books = [b.strip() for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()]
+        books = books[:max(1, int(os.environ.get("PP_MAX_BOOK_REQUESTS", "3")))]
 
         base = {str(f.get("fixtureId")): f for f in fixtures}
+        combined: dict = {}      # fixtureId -> {"fx": campi della fixture, "bm": {slug: payload bookmaker}}
+        per_book: list = []
+        total_bytes = 0
+        t0 = time.time()
+        for i, slug in enumerate(books):
+            await self._throttle_oddspapi()
+            async with session.get(
+                f"{ODDSPAPI_BASE}/odds-by-tournaments",
+                params={"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids), "bookmaker": slug},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as r:
+                self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
+                if self.db is not None:
+                    self.db.increment_api_calls("oddspapi")
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"OddsPapi odds-by-tournaments (bookmaker={slug}) status {r.status}: {body[:200]}")
+                    if r.status in (400, 401, 403, 404, 422):
+                        # errore di configurazione: inutile ritentare (e sprecare quota) a ogni scan
+                        self._pp_tourn_disabled = True
+                        logger.warning("OddsPapi by-tournaments disattivato fino al riavvio del bot")
+                        return None
+                    if i == 0:
+                        return None
+                    continue
+                raw = await r.read()
+            total_bytes += len(raw)
+            data = json.loads(raw)
+            del raw
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("fixtures") or []
+            if not isinstance(data, list):
+                logger.warning("OddsPapi odds-by-tournaments: formato risposta inatteso")
+                return None
+            n_with = 0
+            for fx in data:
+                if not isinstance(fx, dict) or fx.get("hasOdds") is False:
+                    continue
+                fid = str(fx.get("fixtureId"))
+                entry = combined.setdefault(fid, {"fx": {}, "bm": {}})
+                entry["fx"].update({k: v for k, v in fx.items() if k != "bookmakerOdds" and v not in (None, "")})
+                for sl, payload in (fx.get("bookmakerOdds") or {}).items():
+                    entry["bm"][sl] = payload
+                    n_with += 1
+            per_book.append(f"{slug}:{n_with}")
+
         in_window = []
-        for fx in data:
-            if not isinstance(fx, dict) or fx.get("hasOdds") is False:
-                continue
-            merged = {**base.get(str(fx.get("fixtureId")), {}),
-                      **{k: v for k, v in fx.items() if v not in (None, "")}}
+        for fid, entry in combined.items():
+            merged = {**base.get(fid, {}), **entry["fx"], "bookmakerOdds": entry["bm"]}
             st = _start(merged)
-            if st is not None and min_start <= st <= window_end:
-                in_window.append((st, merged))
+            if st is not None and min_start <= st <= window_end and len(entry["bm"]) >= 2:
+                in_window.append((st, merged))     # servono sharp + almeno un soft
         in_window.sort(key=lambda x: x[0])
         cap = max(1, int(os.environ.get("PP_MAX_FIXTURES", "40")))
         in_window = in_window[:cap]
@@ -931,13 +958,12 @@ class SignalScraper:
             if m:
                 matches.append(m)
 
-        books = [len(m.get("raw_bookmakers") or {}) for m in matches]
         with_totals = sum(1 for m in matches if m.get("raw_totals"))
         logger.info(
-            f"OddsPapi by-tournaments: tornei {tids} ({n_cand} partite candidate) → "
-            f"{len(data)} fixture ricevute, {len(in_window)} in finestra, {len(matches)} con quote "
-            f"({with_totals} con over/under), book vincente medi "
-            f"{(sum(books) / len(books)) if books else 0:.0f}, {n_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
+            f"OddsPapi by-tournaments: tornei {tids} ({n_cand} partite candidate), bookmaker {per_book} → "
+            f"{len(combined)} fixture ricevute, {len(in_window)} con almeno 2 book in finestra, "
+            f"{len(matches)} con quote ({with_totals} con over/under), "
+            f"{total_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
         )
         return matches or None
 
