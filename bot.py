@@ -1278,12 +1278,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Scegli intervallo scan (picker visuale) ───────────────────────────────────
     elif data == "pick_interval":
         current = db.get_settings()["scan_interval"]
-        # Finestra attiva 07-22 = 15h → scan_per_giorno = 15 // intervallo
-        opts = [1, 2, 3, 4, 6]
+        # Finestra attiva 07-22: ore di scan = 7, 7+o, 7+2o... fino a 22 incluso
+        # (es. 6h → 07,13,19 · 12h → 07,19). Con 2 tornei attivi (es. ATP + WTA)
+        # ogni scan costa ~4 crediti (2 mercati × 2 tornei): stima prudente.
+        opts = [1, 2, 3, 4, 6, 8, 12]
         kb = []
         for o in opts:
-            scans_day = 15 // o
-            credits_mo = scans_day * 2 * 31
+            scans_day = len(range(7, 23, o))
+            credits_mo = scans_day * 4 * 31
             prefix = "✅ " if o == current else ""
             warn = " ⚠️" if credits_mo > 450 else ""
             label = f"{prefix}{o}h — ~{credits_mo} crediti/mese{warn}"
@@ -1292,7 +1294,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⏱ *Frequenza scan tennis*\n\n"
             "Scan attivi solo tra 07:00 e 22:00.\n"
-            "The Odds API: 500 crediti/mese gratuiti.\n"
+            "The Odds API: 500 crediti/mese gratuiti (stima: ~4 crediti per scan con 2 tornei attivi).\n"
             f"Attuale: ogni {current}h",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
