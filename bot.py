@@ -105,6 +105,11 @@ async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=Non
             sent.append(gid)
         except Exception as e:
             logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
+    # Risultati e statistiche: se sono arrivati nel canale VIP, vanno anche in privato agli
+    # utenti con la ricezione tennis/pingpong attiva (stesso relay dei segnali, nessun saldo
+    # scalato). Il tasto grafico (reply_markup) non viene inoltrato: nei DM non funzionerebbe.
+    if VIP_GROUP_ID in sent:
+        await relay_to_private(text)
     return sent
 
 def _sent_note(sport: str, kind: str, sent: list[int], override: str | None = None) -> str:
@@ -752,8 +757,8 @@ async def send_settings_tennis(fn):
     s = db.get_settings()
     conf_label = _conf_label(s['min_confidence'])
     interval   = s["scan_interval"]
-    scan_day   = 15 // interval  # scan tra 07:00 e 22:00 = 15h di finestra
-    credits_mo = scan_day * 2 * 31  # ~2 crediti per scan
+    scan_day   = len(range(7, 23, interval))   # ore di scan: 7, 7+h, ... fino a 22 incluso
+    credits_mo = scan_day * 4 * 31             # ~4 crediti per scan con 2 tornei attivi
 
     dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_tennis"], "📤 VIP")
     kb = [
@@ -780,8 +785,9 @@ async def send_settings_pingpong(fn):
     s = db.get_settings()
     conf_pp_label = _conf_label(s['min_confidence_pp'])
     pp_interval   = s["pingpong_scan_interval"]
-    pp_scan_day   = 15 // pp_interval + 1
-    pp_calls_mo   = pp_scan_day * 4 * 31
+    pp_scan_day   = len(range(7, 23, pp_interval))
+    _n_books      = len([b for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()])
+    pp_calls_mo   = pp_scan_day * (1 + _n_books) * 31   # 1 elenco + 1 richiesta per bookmaker
 
     dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_pingpong"], "📤 VIP")
     kb = [
@@ -1312,12 +1318,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         opts = [24, 12, 8, 6, 4, 3]
         kb = []
         for o in opts:
-            scans_day  = 15 // o + 1  # +1: include sempre le 07:00 (07-22 inclusivo)
-            # Fixture/scan adattivo (vedi scraper._pingpong_fixtures_per_scan):
-            # 3 con 1 scan/giorno, 2 con 2 scan/giorno, 1 con 3+ scan/giorno —
-            # così la quota resta sotto controllo anche dividendo gli scan.
-            fixtures_per_scan = 3 if scans_day <= 1 else (2 if scans_day == 2 else 1)
-            calls_mo   = scans_day * (1 + fixtures_per_scan) * 31  # 1 /fixtures + N /odds per scan
+            scans_day  = len(range(7, 23, o))   # ore di scan: 7, 7+o, ... fino a 22 incluso
+            # Metodo per tornei: 1 richiesta per l'elenco partite + 1 per ogni
+            # bookmaker (PP_BOOKMAKERS, default 2), a prescindere da quante partite.
+            n_books    = len([b for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()])
+            calls_mo   = scans_day * (1 + n_books) * 31
             prefix = "✅ " if o == current else ""
             warn = " ⚠️" if calls_mo > 240 else ""
             label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo 07:00) — ~{calls_mo} req/mese"
@@ -2070,9 +2075,13 @@ async def run_pingpong_scan(app: Application, is_retry: bool = False):
         # e basta, quindi "nessuna eccezione" non vuol dire "dati reali ottenuti".
         # Controlliamo esplicitamente lo stato quota per non segnare il giorno
         # come completato quando in realtà OddsPapi ha risposto 429.
-        ok = scraper.pingpong_quota_ok
+        rate_limited = getattr(scraper, "pingpong_rate_limited", False)
+        ok = scraper.pingpong_quota_ok and not rate_limited
         if not ok:
-            logger.warning("🏓 Scan ping pong: quota OddsPapi esaurita (429) — non segnato come completato, riprovo")
+            if rate_limited and scraper.pingpong_quota_ok:
+                logger.warning("🏓 Scan ping pong: rate limit momentaneo di OddsPapi (quota ok) — non segnato come completato, riprovo")
+            else:
+                logger.warning("🏓 Scan ping pong: quota OddsPapi esaurita (429) — non segnato come completato, riprovo")
     except Exception as e:
         logger.error(f"🏓 Scan ping pong fallito: {e}", exc_info=True)
 

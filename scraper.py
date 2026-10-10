@@ -256,6 +256,7 @@ class SignalScraper:
         # per avvisare l'admin quando i segnali si fermano per quota esaurita.
         self.tennis_quota_ok   = True
         self.pingpong_quota_ok = True
+        self.pingpong_rate_limited = False   # 429 da cooldown (momentaneo), NON quota esaurita
         # FIX: throttle tra chiamate OddsPapi. Nel log del 24/09 quasi TUTTE
         # le fixture venivano scartate per "nessuna quota reale" — non perché
         # mancassero davvero le quote, ma perché il bot sparava le richieste
@@ -263,7 +264,7 @@ class SignalScraper:
         # rispondeva 429 "rate limited" a quasi tutte (persino la seconda
         # /fixtures nello stesso scan). Ora si aspetta un minimo tra due
         # chiamate consecutive a OddsPapi, qualunque sia l'endpoint.
-        self._oddspapi_min_interval = 0.8  # secondi
+        self._oddspapi_min_interval = 1.2  # secondi (cooldown /fixtures = 1000 ms; /settlements = 2000 ms, vedi sotto)
         self._last_oddspapi_call    = 0.0
         self._oddspapi_lock         = asyncio.Lock()
         self._all_markets_cache     = None  # lista completa /markets, scaricata una volta
@@ -290,11 +291,12 @@ class SignalScraper:
             except Exception:
                 pass
 
-    async def _throttle_oddspapi(self):
-        """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere."""
+    async def _throttle_oddspapi(self, min_interval: float | None = None):
+        """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere.
+        min_interval: cooldown specifico dell'endpoint (es. /settlements = 2000 ms)."""
         async with self._oddspapi_lock:
             now  = asyncio.get_event_loop().time()
-            wait = self._oddspapi_min_interval - (now - self._last_oddspapi_call)
+            wait = (min_interval or self._oddspapi_min_interval) - (now - self._last_oddspapi_call)
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_oddspapi_call = asyncio.get_event_loop().time()
@@ -716,6 +718,17 @@ class SignalScraper:
         return None
 
     async def _fetch_oddspapi_tt(self) -> list[dict]:
+        """Scan ping pong con un nuovo tentativo dopo un 429 da cooldown (momentaneo)."""
+        self.pingpong_rate_limited = False
+        res = await self._fetch_oddspapi_tt_once()
+        if not res and self.pingpong_rate_limited:
+            logger.info("OddsPapi: rate limit momentaneo — riprovo tra 3 secondi")
+            await asyncio.sleep(3)
+            self.pingpong_rate_limited = False
+            res = await self._fetch_oddspapi_tt_once()
+        return res
+
+    async def _fetch_oddspapi_tt_once(self) -> list[dict]:
         matches = []
         async with aiohttp.ClientSession() as session:
             sport_id = await self._get_tt_sport_id(session)
@@ -754,7 +767,11 @@ class SignalScraper:
                         txt = await r.text()
                         logger.warning(f"OddsPapi fixtures status {r.status}: {txt[:120]}")
                         if r.status == 429:
-                            self.pingpong_quota_ok = False
+                            if "rate limit" in txt.lower() or "RATE_LIMITED" in txt:
+                                # cooldown tra due richieste ravvicinate: momentaneo, la quota è ok
+                                self.pingpong_rate_limited = True
+                            else:
+                                self.pingpong_quota_ok = False
                         return []
                     self.pingpong_quota_ok = True
                     fixtures = await r.json()
@@ -1765,6 +1782,12 @@ class SignalScraper:
                 async with aiohttp.ClientSession() as session:
                     sport_id = await self._get_tt_sport_id(session)
                     if sport_id:
+                        # Mercato "vincente" REALE del ping pong (per OddsPapi è 251, non 101
+                        # che è l'1X2 del calcio): stessi ID usati per leggere le quote.
+                        wm = await self._get_winner_market(session, sport_id)
+                        win_mid = str((wm or {}).get("market_id") or "101")
+                        win_o1  = str((wm or {}).get("outcome_p1") or "101")
+                        win_o2  = str((wm or {}).get("outcome_p2") or "102")
                         from_utc = (_now_it() - timedelta(hours=36)).astimezone(ZoneInfo("UTC")) \
                             .strftime("%Y-%m-%dT%H:%M:%SZ")
                         to_utc = _now_it().astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1805,32 +1828,48 @@ class SignalScraper:
                                     if not home or not away or not fid:
                                         continue
                                     try:
-                                        await self._throttle_oddspapi()
-                                        async with session.get(
-                                            f"{ODDSPAPI_BASE}/settlements",
-                                            params={"apiKey": ODDSPAPI_KEY, "fixtureId": fid},
-                                            timeout=aiohttp.ClientTimeout(total=10),
-                                        ) as sresp:
-                                            if sresp.status != 200:
-                                                logger.debug(f"OddsPapi settlements status {sresp.status} per {fid}")
-                                                continue
-                                            sdata = await sresp.json()
-                                            market   = (sdata.get("markets") or {}).get("101", {})
-                                            outcomes = market.get("outcomes", {})
-                                            r1 = outcomes.get("101", {}).get("players", {}).get("0", {}).get("result")
-                                            r2 = outcomes.get("102", {}).get("players", {}).get("0", {}).get("result")
-                                            if r1 == "WIN":
-                                                winner = home
-                                            elif r2 == "WIN":
-                                                winner = away
-                                            else:
-                                                continue  # esito non chiaro (push/annullato/mercato assente)
-                                            results.append({
-                                                "home":   home,
-                                                "away":   away,
-                                                "winner": winner,
-                                                "sport":  "tabletennis",
-                                            })
+                                        sdata = None
+                                        for attempt in (1, 2):
+                                            # /settlements ha un cooldown di 2000 ms (docs OddsPapi):
+                                            # con meno di 2 s tra due chiamate rispondeva 429 e il
+                                            # risultato non veniva mai letto.
+                                            await self._throttle_oddspapi(2.2)
+                                            async with session.get(
+                                                f"{ODDSPAPI_BASE}/settlements",
+                                                params={"apiKey": ODDSPAPI_KEY, "fixtureId": fid},
+                                                timeout=aiohttp.ClientTimeout(total=10),
+                                            ) as sresp:
+                                                if self.db is not None:
+                                                    self.db.increment_api_calls("oddspapi")
+                                                if sresp.status == 200:
+                                                    sdata = await sresp.json()
+                                                    break
+                                                body = (await sresp.text())[:120]
+                                                logger.warning(f"OddsPapi settlements status {sresp.status} per {home} vs {away}: {body}")
+                                                if sresp.status != 429:
+                                                    break
+                                        if sdata is None:
+                                            continue
+                                        market   = (sdata.get("markets") or {}).get(win_mid, {})
+                                        outcomes = market.get("outcomes", {})
+                                        r1 = outcomes.get(win_o1, {}).get("players", {}).get("0", {}).get("result")
+                                        r2 = outcomes.get(win_o2, {}).get("players", {}).get("0", {}).get("result")
+                                        if r1 == "WIN":
+                                            winner = home
+                                        elif r2 == "WIN":
+                                            winner = away
+                                        else:
+                                            logger.info(
+                                                f"OddsPapi settlements: esito non chiaro per {home} vs {away} "
+                                                f"(mercato {win_mid}: {r1}/{r2}, mercati presenti: {list((sdata.get('markets') or {}).keys())[:6]})"
+                                            )
+                                            continue  # esito non chiaro (push/annullato/non ancora liquidato)
+                                        results.append({
+                                            "home":   home,
+                                            "away":   away,
+                                            "winner": winner,
+                                            "sport":  "tabletennis",
+                                        })
                                     except Exception as e:
                                         logger.debug(f"OddsPapi settlements errore fixture {fid}: {e}")
                             else:
