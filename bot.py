@@ -105,11 +105,6 @@ async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=Non
             sent.append(gid)
         except Exception as e:
             logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
-    # Risultati e statistiche: se sono arrivati nel canale VIP, vanno anche in privato agli
-    # utenti con la ricezione tennis/pingpong attiva (stesso relay dei segnali, nessun saldo
-    # scalato). Il tasto grafico (reply_markup) non viene inoltrato: nei DM non funzionerebbe.
-    if VIP_GROUP_ID in sent:
-        await relay_to_private(text)
     return sent
 
 def _sent_note(sport: str, kind: str, sent: list[int], override: str | None = None) -> str:
@@ -1325,7 +1320,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             calls_mo   = scans_day * (1 + n_books) * 31
             prefix = "✅ " if o == current else ""
             warn = " ⚠️" if calls_mo > 240 else ""
-            label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo 07:00) — ~{calls_mo} req/mese"
+            label = f"{prefix}{o}h — ~{calls_mo} req/mese{warn}" if o != 24 else f"{prefix}24h (solo {int(os.environ.get('PP_SCAN_START_HOUR', '7')):02d}:00) — ~{calls_mo} req/mese"
             kb.append([InlineKeyboardButton(label, callback_data=f"set_interval_pp_{o}")])
         kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
         await query.edit_message_text(

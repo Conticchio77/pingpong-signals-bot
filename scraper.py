@@ -63,7 +63,14 @@ def pingpong_scan_hours(interval_h: int) -> list:
         return [7, 14]
     if interval_h <= 0:
         interval_h = 24
-    hours, h = [], 7
+    # PP_SCAN_START_HOUR (variabile Railway, default 7): ora del primo scan. Con 1 scan
+    # al giorno (24h) permette di scegliere il pomeriggio (es. 14), quando 22bet quota
+    # molte più partite che al mattino (nei log: 90 partite alle 14:45, 1 alle 07:00).
+    try:
+        start = min(22, max(0, int(os.environ.get("PP_SCAN_START_HOUR", "7"))))
+    except ValueError:
+        start = 7
+    hours, h = [], start
     while h <= 22:
         hours.append(h)
         h += interval_h

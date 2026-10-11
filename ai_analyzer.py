@@ -43,25 +43,27 @@ SOFT_BOOKS = {
     "sisal", "goldbet", "eurobet", "planetwin365",
 }
 
-# ── Bookmaker "giocabili" (dove l'utente può davvero puntare) ──────────────────
-# La quota da giocare viene cercata SOLO tra questi book; gli sharp restano il
-# riferimento per la probabilità fair. Match per sottostringa sul nome/slug.
-#   Tennis (The Odds API, slug "onexbet"; via OddsPapi sarebbe "1xbet"):
-#     variabile Railway TENNIS_SOFT_BOOKS, default "onexbet,1xbet". Vuota = tutti.
-#   Ping pong: i book arrivano già filtrati dallo scraper (PP_BOOKMAKERS); se vuoi
-#     un filtro in più usa PP_SOFT_BOOKS (default vuoto = nessun filtro).
-def _soft_whitelist(sport: str) -> list:
+# ── Bookmaker PREFERITO (dove l'utente preferisce puntare) ─────────────────────
+# Per ogni segnale si guarda PRIMA il book preferito: se il suo prezzo ha già il
+# valore minimo, il segnale esce su quel book. Se non quota la partita o il suo
+# prezzo non ha valore, si cerca il valore sul miglior prezzo degli ALTRI book
+# (e il messaggio dice su quale book). Gli sharp restano il riferimento fair.
+# Match per sottostringa sul nome/slug del book.
+#   Tennis (The Odds API: slug "onexbet"):  variabile Railway TENNIS_PREFERRED_BOOKS,
+#     default "onexbet,1xbet".
+#   Ping pong (OddsPapi):  variabile PP_PREFERRED_BOOKS, default "22bet". Gli altri
+#     book disponibili dipendono da PP_BOOKMAKERS (quelli che lo scraper scarica).
+# Variabile vuota = nessuna preferenza (si usa sempre il miglior prezzo).
+def _preferred_books(sport: str) -> list:
     if sport == "tennis":
-        raw = os.environ.get("TENNIS_SOFT_BOOKS", "onexbet,1xbet")
+        raw = os.environ.get("TENNIS_PREFERRED_BOOKS", "onexbet,1xbet")
     else:
-        raw = os.environ.get("PP_SOFT_BOOKS", "")
+        raw = os.environ.get("PP_PREFERRED_BOOKS", "22bet")
     return [b.strip().lower() for b in raw.split(",") if b.strip()]
 
-def _soft_allowed(book_name: str, whitelist: list) -> bool:
-    if not whitelist:
-        return True
+def _is_preferred(book_name: str, preferred: list) -> bool:
     name = (book_name or "").lower()
-    return any(w in name for w in whitelist)
+    return bool(preferred) and any(w in name for w in preferred)
 
 # ── Soglie value bet ───────────────────────────────────────────────────────────
 MIN_VALUE_PCT        = 3.0    # % minimo di edge per generare segnale (default — override da settings["min_value_pct"])
@@ -185,25 +187,28 @@ class AIAnalyzer:
 
         # ── Winner ──────────────────────────────────────────────────────────
         if ref_kind:
-            soft_wl = _soft_whitelist(sport)
-            best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"), soft_wl)
-            best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"), soft_wl)
+            best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"))
+            best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"))
+            pref = _preferred_books(sport)
+            pref_h, pref_h_book = self._best_soft_odd(raw_bm, "home", None, pref) if pref else (None, None)
+            pref_a, pref_a_book = self._best_soft_odd(raw_bm, "away", None, pref) if pref else (None, None)
 
-            for player, fair, best, book in (
-                (p1, fair_home, best_h, best_h_book),
-                (p2, fair_away, best_a, best_a_book),
+            for player, fair, best, book, pbest, pbook in (
+                (p1, fair_home, best_h, best_h_book, pref_h, pref_h_book),
+                (p2, fair_away, best_a, best_a_book, pref_a, pref_a_book),
             ):
+                # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
+                pref_note = ""
+                if pbest and MIN_ODDS <= pbest <= MAX_ODDS and fair * pbest - 1 >= min_value:
+                    best, book = pbest, pbook
+                elif pref and best:
+                    pref_note = (f" (su {pbook} {pbest}: nessun valore)" if pbest
+                                 else f" ({'/'.join(pref)} non quota la partita)")
                 # DIAGNOSTICA: prima questi due scarti erano silenziosi (solo
                 # `continue`) — con 72 book di copertura ma zero segnali, non
                 # si riusciva a capire se la causa fosse "quota fuori range"
                 # (es. 1.15 per un favorito schiacciante, comune nel ping
                 # pong) o "edge sotto soglia". Ora entrambi i casi sono loggati.
-                if not best and soft_wl:
-                    logger.info(
-                        f"Winner scartato (nessuna quota su {'/'.join(soft_wl)}): "
-                        f"{match.get('name','?')} — {player}"
-                    )
-                    continue
                 if not best or not (MIN_ODDS <= best <= MAX_ODDS):
                     logger.info(
                         f"Winner scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
@@ -228,14 +233,14 @@ class AIAnalyzer:
                     value_pct = round(value * 100, 2),
                     confidence= self._confidence(value, ref_kind, source),
                     reasoning = self._reasoning_winner(player, fair, best, book, ref_kind, n_ref),
-                    book_note = f"Quota trovata su: {book or 'media mercato'}",
+                    book_note = f"Quota trovata su: {book or 'media mercato'}{pref_note}",
                 ))
 
         # ── Over/Under ───────────────────────────────────────────────────────
         # Servono le quote PER BOOK sulla stessa linea (raw_totals). Prima si
         # prendevano over e under migliori tra tutti i book, anche su linee
         # diverse, e li si de-viggava insieme: falsi positivi.
-        tot = self._totals_reference(match.get("raw_totals") or {}, _soft_whitelist(sport))
+        tot = self._totals_reference(match.get("raw_totals") or {}, _preferred_books(sport))
         if tot:
             unit = "set" if sport == "tabletennis" else "games"
             line = tot["line"]
@@ -244,6 +249,10 @@ class AIAnalyzer:
                 ("over",  tot["fair_over"],  tot["best_over"],  tot["over_book"]),
                 ("under", tot["fair_under"], tot["best_under"], tot["under_book"]),
             ):
+                # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
+                pbest = tot.get(f"pref_{side}")
+                if pbest and MIN_ODDS <= pbest <= MAX_ODDS and fair * pbest - 1 >= min_value:
+                    best, book = pbest, tot[f"pref_{side}_book"]
                 if not best or not (MIN_ODDS <= best <= MAX_ODDS):
                     logger.info(
                         f"Totals scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
@@ -326,17 +335,12 @@ class AIAnalyzer:
             return round(fh, 4), round(1 - fh, 4), "consensus", len(fairs)
         return None, None, None, len(fairs)
 
-    def _totals_reference(self, raw_totals: dict, whitelist: list | None = None) -> dict | None:
+    def _totals_reference(self, raw_totals: dict, preferred: list | None = None) -> dict | None:
         """raw_totals = {linea: {book: {"over": x, "under": y}}}. Sceglie la linea
         quotata da più book su entrambi i lati e ne ricava la probabilità fair."""
         best_line, entries = None, {}
         for line, books in raw_totals.items():
             valid = {b: o for b, o in books.items() if self._valid_pair(o.get("over"), o.get("under"))}
-            # con una whitelist la linea deve essere quotata da almeno un book giocabile
-            if whitelist and not any(
-                _soft_allowed(b, whitelist) and not self._is_sharp(b) for b in valid
-            ):
-                continue
             if len(valid) > len(entries) or (
                 valid and len(valid) == len(entries) and best_line is not None and line < best_line
             ):
@@ -358,19 +362,28 @@ class AIAnalyzer:
         else:
             logger.info(f"Over/Under: linea {best_line} con solo {len(entries)} book (servono {MIN_REF_BOOKS} o uno sharp) — saltato")
             return None
-        if whitelist:
-            playable = {b: v for b, v in playable.items() if _soft_allowed(b, whitelist)}
         if not playable:
             return None
 
         over_book  = max(playable, key=lambda b: playable[b]["over"])
         under_book = max(playable, key=lambda b: playable[b]["under"])
-        return {
+        out = {
             "line": best_line, "kind": kind, "n_books": len(entries),
             "fair_over": round(fair_ov, 4), "fair_under": round(fair_un, 4),
             "best_over": round(float(playable[over_book]["over"]), 3), "over_book": over_book,
             "best_under": round(float(playable[under_book]["under"]), 3), "under_book": under_book,
+            "preferred": list(preferred or []),
         }
+        # prezzo sul book PREFERITO (se quota questa linea)
+        pref_playable = {b: v for b, v in playable.items() if _is_preferred(b, preferred or [])}
+        if pref_playable:
+            po = max(pref_playable, key=lambda b: pref_playable[b]["over"])
+            pu = max(pref_playable, key=lambda b: pref_playable[b]["under"])
+            out.update({
+                "pref_over": round(float(pref_playable[po]["over"]), 3), "pref_over_book": po,
+                "pref_under": round(float(pref_playable[pu]["under"]), 3), "pref_under_book": pu,
+            })
+        return out
 
     # ── De-vig Power (metodo professionale) ───────────────────────────────────
     def _solve_power_k(self, p1: float, p2: float, iterations: int = 20) -> float:
@@ -393,7 +406,7 @@ class AIAnalyzer:
         return round((1/oh) / margin, 4), round((1/oa) / margin, 4)
 
     # ── Miglior quota soft book ────────────────────────────────────────────────
-    def _best_soft_odd(self, raw_bm: dict, side: str, fallback: float, whitelist: list | None = None) -> tuple:
+    def _best_soft_odd(self, raw_bm: dict, side: str, fallback: float, only: list | None = None) -> tuple:
         """
         Cerca la quota migliore per un lato (side = "home" o "away") tra i soft book.
         Ritorna (quota, nome_book).
@@ -415,15 +428,15 @@ class AIAnalyzer:
             # Salta sharp book per la ricerca della quota "da giocare"
             if any(s in book_name.lower() for s in SHARP_BOOKS):
                 continue
-            if not _soft_allowed(book_name, whitelist or []):
+            if only is not None and not _is_preferred(book_name, only):
                 continue
             val = odds.get(side)
             if isinstance(val, (int, float)) and val > best_price:
                 best_price = float(val)
                 best_book  = book_name
 
-        # Con una whitelist niente "media mercato": se il book scelto non quota, nessun segnale
-        if not best_price and whitelist:
+        # Ricerca sul solo book preferito: se non quota, nessun prezzo (niente media mercato)
+        if not best_price and only is not None:
             return None, None
 
         # Se non trovato tra soft, usa il fallback (media mercato)
