@@ -839,9 +839,9 @@ class SignalScraper:
                         except Exception as e:
                             logger.warning(f"OddsPapi by-tournaments errore: {e}")
                             tm = None
-                        if tm:
+                        if tm is not None:
                             return tm
-                        logger.info("OddsPapi by-tournaments: nessun risultato utile — ripiego sul metodo per-partita")
+                        logger.info("OddsPapi by-tournaments: errore — ripiego sul metodo per-partita")
 
                     n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
                     fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, n_fixtures), _sort_key, n_fixtures, min_start, window_end)
@@ -878,7 +878,10 @@ class SignalScraper:
         sono i soft su cui cercare valore (bwin). Costo per scan: 1 (elenco partite)
         + 1 per bookmaker (default 2) = 3 richieste, come il vecchio metodo che però
         controllava solo 2 partite.
-        Ritorna None se qualcosa non va (il chiamante ripiega sul vecchio metodo).
+        Ritorna None se c'è un ERRORE (il chiamante ripiega sul vecchio metodo), oppure
+        una lista (anche vuota = scan fatto, niente da analizzare: nessun ripiego, per non
+        sprecare richieste). Un 404 "FIXTURE_NOT_FOUND" per un bookmaker non è un errore:
+        vuol dire che quel bookmaker non quota ancora quei tornei.
         Variabili d'ambiente opzionali su Railway:
           PP_USE_TOURNAMENT_ODDS=0        → disattiva (torna al metodo per-partita)
           PP_BOOKMAKERS=sbobet,bwin       → bookmaker da interrogare (il primo = sharp)
@@ -906,7 +909,7 @@ class SignalScraper:
                 by_t.setdefault(tid, []).append(f)
         if not by_t:
             logger.info("OddsPapi by-tournaments: nessun torneo con partite ben coperte nella finestra")
-            return None
+            return []
 
         n_t = max(1, int(os.environ.get("PP_TOURNAMENTS_PER_REQUEST", "3")))
         top = sorted(by_t.items(), key=lambda kv: len(kv[1]), reverse=True)[:n_t]
@@ -945,6 +948,11 @@ class SignalScraper:
                     if r.status == 429 and attempt == 1:
                         await asyncio.sleep(1.5)       # rate limit momentaneo: un solo nuovo tentativo
                         continue
+                    if r.status == 404 and ("FIXTURE_NOT_FOUND" in body or "No fixtures" in body):
+                        # quel bookmaker non ha (ancora) quote per questi tornei, es. 22bet al
+                        # mattino: normale, si passa al bookmaker successivo senza disattivare nulla
+                        per_book.append(f"{slug}:0")
+                        break
                     if r.status in (400, 401, 403, 404, 422):
                         # errore di configurazione: inutile ritentare (e sprecare quota) a ogni scan
                         self._pp_tourn_disabled = True
@@ -952,8 +960,10 @@ class SignalScraper:
                         return None
                     break
             if raw is None:
+                if i == 0 and not (per_book and per_book[-1] == f"{slug}:0"):
+                    return None            # errore sullo sharp: ripiego sul vecchio metodo
                 if i == 0:
-                    return None
+                    return []              # lo sharp non ha quote qui: niente da analizzare
                 continue
             total_bytes += len(raw)
             data = json.loads(raw)
@@ -1001,7 +1011,7 @@ class SignalScraper:
             f"{len(matches)} con quote ({with_totals} con over/under), "
             f"{total_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
         )
-        return matches or None
+        return matches
 
     async def _parse_oddspapi_fixture(
         self, session: aiohttp.ClientSession, fix: dict, winner_market: dict,
