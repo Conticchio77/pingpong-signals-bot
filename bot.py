@@ -59,6 +59,30 @@ async def relay_to_private(text: str, category: str = "ping_signal"):
     except Exception as e:
         logger.warning(f"Relay privato: errore di connessione: {e}")
 
+# Risultati (VINTO/PERSO), statistiche di fine mese e simili: percorso separato del bot VIP, che li manda in privato
+# a chi ha la ricezione tennis/pingpong attiva senza richiedere saldo (vedi nodo "POST /relay-ping-info" nel flow).
+RELAY_INFO_URL = os.environ.get("RELAY_INFO_URL", RELAY_URL.replace("relay-segnale-esterno", "relay-ping-info"))
+
+async def relay_ping_info(text: str):
+    """Inoltra in privato un messaggio informativo del bot Ping Pong. Se il flow non ha ancora il nuovo
+    endpoint (404) ripiega sul relay dei segnali, cosi' non si perde nulla."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                RELAY_INFO_URL,
+                headers={"X-Relay-Key": RELAY_KEY},
+                json={"text": text, "parse_mode": "Markdown"},
+            )
+            if resp.status_code == 404:
+                logger.warning("Endpoint relay-ping-info non trovato: uso il relay dei segnali")
+                await relay_to_private(text)
+            elif resp.status_code != 200:
+                logger.warning(f"Relay info fallito ({resp.status_code}): {resp.text[:200]}")
+            else:
+                logger.info(f"Relay info ok: {resp.json()}")
+    except Exception as e:
+        logger.warning(f"Relay info: errore di connessione: {e}")
+
 def _dest_label(sport: str) -> str:
     settings = db.get_settings()
     key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
@@ -105,6 +129,11 @@ async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=Non
             sent.append(gid)
         except Exception as e:
             logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
+    # Risultati e statistiche: se sono arrivati nel canale VIP, vanno anche in privato agli
+    # utenti con la ricezione tennis/pingpong attiva (relay dedicato, nessun saldo
+    # scalato). Il tasto grafico (reply_markup) non viene inoltrato: nei DM non funzionerebbe.
+    if VIP_GROUP_ID in sent:
+        await relay_ping_info(text)
     return sent
 
 def _sent_note(sport: str, kind: str, sent: list[int], override: str | None = None) -> str:

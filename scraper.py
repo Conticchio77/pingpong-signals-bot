@@ -924,19 +924,36 @@ class SignalScraper:
         per_book: list = []
         total_bytes = 0
         t0 = time.time()
-        for i, slug in enumerate(books):
+        # Modalità "multi": la documentazione OddsPapi dice che "bookmakers" accetta fino a 3
+        # bookmaker separati da virgola in UNA richiesta (→ scan = 1 elenco + 1 = 2 richieste).
+        # Se il server non la accetta si passa a una richiesta per bookmaker ("bookmaker",
+        # singolare) e il bot se lo ricorda fino al riavvio.
+        def _sets(mode):
+            if mode == "multi" and 1 < len(books) <= 3:
+                return [(",".join(books), {"bookmakers": ",".join(books)})]
+            return [(sl, {"bookmaker": sl}) for sl in books]
+
+        mode_used = getattr(self, "_pp_bm_mode", "multi")
+        request_sets = _sets(mode_used)
+        n_requests = 0
+        i = 0
+        while i < len(request_sets):
+            label, bm_params = request_sets[i]
             await self._throttle_oddspapi()
             # Questo endpoint ha un cooldown di 1000 ms (docs OddsPapi): la seconda
             # richiesta ravvicinata veniva rifiutata con 429 "Please wait 0.20 seconds".
             if i > 0:
                 await asyncio.sleep(1.3)
             raw = None
+            none_found = False
+            switch_to_single = False
             for attempt in (1, 2):
                 async with session.get(
                     f"{ODDSPAPI_BASE}/odds-by-tournaments",
-                    params={"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids), "bookmaker": slug},
+                    params={"apiKey": ODDSPAPI_KEY, "tournamentIds": ",".join(tids), **bm_params},
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as r:
+                    n_requests += 1
                     self._save_quota_snapshot("quota_oddspapi", remaining=r.headers.get("X-RateLimit-Remaining", "?"))
                     if self.db is not None:
                         self.db.increment_api_calls("oddspapi")
@@ -944,26 +961,38 @@ class SignalScraper:
                         raw = await r.read()
                         break
                     body = await r.text()
-                    logger.warning(f"OddsPapi odds-by-tournaments (bookmaker={slug}) status {r.status}: {body[:200]}")
+                    logger.warning(f"OddsPapi odds-by-tournaments ({label}) status {r.status}: {body[:200]}")
                     if r.status == 429 and attempt == 1:
                         await asyncio.sleep(1.5)       # rate limit momentaneo: un solo nuovo tentativo
                         continue
                     if r.status == 404 and ("FIXTURE_NOT_FOUND" in body or "No fixtures" in body):
-                        # quel bookmaker non ha (ancora) quote per questi tornei, es. 22bet al
-                        # mattino: normale, si passa al bookmaker successivo senza disattivare nulla
-                        per_book.append(f"{slug}:0")
+                        # nessuna quota per questi tornei adesso (es. 22bet al mattino): normale
+                        none_found = True
                         break
                     if r.status in (400, 401, 403, 404, 422):
-                        # errore di configurazione: inutile ritentare (e sprecare quota) a ogni scan
-                        self._pp_tourn_disabled = True
-                        logger.warning("OddsPapi by-tournaments disattivato fino al riavvio del bot")
-                        return None
+                        if "bookmakers" in bm_params:
+                            switch_to_single = True    # modalità multi non accettata
+                        else:
+                            # errore di configurazione: inutile ritentare (e sprecare quota) a ogni scan
+                            self._pp_tourn_disabled = True
+                            logger.warning("OddsPapi by-tournaments disattivato fino al riavvio del bot")
+                            return None
                     break
+            if switch_to_single:
+                self._pp_bm_mode = "single"
+                mode_used = "single"
+                logger.warning("OddsPapi by-tournaments: più bookmaker per richiesta non accettato — passo a una richiesta per bookmaker")
+                request_sets = _sets("single")
+                i = 0
+                continue
             if raw is None:
-                if i == 0 and not (per_book and per_book[-1] == f"{slug}:0"):
-                    return None            # errore sullo sharp: ripiego sul vecchio metodo
+                if none_found and "bookmakers" in bm_params:
+                    return []              # nessuno dei bookmaker ha quote qui: niente da analizzare
+                if i == 0 and not none_found:
+                    return None            # errore sul primo (sharp): ripiego sul vecchio metodo
                 if i == 0:
                     return []              # lo sharp non ha quote qui: niente da analizzare
+                i += 1
                 continue
             total_bytes += len(raw)
             data = json.loads(raw)
@@ -973,7 +1002,6 @@ class SignalScraper:
             if not isinstance(data, list):
                 logger.warning("OddsPapi odds-by-tournaments: formato risposta inatteso")
                 return None
-            n_with = 0
             for fx in data:
                 if not isinstance(fx, dict) or fx.get("hasOdds") is False:
                     continue
@@ -982,8 +1010,9 @@ class SignalScraper:
                 entry["fx"].update({k: v for k, v in fx.items() if k != "bookmakerOdds" and v not in (None, "")})
                 for sl, payload in (fx.get("bookmakerOdds") or {}).items():
                     entry["bm"][sl] = payload
-                    n_with += 1
-            per_book.append(f"{slug}:{n_with}")
+            i += 1
+
+        per_book = [f"{b}:{sum(1 for e in combined.values() if b in e['bm'])}" for b in books]
 
         in_window = []
         for fid, entry in combined.items():
@@ -1006,7 +1035,7 @@ class SignalScraper:
 
         with_totals = sum(1 for m in matches if m.get("raw_totals"))
         logger.info(
-            f"OddsPapi by-tournaments: tornei {tids} ({n_cand} partite candidate), bookmaker {per_book} → "
+            f"OddsPapi by-tournaments [{n_requests} richieste, modalità {mode_used}]: tornei {tids} ({n_cand} partite candidate), bookmaker {per_book} → "
             f"{len(combined)} fixture ricevute, {len(in_window)} con almeno 2 book in finestra, "
             f"{len(matches)} con quote ({with_totals} con over/under), "
             f"{total_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
