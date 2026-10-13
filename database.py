@@ -172,6 +172,13 @@ class Database:
         )
         self.conn.commit()
 
+    def delete_signal(self, sig_id: int):
+        """Cancella DEFINITIVAMENTE un segnale: sparisce da lista, statistiche e storico
+        del bilancio (a differenza di "scartato" o "annullato", che restano nel database)."""
+        self.conn.execute("DELETE FROM balance_history WHERE sig_id = ?", (sig_id,))
+        self.conn.execute("DELETE FROM signals WHERE id = ?", (sig_id,))
+        self.conn.commit()
+
     def mark_signal_sent(self, sig_id: int, vip: bool, free: bool):
         """Segna il segnale come inviato e ricorda A QUALE gruppo (VIP/FREE).
         Non declassa uno stato won/lost già assegnato."""

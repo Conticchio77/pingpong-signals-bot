@@ -43,6 +43,14 @@ SOFT_BOOKS = {
     "sisal", "goldbet", "eurobet", "planetwin365",
 }
 
+# Partite VERIFICABILI: senza un book sharp (Pinnacle/Betfair/Matchbook per il tennis,
+# sbobet per il ping pong) il solo "consenso" di book morbidi non prova che la partita
+# esista davvero (es. WTA Wuhan: Bencic–Zhang quotata solo da book minori ma Zhang era
+# già in un'altra partita → evento fantasma, +16% di edge "finto"). Quindi i segnali
+# senza sharp vengono scartati. Variabile Railway REQUIRE_SHARP=0 per riattivarli.
+def _require_sharp() -> bool:
+    return os.environ.get("REQUIRE_SHARP", "1") != "0"
+
 # ── Bookmaker PREFERITO (dove l'utente preferisce puntare) ─────────────────────
 # Per ogni segnale si guarda PRIMA il book preferito: se il suo prezzo ha già il
 # valore minimo, il segnale esce su quel book. Se non quota la partita o il suo
@@ -169,6 +177,12 @@ class AIAnalyzer:
             ref_kind = None
         has_sharp = ref_kind == "sharp"
         source    = match.get("source", "")
+        if ref_kind and not has_sharp and _require_sharp():
+            logger.info(
+                f"Winner scartato (nessun book sharp: partita non verificabile, solo consenso): "
+                f"{match.get('name','?')}"
+            )
+            ref_kind = None
 
         def _edge_ok(value: float, label: str) -> bool:
             # Senza sharp un edge sopra il tetto è quasi sempre una quota
@@ -270,7 +284,12 @@ class AIAnalyzer:
             if cand:
                 value, side, fair, best, book = max(cand)
                 tot_sharp = tot["kind"] == "sharp"
-                if tot_sharp or value <= max_edge_cap:
+                if not tot_sharp and _require_sharp():
+                    logger.info(
+                        f"Totals scartato (nessun book sharp: partita non verificabile): "
+                        f"{match.get('name','?')} — {side} {line}"
+                    )
+                elif tot_sharp or value <= max_edge_cap:
                     method = "book sharp" if tot_sharp else f"consenso di {tot['n_books']} book (mediana)"
                     signals.append(self._build(
                         match     = match,

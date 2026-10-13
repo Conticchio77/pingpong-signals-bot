@@ -1,4 +1,5 @@
 import os
+import re
 import io
 import logging
 import asyncio
@@ -59,30 +60,6 @@ async def relay_to_private(text: str, category: str = "ping_signal"):
     except Exception as e:
         logger.warning(f"Relay privato: errore di connessione: {e}")
 
-# Risultati (VINTO/PERSO), statistiche di fine mese e simili: percorso separato del bot VIP, che li manda in privato
-# a chi ha la ricezione tennis/pingpong attiva senza richiedere saldo (vedi nodo "POST /relay-ping-info" nel flow).
-RELAY_INFO_URL = os.environ.get("RELAY_INFO_URL", RELAY_URL.replace("relay-segnale-esterno", "relay-ping-info"))
-
-async def relay_ping_info(text: str):
-    """Inoltra in privato un messaggio informativo del bot Ping Pong. Se il flow non ha ancora il nuovo
-    endpoint (404) ripiega sul relay dei segnali, cosi' non si perde nulla."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                RELAY_INFO_URL,
-                headers={"X-Relay-Key": RELAY_KEY},
-                json={"text": text, "parse_mode": "Markdown"},
-            )
-            if resp.status_code == 404:
-                logger.warning("Endpoint relay-ping-info non trovato: uso il relay dei segnali")
-                await relay_to_private(text)
-            elif resp.status_code != 200:
-                logger.warning(f"Relay info fallito ({resp.status_code}): {resp.text[:200]}")
-            else:
-                logger.info(f"Relay info ok: {resp.json()}")
-    except Exception as e:
-        logger.warning(f"Relay info: errore di connessione: {e}")
-
 def _dest_label(sport: str) -> str:
     settings = db.get_settings()
     key = "send_dest_tennis" if sport == "tennis" else "send_dest_pingpong"
@@ -129,11 +106,6 @@ async def send_to_groups(bot, sport: str, kind: str, text: str, reply_markup=Non
             sent.append(gid)
         except Exception as e:
             logger.warning(f"Invio ({kind}) al gruppo {gid} fallito: {e}")
-    # Risultati e statistiche: se sono arrivati nel canale VIP, vanno anche in privato agli
-    # utenti con la ricezione tennis/pingpong attiva (relay dedicato, nessun saldo
-    # scalato). Il tasto grafico (reply_markup) non viene inoltrato: nei DM non funzionerebbe.
-    if VIP_GROUP_ID in sent:
-        await relay_ping_info(text)
     return sent
 
 def _sent_note(sport: str, kind: str, sent: list[int], override: str | None = None) -> str:
@@ -227,6 +199,30 @@ PERSISTENT_KB = ReplyKeyboardMarkup(
 )
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
+_BOOK_NAMES = {"onexbet": "1xBet", "1xbet": "1xBet", "22bet": "22bet", "bwin": "bwin", "bet365": "bet365",
+               "betsson": "Betsson", "unibet_eu": "Unibet", "williamhill": "William Hill", "betfair_ex_eu": "Betfair Exchange"}
+
+def _book_from_note(note: str) -> str:
+    """Nome (leggibile) del bookmaker da "Quota trovata su: X (...)" / "quota su: X"."""
+    m = re.search(r"(?:Quota trovata su|quota su):\s*([A-Za-z0-9_.\-]+)", note or "")
+    if not m:
+        return ""
+    slug = m.group(1)
+    return _BOOK_NAMES.get(slug.lower(), slug)
+
+def _howto_block(s: dict) -> str:
+    """Guida breve, dentro ogni segnale, per chi non conosce i termini."""
+    return (
+        "\n📖 *Come leggere il segnale*\n"
+        "• *Giocata*: l'esito su cui puntare.\n"
+        "• *Quota minima*: se sul tuo bookmaker la quota è più bassa, il vantaggio sparisce: non giocarla.\n"
+        "• *Value edge*: di quanto la quota supera quella \"giusta\" stimata dal mercato. "
+        "Non è una vincita garantita: è il vantaggio medio nel lungo periodo.\n"
+        "• *Stake e puntata*: quanto rischiare, in % del tuo bankroll. Non alzarla per recuperare.\n"
+        "• *Confidenza*: affidabilità della stima (più stelle, più affidabile).\n"
+        "⚠️ Nessuna giocata è sicura: punta solo ciò che puoi permetterti di perdere."
+    )
+
 def signal_text(s: dict, for_vip: bool = False) -> str:
     icons  = {"winner": "🏆", "over": "📈", "under": "📉", "handicap": "⚖️", "set": "🎯"}
     icon   = icons.get(s["signal_type"], "🎯")
@@ -249,15 +245,27 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
     }
     src = src_map.get(s.get("source", ""), "⚠️ Quote stimate")
 
+    # Quota minima: sotto questa quota il valore sparisce (tolleranza 1% sul prezzo "giusto")
+    book = _book_from_note(s.get("book_note", ""))
+    try:
+        fair_odds = float(s["odds"]) / (1 + float(s["value_pct"]) / 100)
+        min_odds  = min(float(s["odds"]), round(fair_odds * 1.01, 2))
+    except Exception:
+        min_odds = None
+    stake_pct = db.get_settings().get("stake_pct", 0.5)
+    min_line  = f"✅ Quota minima per giocare: *{min_odds:.2f}*\n" if min_odds else ""
+    book_part = f" su *{book}*" if book else ""
+
     text = (
         f"{sport_label} *SEGNALE {sport_name}*\n"
         f"{'━' * 22}\n"
         f"{icon} *{s['match']}*\n"
         f"🎯 Giocata: *{s['pick']}*\n"
-        f"💰 Quota: *{s['odds']}*\n"
+        f"💰 Quota: *{s['odds']}*{book_part}\n"
+        f"{min_line}"
         f"📊 Confidenza: *{s['confidence']}%* {stars}\n"
         f"💡 Value edge: *{vsign}*\n"
-        f"📌 Stake: *{s['stake']}/5* | 💹 Puntata: *{db.get_settings().get('stake_pct', 0.5)}% bankroll*\n"
+        f"📌 Stake: *{s['stake']}/5* | 💹 Puntata: *{stake_pct}% bankroll* (es. {stake_pct * 10:g} € ogni 1.000 €)\n"
         f"⏰ Inizio: *{s['kickoff']}*\n"
         f"🌍 Torneo: {s.get('tournament', default_tourn)}\n"
         f"🔗 Fonte: {src}\n"
@@ -269,6 +277,8 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
             text += f"\n📝 _{reasoning}_"
         if book_note:
             text += f"\n🔎 _{book_note}_"
+    else:
+        text += _howto_block(s)
     return text
 
 def vip_signal_text(s: dict) -> str:
@@ -1099,6 +1109,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
         ])
         kb.append([InlineKeyboardButton("🚫 Annulla (sospesa)", callback_data=f"result_{sig_id}_void")])
+        kb.append([InlineKeyboardButton("🗑 Cancella", callback_data=f"delask_{sig_id}")])
         kb.append([InlineKeyboardButton("🔙 Lista", callback_data="admin_list")])
         await query.edit_message_text(signal_text(s), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -1117,7 +1128,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wanted = {"vip": [VIP_GROUP_ID], "free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(
             dest or _dest_setting("send", _sport_short(s.get("sport", "tabletennis"))), [VIP_GROUP_ID])
         failed = [g for g in wanted if g not in sent]
-        kb = [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
+        kb = [[InlineKeyboardButton("🗑 Cancella", callback_data=f"delask_{sig_id}")],
+              [InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
                InlineKeyboardButton("🔙 Home",  callback_data="admin_home")]]
         if not sent:
             await query.edit_message_text(
@@ -1134,6 +1146,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Inviato a: {', '.join(_group_name(g) for g in sent)}{extra}\n\n{vip_signal_text(s)}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(_send_rows(s) + kb),
+        )
+
+    # ── Cancella (definitivo) ────────────────────────────────────────────────────
+    elif data.startswith("delask_"):
+        sig_id = int(data.split("_")[-1])
+        s = db.get_signal(sig_id)
+        if not s:
+            await query.edit_message_text("❌ Segnale non trovato (forse già cancellato).")
+            return
+        sent_note = ""
+        if s.get("sent_to_vip") or s.get("sent_to_free"):
+            sent_note = "\n⚠️ È già stato inviato ai gruppi: i messaggi nei gruppi restano, li devi togliere a mano."
+        await query.edit_message_text(
+            f"🗑 *Cancellare questo segnale?*\n\n{s['sport_label']} {s['match']} — {s['pick']} @ {s['odds']}\n\n"
+            f"Sparisce per sempre da lista, statistiche e storico del bilancio. "
+            f"(Per tenerlo nello storico usa Scarta o Annulla.){sent_note}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Sì, cancella", callback_data=f"delyes_{sig_id}")],
+                [InlineKeyboardButton("↩️ No, torna indietro", callback_data=f"view_signal_{sig_id}")],
+            ])
+        )
+
+    elif data.startswith("delyes_"):
+        sig_id = int(data.split("_")[-1])
+        db.delete_signal(sig_id)
+        await query.edit_message_text(
+            "🗑 Segnale cancellato.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
+                                                InlineKeyboardButton("🔙 Home", callback_data="admin_home")]])
         )
 
     # ── Scarta ───────────────────────────────────────────────────────────────────
@@ -1745,14 +1787,23 @@ async def post_init(app: Application):
         next_run_time=now + datetime.timedelta(minutes=10),
     )
 
-    # Auto-risultati ping pong: solo 2 volte al giorno (OddsPapi, 250
-    # richieste/mese — un controllo ogni 30 min esaurirebbe la quota in
-    # pochi giorni e bloccherebbe anche la ricerca di nuove partite)
+    # Auto-risultati ping pong: poche volte al giorno (OddsPapi, 250 richieste/mese).
+    # Costo di un controllo: 0 se non ci sono segnali ping pong aperti e già "dovuti";
+    # altrimenti 1 richiesta (elenco partite concluse) + 1 per ogni segnale che risulta
+    # concluso, che si paga UNA volta sola perché poi il segnale è chiuso.
+    # Gli orari si cambiano dalla variabile Railway PP_RESULT_HOURS (default "14,22"),
+    # es. PP_RESULT_HOURS=12,16,20,22
+    def _result_hours() -> str:
+        raw = os.environ.get("PP_RESULT_HOURS", "14,22")
+        hs = sorted({int(x) for x in raw.split(",") if x.strip().isdigit() and 0 <= int(x) <= 23})
+        return ",".join(map(str, hs)) or "14,22"
+
     _scheduler.add_job(
         lambda: _schedule_coro(lambda: _results_job(app, "tabletennis")),
-        trigger=CronTrigger(hour="14,22", minute=0, timezone=ROME),
+        trigger=CronTrigger(hour=_result_hours(), minute=0, timezone=ROME),
         id="auto_results_pingpong",
     )
+    logger.info(f"⏰ Controllo risultati ping pong alle ore: {_result_hours()}")
 
     # Scan ping pong: stesso schema del tennis — 07:00 → 22:00, ogni "pp_hours"
     # ore, configurabile dal pannello come per il tennis (era fisso solo 07:00).
@@ -1990,6 +2041,8 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
                     InlineKeyboardButton("❌ Perso", callback_data=f"result_{sig_id}_lost"),
                 ],[
                     InlineKeyboardButton("🚫 Annulla (sospesa)", callback_data=f"result_{sig_id}_void"),
+                ],[
+                    InlineKeyboardButton("🗑 Cancella", callback_data=f"delask_{sig_id}"),
                 ]]
                 admin_msg = await app.bot.send_message(
                     chat_id=ADMIN_ID,
@@ -2210,6 +2263,7 @@ async def remind_pending_results(app: Application, sport: str):
             kb.append([
                 InlineKeyboardButton(f"✅ {short}", callback_data=f"result_{sig['id']}_won"),
                 InlineKeyboardButton(f"❌ {short}", callback_data=f"result_{sig['id']}_lost"),
+                InlineKeyboardButton("🗑", callback_data=f"delask_{sig['id']}"),
             ])
         try:
             await app.bot.send_message(

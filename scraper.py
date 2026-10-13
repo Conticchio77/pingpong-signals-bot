@@ -249,6 +249,47 @@ def result_due(sig: dict) -> bool:
         <= timedelta(hours=RESULT_MAX_AGE_H.get(sport, 30))
     )
 
+def _drop_conflicting_tennis(matches: list) -> list:
+    """Scarta le partite di tennis (singolare) in cui un giocatore compare in DUE eventi
+    a meno di 18 ore di distanza: un giocatore non può giocare due partite così vicine,
+    quindi almeno una delle due è un evento fantasma (es. turno ipotetico quotato da book
+    minori). Non sapendo quale sia vera, si scartano entrambe: devono arrivare solo
+    partite vere."""
+    import unicodedata
+
+    def _norm(n: str) -> str:
+        n = unicodedata.normalize("NFKD", n or "").encode("ascii", "ignore").decode().lower()
+        return " ".join(n.replace(",", " ").replace(".", " ").split())
+
+    def _start(m):
+        try:
+            return datetime.fromisoformat(str(m.get("start_iso", "")).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    by_player: dict = {}
+    for idx, m in enumerate(matches):
+        st = _start(m)
+        if st is None or "/" in (m.get("player1", "") + m.get("player2", "")):   # doppi: ignorati
+            continue
+        for pl in (m.get("player1"), m.get("player2")):
+            by_player.setdefault(_norm(pl), []).append((st, idx))
+    bad = set()
+    for pl, lst in by_player.items():
+        lst.sort()
+        for (st1, i1), (st2, i2) in zip(lst, lst[1:]):
+            if i1 != i2 and (st2 - st1) < timedelta(hours=18):
+                bad.update((i1, i2))
+    if not bad:
+        return matches
+    for i in sorted(bad):
+        logger.warning(
+            f"Tennis: partita scartata (giocatore in due eventi a meno di 18h, evento non affidabile): "
+            f"{matches[i].get('name')} — {matches[i].get('kickoff')}"
+        )
+    return [m for i, m in enumerate(matches) if i not in bad]
+
+
 class SignalScraper:
 
     def __init__(self, db=None):
@@ -933,7 +974,9 @@ class SignalScraper:
                 return [(",".join(books), {"bookmakers": ",".join(books)})]
             return [(sl, {"bookmaker": sl}) for sl in books]
 
-        mode_used = getattr(self, "_pp_bm_mode", "multi")
+        # Il server OddsPapi rifiuta più bookmaker per richiesta ("exactly one bookmaker"):
+        # si parte da una richiesta per bookmaker. PP_MULTI_BOOKMAKERS=1 per riprovare "multi".
+        mode_used = getattr(self, "_pp_bm_mode", "multi" if os.environ.get("PP_MULTI_BOOKMAKERS") == "1" else "single")
         request_sets = _sets(mode_used)
         n_requests = 0
         i = 0
@@ -1561,7 +1604,7 @@ class SignalScraper:
             if m["name"] not in seen:
                 seen.add(m["name"])
                 unique.append(m)
-        return unique
+        return _drop_conflicting_tennis(unique)
 
     def _parse_odds_api_tennis(self, ev: dict) -> dict | None:
         try:
@@ -1623,6 +1666,7 @@ class SignalScraper:
                 "player1":        home,
                 "player2":        away,
                 "kickoff":        kickoff,
+                "start_iso":      ev.get("commence_time", ""),
                 "tournament":     sport,
                 "status":         "scheduled",
                 "odds_home":      round(best[home], 3),
