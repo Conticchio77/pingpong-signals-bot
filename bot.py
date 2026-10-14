@@ -36,6 +36,7 @@ TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "858001417"))
 VIP_GROUP_ID  = int(os.environ.get("VIP_GROUP_ID",  "-1004272035660"))
 FREE_GROUP_ID = int(os.environ.get("FREE_GROUP_ID", "-1002520876408"))
+CHART_GROUP_URL = os.environ.get("CHART_GROUP_URL", "https://t.me/segnali_dal_futuro_chat")   # link mostrato agli utenti privati nelle stats
 ODDS_KEY     = os.environ.get("ODDS_API_KEY", "")
 
 # ── Relay verso il bot "Segnali dal Futuro" (inoltro privato filtrato per utente) ──
@@ -918,7 +919,12 @@ async def send_monthly_stats(app: Application, ym: str | None = None, test: bool
             # Anche in privato agli iscritti VIP (come i segnali), senza il tasto grafico:
             # il pulsante funziona solo qui nel bot, quindi si rimanda al gruppo VIP.
             if VIP_GROUP_ID in _dest_group_ids(sport, "stats", dest):
-                tail = "\n\n📈 Il grafico del mese è nel gruppo VIP." if VIP_GROUP_ID in sent else ""
+                tail = (
+                    "\n\n━━━━━━━━━━━━━━━\n"
+                    "📈 *Il grafico del mese è nel gruppo*\n"
+                    f"👉 [Vai al gruppo Segnali dal Futuro]({CHART_GROUP_URL})\n"
+                    "_Premi il tasto \"📈 Grafico\" sotto il messaggio delle statistiche._"
+                ) if VIP_GROUP_ID in sent else ""
                 ok = await relay_to_private(text + tail)
                 note += " + utenti privati ✅" if ok else " + utenti privati ⚠️ (relay non riuscito)"
         else:
