@@ -915,6 +915,12 @@ async def send_monthly_stats(app: Application, ym: str | None = None, test: bool
         if to_groups:
             sent = await send_to_groups(app.bot, sport, "stats", text, kb, override=dest)
             note = _sent_note(sport, "stats", sent, override=dest)
+            # Anche in privato agli iscritti VIP (come i segnali), senza il tasto grafico:
+            # il pulsante funziona solo qui nel bot, quindi si rimanda al gruppo VIP.
+            if VIP_GROUP_ID in _dest_group_ids(sport, "stats", dest):
+                tail = "\n\n📈 Il grafico del mese è nel gruppo VIP." if VIP_GROUP_ID in sent else ""
+                ok = await relay_to_private(text + tail)
+                note += " + utenti privati ✅" if ok else " + utenti privati ⚠️ (relay non riuscito)"
         else:
             note = "📨 Gruppi: NON inviato (invio automatico spento)"
         lines.append(label)
