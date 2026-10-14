@@ -55,10 +55,20 @@ async def relay_to_private(text: str, category: str = "ping_signal"):
             )
             if resp.status_code != 200:
                 logger.warning(f"Relay privato fallito ({resp.status_code}): {resp.text[:200]}")
-            else:
-                logger.info(f"Relay privato ok: {resp.json()}")
+                return False
+            logger.info(f"Relay privato ok: {resp.json()}")
+            return True
     except Exception as e:
         logger.warning(f"Relay privato: errore di connessione: {e}")
+    return False
+
+async def _relay_result(sport: str, text: str) -> str:
+    """I messaggi vinto/perso vanno anche in privato agli iscritti VIP (come i segnali)
+    quando tra le destinazioni dei risultati c'è il VIP. Ritorna una riga per l'admin."""
+    if VIP_GROUP_ID not in _dest_group_ids(sport, "result"):
+        return ""
+    ok = await relay_to_private(text)
+    return " + utenti privati ✅" if ok else " + utenti privati ⚠️ (relay non riuscito)"
 
 def _dest_label(sport: str) -> str:
     settings = db.get_settings()
@@ -277,8 +287,7 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
             text += f"\n📝 _{reasoning}_"
         if book_note:
             text += f"\n🔎 _{book_note}_"
-    else:
-        text += _howto_block(s)
+    text += _howto_block(s)
     return text
 
 def vip_signal_text(s: dict) -> str:
@@ -1216,7 +1225,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bal = db.get_balance_stats(sport=sig.get("sport"))
             bal_str = f"{bal['current_balance_pct']:+.2f}% bankroll" if bal["total_bets"] > 0 else "n/d"
             _sp = sig.get("sport", "tabletennis")
-            _sent = await send_to_groups(context.application.bot, _sp, "result", _result_group_text(sig, result, bal))
+            _rtxt = _result_group_text(sig, result, bal)
+            _sent = await send_to_groups(context.application.bot, _sp, "result", _rtxt)
+            _priv = await _relay_result(_sp, _rtxt)
             await query.message.reply_text(
                 f"{emoji} *Risultato aggiornato*\n"
                 f"{'━' * 20}\n"
@@ -1225,7 +1236,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📌 Stake: {sig['stake']}/5\n\n"
                 f"{emoji} *{'VINTO!' if result == 'won' else 'Perso.'}*\n\n"
                 f"💰 Bilancio {sport_label}: *{bal_str}* | ROI: *{bal['roi']:+.1f}%*\n\n"
-                f"{_sent_note(_sp, 'result', _sent)}",
+                f"{_sent_note(_sp, 'result', _sent)}{_priv}",
                 parse_mode="Markdown"
             )
 
@@ -2252,13 +2263,15 @@ async def remind_pending_results(app: Application, sport: str):
         limit = REMIND_AFTER_H.get(sport, 4) if sig.get("signal_type") == "winner" else REMIND_AFTER_H_TOTALS
         if age >= limit:
             due.append(sig)
+    # ricontrollo "fresco": niente promemoria per un segnale chiuso nel frattempo
+    due = [x for x in due if (db.get_signal(x["id"]) or {}).get("result") is None]
     if not due:
         return
     for i in range(0, len(due), 8):
         chunk = due[i:i + 8]
         lines, kb = [], []
         for sig in chunk:
-            lines.append(f"• {sig.get('sport_label', '')} {sig['match']} — {sig['pick']} @ {sig['odds']} (inizio {sig.get('kickoff', '?')})")
+            lines.append(f"• #{sig['id']} {sig.get('sport_label', '')} {sig['match']} — {sig['pick']} @ {sig['odds']} (inizio {sig.get('kickoff', '?')})")
             short = (sig["match"] or "")[:14]
             kb.append([
                 InlineKeyboardButton(f"✅ {short}", callback_data=f"result_{sig['id']}_won"),
@@ -2395,7 +2408,9 @@ async def run_auto_results(app: Application, sport: str = "both"):
             bal_str = f"{bal_stats['current_balance_pct']:+.2f}% bankroll" if bal_stats["total_bets"] > 0 else "n/d"
 
             _sp = sig.get("sport", "tabletennis")
-            _sent = await send_to_groups(app.bot, _sp, "result", _result_group_text(sig, result, bal_stats))
+            _rtxt = _result_group_text(sig, result, bal_stats)
+            _sent = await send_to_groups(app.bot, _sp, "result", _rtxt)
+            _priv = await _relay_result(_sp, _rtxt)
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
@@ -2408,7 +2423,7 @@ async def run_auto_results(app: Application, sport: str = "both"):
                     f"💰 Bilancio {sig.get('sport_label','')}: *{bal_str}*\n"
                     f"📊 W/L: {bal_stats['won']}V/{bal_stats['lost']}P | "
                     f"Win%: {bal_stats['winrate']}% | ROI: {bal_stats['roi']}%\n\n"
-                    f"{_sent_note(_sp, 'result', _sent)}"
+                    f"{_sent_note(_sp, 'result', _sent)}{_priv}"
                 ),
                 parse_mode="Markdown"
             )
