@@ -332,7 +332,7 @@ def genera_grafico_bilancio(sport: str | None = None, month: str | None = None) 
         colors   = ["#2ecc71" if b >= 0 else "#e74c3c" for b in balances[1:]]
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), facecolor="#1a1a2e")
-        fig.suptitle("📊 Bilancio Segnali" + (f" — {month[4:]}/{month[:4]}" if month else ""), color="white", fontsize=16, fontweight="bold", y=0.98)
+        fig.suptitle("Bilancio Segnali" + (f" - {month[4:]}/{month[:4]}" if month else ""), color="white", fontsize=16, fontweight="bold", y=0.98)
 
         # ── Grafico linea bilancio ─────────────────────────────────────────
         ax1.set_facecolor("#16213e")
