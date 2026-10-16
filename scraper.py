@@ -1057,12 +1057,23 @@ class SignalScraper:
 
         per_book = [f"{b}:{sum(1 for e in combined.values() if b in e['bm'])}" for b in books]
 
-        in_window = []
+        # Servono lo sharp di riferimento (il primo bookmaker di PP_BOOKMAKERS, es. sbobet) e almeno
+        # un soft. Senza sharp l'analizzatore non ha un riferimento affidabile e scarta la partita:
+        # il 16/10 solo 10 delle 40 partite analizzate avevano sbobet (lo ha solo ~15% delle partite),
+        # le altre 24-30 occupavano posti e quota senza poter generare segnali. PP_SHARP_BOOK per
+        # cambiarlo, REQUIRE_SHARP=0 per non richiederlo.
+        sharp_slug = os.environ.get("PP_SHARP_BOOK", books[0]).strip().lower()
+        need_sharp = os.environ.get("REQUIRE_SHARP", "1") != "0"
+        in_window, n_two, n_no_sharp = [], 0, 0
         for fid, entry in combined.items():
             merged = {**base.get(fid, {}), **entry["fx"], "bookmakerOdds": entry["bm"]}
             st = _start(merged)
             if st is not None and min_start <= st <= window_end and len(entry["bm"]) >= 2:
-                in_window.append((st, merged))     # servono sharp + almeno un soft
+                n_two += 1
+                if need_sharp and not any(sharp_slug in b.lower() for b in entry["bm"]):
+                    n_no_sharp += 1
+                    continue
+                in_window.append((st, merged))
         in_window.sort(key=lambda x: x[0])
         cap = max(1, int(os.environ.get("PP_MAX_FIXTURES", "40")))
         in_window = in_window[:cap]
@@ -1079,7 +1090,8 @@ class SignalScraper:
         with_totals = sum(1 for m in matches if m.get("raw_totals"))
         logger.info(
             f"OddsPapi by-tournaments [{n_requests} richieste, modalità {mode_used}]: tornei {tids} ({n_cand} partite candidate), bookmaker {per_book} → "
-            f"{len(combined)} fixture ricevute, {len(in_window)} con almeno 2 book in finestra, "
+            f"{len(combined)} fixture ricevute, {n_two} con almeno 2 book in finestra "
+            f"({n_no_sharp} senza {sharp_slug}, scartate), {len(in_window)} analizzate, "
             f"{len(matches)} con quote ({with_totals} con over/under), "
             f"{total_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
         )
