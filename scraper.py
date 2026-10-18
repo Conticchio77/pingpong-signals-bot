@@ -339,6 +339,25 @@ class SignalScraper:
             except Exception:
                 pass
 
+    async def _oddspapi_remaining(self, session: aiohttp.ClientSession) -> int | None:
+        """Richieste OddsPapi rimaste (limite - usate) da GET /v4/account: endpoint non conteggiato."""
+        try:
+            await self._throttle_oddspapi()
+            async with session.get(f"{ODDSPAPI_BASE}/account", params={"apiKey": ODDSPAPI_KEY},
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+            subs = d.get("subscriptions") or []
+            cur = d.get("current_subscription_id")
+            sub = next((x for x in subs if x.get("subscription_id") == cur), None) or (subs[0] if subs else None)
+            if not sub:
+                return None
+            return int(sub["request_limit"]) - int(sub["request_count"])
+        except Exception as e:
+            logger.warning(f"OddsPapi /account: lettura richieste rimaste fallita: {e}")
+            return None
+
     async def _throttle_oddspapi(self, min_interval: float | None = None):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere.
         min_interval: cooldown specifico dell'endpoint (es. /settlements = 2000 ms)."""
@@ -1078,21 +1097,54 @@ class SignalScraper:
         cap = max(1, int(os.environ.get("PP_MAX_FIXTURES", "40")))
         in_window = in_window[:cap]
 
-        matches = []
+        matches, pairs = [], []
         for _, merged in in_window:
             m = await self._parse_oddspapi_fixture(
                 session, merged, winner_market, totals_market,
                 totals_markets_all=totals_markets_all, odds_data=merged, quiet=True,
             )
             if m:
+                # partita "verificata": lo sharp quota il mercato vincente (evento reale)
+                m["verified"] = any(sharp_slug in b.lower() for b in merged["bookmakerOdds"])
                 matches.append(m)
+                pairs.append((merged, m))
+
+        # ── Approfondimento over/under ───────────────────────────────────────────────
+        # Con soli 3 bookmaker scaricati i totali (che sbobet e bwin non quotano) hanno 1 solo
+        # book per linea e vengono saltati. Per le prime N partite verificate con una linea totals
+        # si scarica /odds completo (tutti i bookmaker, 1 richiesta ciascuna): il consenso sulla
+        # stessa linea diventa ampio (in genere 10-50 book). Solo se restano abbastanza richieste
+        # (da /v4/account, che non conta). PP_TOTALS_DEEP=0 per disattivare.
+        n_deep = max(0, int(os.environ.get("PP_TOTALS_DEEP", "2")))
+        deep_done, deep_note = 0, ""
+        if n_deep and pairs:
+            min_rem = int(os.environ.get("PP_TOTALS_MIN_REMAINING", "40"))
+            remaining = await self._oddspapi_remaining(session)
+            if remaining is None or remaining < min_rem:
+                deep_note = f", approfondimento totali saltato (richieste rimaste {remaining}, minimo {min_rem})"
+            else:
+                for merged, m in pairs:
+                    if deep_done >= n_deep or remaining - deep_done < min_rem:
+                        break
+                    if not m.get("raw_totals") or not m.get("verified"):
+                        continue
+                    full = await self._parse_oddspapi_fixture(
+                        session, merged, winner_market, totals_market,
+                        totals_markets_all=totals_markets_all, quiet=True,
+                    )
+                    if full:
+                        full["verified"] = True
+                        matches[matches.index(m)] = full
+                        deep_done += 1
+                deep_note = f", totali approfonditi su {deep_done} partite (+{deep_done} richieste)"
+        n_requests += deep_done
 
         with_totals = sum(1 for m in matches if m.get("raw_totals"))
         logger.info(
             f"OddsPapi by-tournaments [{n_requests} richieste, modalità {mode_used}]: tornei {tids} ({n_cand} partite candidate), bookmaker {per_book} → "
             f"{len(combined)} fixture ricevute, {n_two} con almeno 2 book in finestra "
             f"({n_no_sharp} senza {sharp_slug}, scartate), {len(in_window)} analizzate, "
-            f"{len(matches)} con quote ({with_totals} con over/under), "
+            f"{len(matches)} con quote ({with_totals} con over/under){deep_note}, "
             f"{total_bytes / 1024:.0f} KB in {time.time() - t0:.1f}s"
         )
         return matches

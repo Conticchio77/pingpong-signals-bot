@@ -51,6 +51,15 @@ SOFT_BOOKS = {
 def _require_sharp() -> bool:
     return os.environ.get("REQUIRE_SHARP", "1") != "0"
 
+def _totals_min_books() -> int:
+    """Over/Under senza sharp (sbobet non quota i totali del ping pong): si accetta il consenso
+    SOLO se la partita è verificata da uno sharp sul mercato vincente (match["verified"]) e
+    almeno N bookmaker quotano la stessa linea. Variabile Railway TOTALS_CONSENSUS_MIN_BOOKS."""
+    try:
+        return max(3, int(os.environ.get("TOTALS_CONSENSUS_MIN_BOOKS", "6")))
+    except ValueError:
+        return 6
+
 # ── Bookmaker PREFERITO (dove l'utente preferisce puntare) ─────────────────────
 # Per ogni segnale si guarda PRIMA il book preferito: se il suo prezzo ha già il
 # valore minimo, il segnale esce su quel book. Se non quota la partita o il suo
@@ -256,8 +265,9 @@ class AIAnalyzer:
         # diverse, e li si de-viggava insieme: falsi positivi.
         tot = self._totals_reference(match.get("raw_totals") or {}, _preferred_books(sport))
         if tot:
-            unit = "set" if sport == "tabletennis" else "games"
             line = tot["line"]
+            # ping pong: linee piccole (3.5, 4.5) = set totali; linee come 74.5 = punti totali
+            unit = ("set" if line <= 6.5 else "punti") if sport == "tabletennis" else "games"
             cand = []
             for side, fair, best, book in (
                 ("over",  tot["fair_over"],  tot["best_over"],  tot["over_book"]),
@@ -284,9 +294,11 @@ class AIAnalyzer:
             if cand:
                 value, side, fair, best, book = max(cand)
                 tot_sharp = tot["kind"] == "sharp"
-                if not tot_sharp and _require_sharp():
+                if (not tot_sharp and _require_sharp()
+                        and not (match.get("verified") and tot["n_books"] >= _totals_min_books())):
                     logger.info(
-                        f"Totals scartato (nessun book sharp: partita non verificabile): "
+                        f"Totals scartato (nessun book sharp e consenso troppo debole: "
+                        f"{tot['n_books']} book, partita {'verificata' if match.get('verified') else 'non verificata'}): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                 elif tot_sharp or value <= max_edge_cap:
