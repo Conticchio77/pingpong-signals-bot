@@ -63,12 +63,37 @@ async def relay_to_private(text: str, category: str = "ping_signal"):
         logger.warning(f"Relay privato: errore di connessione: {e}")
     return False
 
+# Risultati (VINTO/PERSO) e statistiche: percorso dedicato del bot VIP (/relay-ping-info). Legge il foglio al momento,
+# quindi non dipende dalla cache utenti. Va agli utenti attivi con almeno 1 segnale e la ricezione tennis/pingpong attiva.
+# Se il flow non ha ancora il nuovo endpoint (404) si ripiega sul relay dei segnali, cosi' non si perde nulla.
+RELAY_INFO_URL = os.environ.get("RELAY_INFO_URL", RELAY_URL.replace("relay-segnale-esterno", "relay-ping-info"))
+
+async def relay_ping_info(text: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                RELAY_INFO_URL,
+                headers={"X-Relay-Key": RELAY_KEY},
+                json={"text": text, "parse_mode": "Markdown"},
+            )
+            if resp.status_code == 404:
+                logger.warning("Endpoint relay-ping-info non trovato: uso il relay dei segnali")
+                return await relay_to_private(text)
+            if resp.status_code != 200:
+                logger.warning(f"Relay info fallito ({resp.status_code}): {resp.text[:200]}")
+                return False
+            logger.info(f"Relay info ok: {resp.json()}")
+            return True
+    except Exception as e:
+        logger.warning(f"Relay info: errore di connessione: {e}")
+    return False
+
 async def _relay_result(sport: str, text: str) -> str:
     """I messaggi vinto/perso vanno anche in privato agli iscritti VIP (come i segnali)
     quando tra le destinazioni dei risultati c'è il VIP. Ritorna una riga per l'admin."""
     if VIP_GROUP_ID not in _dest_group_ids(sport, "result"):
         return ""
-    ok = await relay_to_private(text)
+    ok = await relay_ping_info(text)
     return " + utenti privati ✅" if ok else " + utenti privati ⚠️ (relay non riuscito)"
 
 def _dest_label(sport: str) -> str:
@@ -926,7 +951,7 @@ async def send_monthly_stats(app: Application, ym: str | None = None, test: bool
                     f"👉 [Vai al gruppo Segnali dal Futuro]({CHART_GROUP_URL})\n"
                     "_Premi il tasto \"📈 Grafico\" sotto il messaggio delle statistiche._"
                 ) if VIP_GROUP_ID in sent else ""
-                ok = await relay_to_private(text + tail)
+                ok = await relay_ping_info(text + tail)
                 note += " + utenti privati ✅" if ok else " + utenti privati ⚠️ (relay non riuscito)"
         else:
             note = "📨 Gruppi: NON inviato (invio automatico spento)"
