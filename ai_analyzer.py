@@ -51,15 +51,20 @@ SOFT_BOOKS = {
 def _require_sharp() -> bool:
     return os.environ.get("REQUIRE_SHARP", "1") != "0"
 
-def _max_sharp_overround() -> float:
-    """Margine massimo ammesso per il book di riferimento (somma delle probabilità implicite).
-    Exchange/sharp reali stanno tra ~1.00 e ~1.08. Il 18/10 matchbook dava 1.12/1.32
-    (somma 1.65: libro quasi vuoto, non un prezzo vero) e il de-vig ne ricavava un "fair"
-    sbagliato → falsi edge. Variabile Railway MAX_SHARP_OVERROUND (default 1.10)."""
+def _max_sharp_overround(book: str = "") -> float:
+    """Margine massimo (somma delle probabilità implicite) per usare un book come riferimento.
+    - Exchange (betfair, matchbook): ~1.00-1.05 se il libro è pieno. Il 18/10 matchbook dava
+      1.12/1.32 (somma 1.65) e 1.9/1.61 (1.15): libro vuoto, prezzi non veri → falsi edge.
+      Soglia 1.07 (MAX_EXCHANGE_OVERROUND).
+    - Sharp "da bookmaker" (sbobet, pinnacle...): margini veri fino a ~1.12 sul ping pong
+      di serie minori (log del 20/10: 1.11-1.12). Soglia 1.15 (MAX_SHARP_OVERROUND)."""
+    name = (book or "").lower()
     try:
-        return float(os.environ.get("MAX_SHARP_OVERROUND", "1.10"))
+        if "betfair" in name or "matchbook" in name:
+            return float(os.environ.get("MAX_EXCHANGE_OVERROUND", "1.07"))
+        return float(os.environ.get("MAX_SHARP_OVERROUND", "1.15"))
     except ValueError:
-        return 1.10
+        return 1.07 if ("betfair" in name or "matchbook" in name) else 1.15
 
 def _totals_min_books() -> int:
     """Over/Under senza sharp (sbobet non quota i totali del ping pong): si accetta il consenso
@@ -351,13 +356,13 @@ class AIAnalyzer:
         )
 
     @staticmethod
-    def _sane_overround(a, b) -> bool:
+    def _sane_overround(a, b, book: str = "") -> bool:
         """Coppia di quote con margine plausibile (non un libro vuoto / prezzi sballati)."""
         try:
             over = 1 / float(a) + 1 / float(b)
         except (TypeError, ValueError, ZeroDivisionError):
             return False
-        return 0.985 <= over <= _max_sharp_overround()
+        return 0.985 <= over <= _max_sharp_overround(book)
 
     def _power_fair(self, oa: float, ob: float) -> tuple:
         """Probabilità fair di un mercato a 2 esiti con power de-vig."""
@@ -371,7 +376,7 @@ class AIAnalyzer:
         for book, odds in raw_bm.items():
             if self._is_sharp(book):
                 h, a = odds.get("home"), odds.get("away")
-                if self._valid_pair(h, a) and not self._sane_overround(h, a):
+                if self._valid_pair(h, a) and not self._sane_overround(h, a, book):
                     logger.info(f"Sharp book scartato: {book} → {h}/{a} (margine anomalo {1/float(h) + 1/float(a):.2f}: prezzi non affidabili)")
                     continue
                 if self._valid_pair(h, a):
@@ -401,7 +406,7 @@ class AIAnalyzer:
         if not entries:
             return None
         # scarta i book di riferimento con margine anomalo (libro vuoto/prezzi sballati)
-        bad = [b for b, o in entries.items() if self._is_sharp(b) and not self._sane_overround(o["over"], o["under"])]
+        bad = [b for b, o in entries.items() if self._is_sharp(b) and not self._sane_overround(o["over"], o["under"], b)]
         for b in bad:
             logger.info(f"Sharp totals scartato: {b} (margine anomalo)")
             entries = {k: v for k, v in entries.items() if k != b}
