@@ -979,6 +979,24 @@ class SignalScraper:
         books = [b.strip() for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()]
         books = books[:max(1, int(os.environ.get("PP_MAX_BOOK_REQUESTS", "3")))]
 
+        # ── Budget richieste ────────────────────────────────────────────────────────
+        # Legge le richieste rimaste (GET /v4/account, non conteggiato) e calcola quante ne
+        # servono per continuare a fare 1 scan al giorno fino a fine mese (si assume il reset
+        # il 1° del mese: non confermato da OddsPapi). Se non bastano, riduce i bookmaker a 2
+        # (sharp + preferito) invece di restare senza quota a metà mese; l'approfondimento dei
+        # totali parte solo se la quota regge anche con le richieste extra. PP_QUOTA_RESERVE =
+        # richieste tenute da parte per i controlli dei risultati (default 10).
+        rem0 = await self._oddspapi_remaining(session)
+        today = _now_it()
+        next_first = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
+        days_left = max(1, (next_first.date() - today.date()).days)
+        reserve = int(os.environ.get("PP_QUOTA_RESERVE", "10"))
+        budget_note = ""
+        if rem0 is not None and len(books) > 2 and rem0 < (len(books) + 1) * days_left + reserve:
+            books = books[:2]
+            budget_note = f"quota {rem0} per {days_left} giorni: bookmaker ridotti a {books}"
+            logger.info(f"OddsPapi by-tournaments: {budget_note}")
+
         base = {str(f.get("fixtureId")): f for f in fixtures}
         combined: dict = {}      # fixtureId -> {"fx": campi della fixture, "bm": {slug: payload bookmaker}}
         per_book: list = []
@@ -1119,9 +1137,12 @@ class SignalScraper:
         deep_done, deep_note = 0, ""
         if n_deep and pairs:
             min_rem = int(os.environ.get("PP_TOTALS_MIN_REMAINING", "40"))
-            remaining = await self._oddspapi_remaining(session)
-            if remaining is None or remaining < min_rem:
-                deep_note = f", approfondimento totali saltato (richieste rimaste {remaining}, minimo {min_rem})"
+            remaining = rem0
+            sustainable = remaining is not None and remaining >= (len(books) + 1 + n_deep) * days_left + reserve
+            if remaining is None or remaining < min_rem or not sustainable:
+                deep_note = (f", approfondimento totali saltato (richieste rimaste {remaining}, "
+                             f"per {days_left} giorni a {len(books) + 1 + n_deep}/scan ne servono "
+                             f"{(len(books) + 1 + n_deep) * days_left + reserve})")
             else:
                 for merged, m in pairs:
                     if deep_done >= n_deep or remaining - deep_done < min_rem:
