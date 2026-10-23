@@ -104,7 +104,10 @@ MAX_ODDS             = 5.00   # quota massima accettata
 MIN_SOFT_BOOKS       = 1      # almeno N soft book devono confermare la quota
 MIN_HOURS_BEFORE     = 1.0    # default ore minime al kickoff
 SAME_DAY_ONLY        = False  # default: NON limitare al giorno solare (vedi MAX_HOURS_AHEAD)
-MAX_HOURS_AHEAD      = 18.0   # scarta partite oltre N ore da adesso (copre lo scan serale per i match asiatici del mattino dopo)
+# Scarta partite oltre N ore da adesso. Default 24h (variabile Railway MAX_HOURS_AHEAD): ogni partita viene
+# così valutata da più scan (con 2 scan al giorno: 07:00 e 19:00) senza costi in più (i crediti si pagano per
+# scan, non per partita). Il valore salvato nelle impostazioni ("max_hours_ahead") ha la precedenza.
+MAX_HOURS_AHEAD      = float(os.environ.get("MAX_HOURS_AHEAD", "24"))
 MAX_EDGE_NO_SHARP    = 20.0   # default cap edge% senza Pinnacle
 MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senza sharp)
 
@@ -596,11 +599,14 @@ class AIAnalyzer:
         # match_key: usa event_id se disponibile (stabile tra scan), altrimenti nome+data.
         # sig_type distingue winner da over/under sulla stessa partita.
         event_id = match.get("event_id") or ""
+        real_id  = bool(event_id)
         if not event_id:
             # Fallback: nome normalizzato + data. Meno stabile ma meglio di niente.
             event_id = f"{match['name'].lower().replace(' ', '_')}_{now.strftime('%Y%m%d')}"
             logger.warning(f"match_key: event_id mancante per '{match['name']}' — uso nome come chiave")
-        key_str = f"{event_id}|{sig_type}|{now.strftime('%Y%m%d')}"
+        # Con event_id reale la chiave NON contiene la data dello scan: la stessa partita vista da
+        # due scan in giorni diversi (es. alle 19:00 e alle 07:00 successive) non genera due segnali.
+        key_str = f"{event_id}|{sig_type}" if real_id else f"{event_id}|{sig_type}|{now.strftime('%Y%m%d')}"
         mk      = hashlib.md5(key_str.encode()).hexdigest()[:16]
         stake   = self._stake(fair_prob, odds, confidence)
 
