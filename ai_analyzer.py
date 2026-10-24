@@ -51,6 +51,22 @@ SOFT_BOOKS = {
 def _require_sharp() -> bool:
     return os.environ.get("REQUIRE_SHARP", "1") != "0"
 
+def _reliability(sport: str) -> tuple:
+    """(edge massimo con sharp, quota massima) per sport — filtri di affidabilità.
+    - Con un book sharp un edge molto alto è quasi sempre una quota ferma/sbagliata di un singolo book
+      (o un riferimento in ritardo), non valore vero: i valori reali stanno di solito tra 3% e 8%.
+      Ping pong: sbobet è meno "sharp" di Pinnacle e le serie minori hanno margini del 10-12%,
+      quindi tetto più basso. Variabili Railway: MAX_EDGE_SHARP_PP (default 10), MAX_EDGE_SHARP_TENNIS (15).
+    - Quota massima ping pong: sulle quote alte la stima della probabilità è più rumorosa.
+      PP_MAX_ODDS (default 4.0; MAX_ODDS generale = 5.0)."""
+    try:
+        if sport == "tabletennis":
+            return (float(os.environ.get("MAX_EDGE_SHARP_PP", "10")) / 100,
+                    float(os.environ.get("PP_MAX_ODDS", "4.0")))
+        return (float(os.environ.get("MAX_EDGE_SHARP_TENNIS", "15")) / 100, MAX_ODDS)
+    except ValueError:
+        return (0.10, 4.0) if sport == "tabletennis" else (0.15, MAX_ODDS)
+
 def _max_sharp_overround(book: str = "") -> float:
     """Margine massimo (somma delle probabilità implicite) per usare un book come riferimento.
     - Exchange (betfair, matchbook): ~1.00-1.05 se il libro è pieno. Il 18/10 matchbook dava
@@ -146,6 +162,8 @@ class AIAnalyzer:
         else:
             max_edge_cap = float(settings.get("max_edge_no_sharp", MAX_EDGE_NO_SHARP)) / 100
 
+        sharp_edge_cap, max_odds = _reliability(sport)
+
         # ── Filtro anticipo kickoff ──────────────────────────────────────────
         kickoff_str = match.get("kickoff", "")
         if kickoff_str:
@@ -221,6 +239,12 @@ class AIAnalyzer:
                     f"(quota sospetta): {match.get('name','?')} — {label}"
                 )
                 return False
+            if has_sharp and value > sharp_edge_cap:
+                logger.info(
+                    f"Edge {value:.1%} sopra il tetto {sharp_edge_cap:.0%} anche con sharp "
+                    f"(probabile quota ferma/sbagliata di un solo book): {match.get('name','?')} — {label}"
+                )
+                return False
             return True
 
         p1 = match["player1"]
@@ -240,7 +264,7 @@ class AIAnalyzer:
             ):
                 # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
                 pref_note = ""
-                if pbest and MIN_ODDS <= pbest <= MAX_ODDS and fair * pbest - 1 >= min_value:
+                if pbest and MIN_ODDS <= pbest <= max_odds and fair * pbest - 1 >= min_value:
                     best, book = pbest, pbook
                 elif pref and best:
                     pref_note = (f" (su {pbook} {pbest}: nessun valore)" if pbest
@@ -250,9 +274,9 @@ class AIAnalyzer:
                 # si riusciva a capire se la causa fosse "quota fuori range"
                 # (es. 1.15 per un favorito schiacciante, comune nel ping
                 # pong) o "edge sotto soglia". Ora entrambi i casi sono loggati.
-                if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                if not best or not (MIN_ODDS <= best <= max_odds):
                     logger.info(
-                        f"Winner scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
+                        f"Winner scartato (quota {best} fuori range {MIN_ODDS}-{max_odds}): "
                         f"{match.get('name','?')} — {player}"
                     )
                     continue
@@ -293,11 +317,11 @@ class AIAnalyzer:
             ):
                 # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
                 pbest = tot.get(f"pref_{side}")
-                if pbest and MIN_ODDS <= pbest <= MAX_ODDS and fair * pbest - 1 >= min_value:
+                if pbest and MIN_ODDS <= pbest <= max_odds and fair * pbest - 1 >= min_value:
                     best, book = pbest, tot[f"pref_{side}_book"]
-                if not best or not (MIN_ODDS <= best <= MAX_ODDS):
+                if not best or not (MIN_ODDS <= best <= max_odds):
                     logger.info(
-                        f"Totals scartato (quota {best} fuori range {MIN_ODDS}-{MAX_ODDS}): "
+                        f"Totals scartato (quota {best} fuori range {MIN_ODDS}-{max_odds}): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                     continue
@@ -317,6 +341,11 @@ class AIAnalyzer:
                     logger.info(
                         f"Totals scartato (nessun book sharp e consenso troppo debole: "
                         f"{tot['n_books']} book, partita {'verificata' if match.get('verified') else 'non verificata'}): "
+                        f"{match.get('name','?')} — {side} {line}"
+                    )
+                elif tot_sharp and value > sharp_edge_cap:
+                    logger.info(
+                        f"Totals scartato (edge {value:.1%} sopra il tetto {sharp_edge_cap:.0%} anche con sharp): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                 elif tot_sharp or value <= max_edge_cap:
