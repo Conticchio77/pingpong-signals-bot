@@ -54,6 +54,50 @@ def _iso_to_it(iso: str) -> str:
     except Exception:
         return _now_it().strftime("%d/%m %H:%M")
 
+# ─────────────────────────────────────────────────────────────────────────────────
+# GESTORE AUTOMATICO DELLA QUOTA
+# Idea: l'utente imposta una volta la frequenza "desiderata" (es. tennis 6h, ping pong 12h) e il
+# bot, ogni giorno, calcola da solo quanti scan e quanti bookmaker può permettersi con le
+# richieste/crediti rimasti fino al prossimo reset, saltando gli scan che non sono sostenibili.
+# ─────────────────────────────────────────────────────────────────────────────────
+def quota_days_left(now: datetime, reset_dom: int = 1) -> int:
+    """Giorni (oggi incluso) fino al prossimo reset, che cade il giorno `reset_dom` del mese."""
+    reset_dom = max(1, min(28, int(reset_dom or 1)))
+    d = now.date()
+    if d.day < reset_dom:
+        nxt = d.replace(day=reset_dom)
+    else:
+        first_next = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+        nxt = first_next.replace(day=reset_dom)
+    return max(1, (nxt - d).days)
+
+
+def plan_budget(remaining: float, days_left: int, slots: int, configs: list, reserve_per_day: float) -> tuple:
+    """Sceglie la configurazione e gli scan/giorno sostenibili.
+    configs: [(nome, costo_per_scan), ...] in ordine di preferenza (la prima è la migliore).
+    Ritorna (indice_config, scan_al_giorno, budget_al_giorno): si usa la prima configurazione che
+    permette TUTTI gli scan desiderati ("slots"); altrimenti l'ultima (la più economica) con
+    meno scan al giorno (anche frazionari: es. 0.8 = uno scan su cinque giorni saltato)."""
+    avail = max(0.0, float(remaining) - reserve_per_day * max(1, days_left))
+    per_day = avail / max(1, days_left)
+    for i, (_, cost) in enumerate(configs):
+        if per_day / cost >= slots - 1e-9:
+            return i, float(slots), per_day
+    last = len(configs) - 1
+    return last, min(float(slots), per_day / configs[last][1]), per_day
+
+
+def slot_allowed(scans_per_day: float, slot_idx: int, ordinal: int) -> bool:
+    """True se lo slot numero slot_idx (0 = primo della giornata) va eseguito. Le frazioni di scan
+    sono distribuite regolarmente nei giorni (es. 1.5 scan/giorno = 1 e 2 a giorni alterni)."""
+    base = int(scans_per_day)
+    allowed = base
+    frac = scans_per_day - base
+    if frac > 1e-9 and int(ordinal * frac) != int((ordinal - 1) * frac):
+        allowed += 1
+    return slot_idx < allowed
+
+
 def pingpong_scan_hours(interval_h: int) -> list:
     """Ore (Europe/Rome) in cui gira lo scan ping pong. Con intervallo 12h
     (2 scan/giorno) NON si usa 07+19: lo scan delle 19:00 copriva la notte, quando
@@ -353,10 +397,64 @@ class SignalScraper:
             sub = next((x for x in subs if x.get("subscription_id") == cur), None) or (subs[0] if subs else None)
             if not sub:
                 return None
-            return int(sub["request_limit"]) - int(sub["request_count"])
+            count = int(sub["request_count"])
+            self._note_oddspapi_count(count)
+            return int(sub["request_limit"]) - count
         except Exception as e:
             logger.warning(f"OddsPapi /account: lettura richieste rimaste fallita: {e}")
             return None
+
+    def _note_oddspapi_count(self, count: int):
+        """Memorizza il contatore e rileva il reset: se scende, il giorno del mese in cui è
+        avvenuto diventa il giorno di reset previsto (OddsPapi non lo dichiara)."""
+        if self.db is None:
+            return
+        try:
+            last = self.db.get_setting("oddspapi_last_count")
+            if last is not None and str(last).isdigit() and int(last) > count:
+                dom = min(28, _now_it().day)
+                self.db.set_setting("oddspapi_reset_dom", str(dom))
+                logger.info(f"OddsPapi: reset quota rilevato (contatore {last} → {count}): prossimo reset il giorno {dom} del mese")
+            self.db.set_setting("oddspapi_last_count", str(count))
+        except Exception:
+            pass
+
+    def _pp_reset_dom(self) -> int:
+        try:
+            v = self.db.get_setting("oddspapi_reset_dom") if self.db is not None else None
+            return int(v) if v and str(v).isdigit() else 1
+        except Exception:
+            return 1
+
+    async def plan_pingpong(self, slots: int, session: aiohttp.ClientSession | None = None) -> dict:
+        """Piano ping pong: quanti bookmaker, se fare l'approfondimento totali e quanti scan al
+        giorno sono sostenibili con le richieste rimaste (lette gratis da /v4/account)."""
+        now = _now_it()
+        books_cfg = [b for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()]
+        n_books = max(1, min(len(books_cfg), int(os.environ.get("PP_MAX_BOOK_REQUESTS", "3"))))
+        n_deep = max(0, int(os.environ.get("PP_TOTALS_DEEP", "2")))
+        reserve = float(os.environ.get("PP_RESULTS_PER_DAY", "2"))   # richieste/giorno tenute per i risultati
+        slots = max(1, int(slots))
+        own = session is None
+        sess = session or aiohttp.ClientSession()
+        try:
+            remaining = await self._oddspapi_remaining(sess)
+        finally:
+            if own:
+                await sess.close()
+        days_left = quota_days_left(now, self._pp_reset_dom())
+        cfgs = []
+        if n_books >= 3 and n_deep > 0:
+            cfgs.append((n_books, n_deep, 1 + n_books + n_deep))
+        if n_books >= 3:
+            cfgs.append((n_books, 0, 1 + n_books))
+        cfgs.append((min(n_books, 2), 0, 1 + min(n_books, 2)))
+        if remaining is None:        # account non leggibile: nessuna limitazione (fail-open)
+            return {"remaining": None, "days_left": days_left, "books_n": n_books, "deep": n_deep,
+                    "scans_per_day": float(slots), "cost": cfgs[0][2], "per_day": None}
+        idx, spd, per_day = plan_budget(remaining, days_left, slots, [(str(c[:2]), c[2]) for c in cfgs], reserve)
+        return {"remaining": remaining, "days_left": days_left, "books_n": cfgs[idx][0], "deep": cfgs[idx][1],
+                "scans_per_day": spd, "cost": cfgs[idx][2], "per_day": per_day}
 
     async def _throttle_oddspapi(self, min_interval: float | None = None):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere.
@@ -979,23 +1077,12 @@ class SignalScraper:
         books = [b.strip() for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()]
         books = books[:max(1, int(os.environ.get("PP_MAX_BOOK_REQUESTS", "3")))]
 
-        # ── Budget richieste ────────────────────────────────────────────────────────
-        # Legge le richieste rimaste (GET /v4/account, non conteggiato) e calcola quante ne
-        # servono per continuare a fare 1 scan al giorno fino a fine mese (si assume il reset
-        # il 1° del mese: non confermato da OddsPapi). Se non bastano, riduce i bookmaker a 2
-        # (sharp + preferito) invece di restare senza quota a metà mese; l'approfondimento dei
-        # totali parte solo se la quota regge anche con le richieste extra. PP_QUOTA_RESERVE =
-        # richieste tenute da parte per i controlli dei risultati (default 10).
-        rem0 = await self._oddspapi_remaining(session)
-        today = _now_it()
-        next_first = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
-        days_left = max(1, (next_first.date() - today.date()).days)
-        reserve = int(os.environ.get("PP_QUOTA_RESERVE", "10"))
-        budget_note = ""
-        if rem0 is not None and len(books) > 2 and rem0 < (len(books) + 1) * days_left + reserve:
-            books = books[:2]
-            budget_note = f"quota {rem0} per {days_left} giorni: bookmaker ridotti a {books}"
-            logger.info(f"OddsPapi by-tournaments: {budget_note}")
+        # ── Budget richieste: piano automatico (vedi plan_pingpong) ─────────────────
+        plan = await self.plan_pingpong(getattr(self, "pp_slots", 1), session)
+        rem0, days_left = plan["remaining"], plan["days_left"]
+        if plan["books_n"] < len(books):
+            books = books[:plan["books_n"]]
+            logger.info(f"OddsPapi by-tournaments: quota {rem0} per {days_left} giorni → bookmaker ridotti a {books}")
 
         base = {str(f.get("fixtureId")): f for f in fixtures}
         combined: dict = {}      # fixtureId -> {"fx": campi della fixture, "bm": {slug: payload bookmaker}}
@@ -1133,31 +1220,25 @@ class SignalScraper:
         # si scarica /odds completo (tutti i bookmaker, 1 richiesta ciascuna): il consenso sulla
         # stessa linea diventa ampio (in genere 10-50 book). Solo se restano abbastanza richieste
         # (da /v4/account, che non conta). PP_TOTALS_DEEP=0 per disattivare.
-        n_deep = max(0, int(os.environ.get("PP_TOTALS_DEEP", "2")))
+        n_deep = plan["deep"]
         deep_done, deep_note = 0, ""
         if n_deep and pairs:
-            min_rem = int(os.environ.get("PP_TOTALS_MIN_REMAINING", "40"))
-            remaining = rem0
-            sustainable = remaining is not None and remaining >= (len(books) + 1 + n_deep) * days_left + reserve
-            if remaining is None or remaining < min_rem or not sustainable:
-                deep_note = (f", approfondimento totali saltato (richieste rimaste {remaining}, "
-                             f"per {days_left} giorni a {len(books) + 1 + n_deep}/scan ne servono "
-                             f"{(len(books) + 1 + n_deep) * days_left + reserve})")
-            else:
-                for merged, m in pairs:
-                    if deep_done >= n_deep or remaining - deep_done < min_rem:
-                        break
-                    if not m.get("raw_totals") or not m.get("verified"):
-                        continue
-                    full = await self._parse_oddspapi_fixture(
-                        session, merged, winner_market, totals_market,
-                        totals_markets_all=totals_markets_all, quiet=True,
-                    )
-                    if full:
-                        full["verified"] = True
-                        matches[matches.index(m)] = full
-                        deep_done += 1
-                deep_note = f", totali approfonditi su {deep_done} partite (+{deep_done} richieste)"
+            for merged, m in pairs:
+                if deep_done >= n_deep:
+                    break
+                if not m.get("raw_totals") or not m.get("verified"):
+                    continue
+                full = await self._parse_oddspapi_fixture(
+                    session, merged, winner_market, totals_market,
+                    totals_markets_all=totals_markets_all, quiet=True,
+                )
+                if full:
+                    full["verified"] = True
+                    matches[matches.index(m)] = full
+                    deep_done += 1
+            deep_note = f", totali approfonditi su {deep_done} partite (+{deep_done} richieste)"
+        elif int(os.environ.get("PP_TOTALS_DEEP", "2")) > 0 and pairs:
+            deep_note = f", approfondimento totali sospeso dal gestore quota (rimaste {rem0}, {days_left} giorni)"
         n_requests += deep_done
 
         with_totals = sum(1 for m in matches if m.get("raw_totals"))
