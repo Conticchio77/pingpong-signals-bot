@@ -2436,8 +2436,30 @@ async def remind_pending_results(app: Application, sport: str):
         except Exception as e:
             logger.error(f"Promemoria risultati fallito: {e}")
 
+def _pp_result_hours() -> list:
+    """Ore (Roma) dei controlli risultati ping pong: variabile PP_RESULT_HOURS, default 14 e 22."""
+    raw = os.environ.get("PP_RESULT_HOURS", "14,22")
+    hs = sorted({int(x) for x in raw.split(",") if x.strip().isdigit() and 0 <= int(x) <= 23})
+    return hs or [14, 22]
+
 async def _results_job(app: Application, sport: str):
-    """Job orario: cerca i risultati e poi manda i promemoria per quelli mancanti."""
+    """Job orario: cerca i risultati e poi manda i promemoria per quelli mancanti.
+    Ping pong con gestore quota: l'ULTIMO controllo della giornata (22:00) gira sempre; gli
+    altri (es. 14:00) solo se la quota basta per tutti gli scan impostati: gli scan hanno
+    la precedenza. Così non serve cambiare PP_RESULT_HOURS a mano a fine/inizio mese."""
+    if AUTO_QUOTA and sport == "tabletennis":
+        hours = _pp_result_hours()
+        if datetime.datetime.now(ROME).hour != hours[-1]:
+            try:
+                scan_slots = len(pingpong_scan_hours(int(db.get_settings()["pingpong_scan_interval"])))
+                plan = await scraper.plan_pingpong(scan_slots)
+            except Exception as e:
+                plan = None
+                logger.warning(f"Gestore quota (risultati): piano non calcolabile ({e}) — controllo eseguito")
+            if plan and plan["remaining"] is not None and plan["scans_per_day"] < scan_slots - 1e-9:
+                logger.info(f"⏭ Controllo risultati ping pong saltato dal gestore quota "
+                            f"({plan['remaining']} richieste per {plan['days_left']} giorni): resta quello serale")
+                return
     try:
         await run_auto_results(app, sport=sport)
     finally:
