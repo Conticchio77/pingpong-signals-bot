@@ -643,7 +643,12 @@ async def send_quota(fn):
                 lines.append(f"🎾 {tp['scans_per_day']:.1f} scan al giorno su {tp['slots']} impostati "
                              f"(~{tp['cost']:g} crediti a scan, {tp['days_left']} giorni al reset)")
             hrs = pingpong_scan_hours(int(db.get_settings()["pingpong_scan_interval"]))
-            pp = await scraper.plan_pingpong(len(hrs))
+            # /v4/account di OddsPapi ha un cooldown di 1 s: si riusa la lettura già fatta qui sopra
+            # (prima una seconda chiamata ravvicinata veniva rifiutata e la riga del ping pong spariva)
+            pp = None
+            if live_p and live_p.get("limit") is not None and isinstance(live_p.get("count"), (int, float)):
+                scraper._note_oddspapi_count(int(live_p["count"]))     # rileva anche il reset
+                pp = await scraper.plan_pingpong(len(hrs), remaining=int(live_p["limit"] - live_p["count"]))
             if pp and pp["remaining"] is not None:
                 extra = " + totali" if pp["deep"] else ""
                 lines.append(f"🏓 {pp['scans_per_day']:.1f} scan al giorno su {len(hrs)} impostati, "

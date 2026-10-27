@@ -426,7 +426,8 @@ class SignalScraper:
         except Exception:
             return 1
 
-    async def plan_pingpong(self, slots: int, session: aiohttp.ClientSession | None = None) -> dict:
+    async def plan_pingpong(self, slots: int, session: aiohttp.ClientSession | None = None,
+                            remaining: int | None = None) -> dict:
         """Piano ping pong: quanti bookmaker, se fare l'approfondimento totali e quanti scan al
         giorno sono sostenibili con le richieste rimaste (lette gratis da /v4/account)."""
         now = _now_it()
@@ -435,13 +436,14 @@ class SignalScraper:
         n_deep = max(0, int(os.environ.get("PP_TOTALS_DEEP", "2")))
         reserve = float(os.environ.get("PP_RESULTS_PER_DAY", "2"))   # richieste/giorno tenute per i risultati
         slots = max(1, int(slots))
-        own = session is None
-        sess = session or aiohttp.ClientSession()
-        try:
-            remaining = await self._oddspapi_remaining(sess)
-        finally:
-            if own:
-                await sess.close()
+        if remaining is None:        # se il chiamante l'ha già letto (es. tasto Quota) non si rilegge /account
+            own = session is None
+            sess = session or aiohttp.ClientSession()
+            try:
+                remaining = await self._oddspapi_remaining(sess)
+            finally:
+                if own:
+                    await sess.close()
         days_left = quota_days_left(now, self._pp_reset_dom())
         cfgs = []
         if n_books >= 3 and n_deep > 0:
