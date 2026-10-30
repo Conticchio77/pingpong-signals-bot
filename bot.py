@@ -256,7 +256,8 @@ def _howto_block(s: dict) -> str:
         "Non è una vincita garantita: è il vantaggio medio nel lungo periodo.\n"
         "• *Stake*: la forza del segnale da 1 (vantaggio lieve) a 5 (forte). Non cambia l'importo.\n"
         "• *Puntata*: quanto rischiare, sempre la stessa % fissa del bankroll. Non alzarla per recuperare.\n"
-        "• *Confidenza*: affidabilità della stima (più stelle, più affidabile).\n"
+        "• *Probabilità stimata*: quante volte su 100 ci aspettiamo che la giocata vinca. Con quote alte si perde più spesso di quanto si vince: è normale.\n"
+        "• *Affidabilità*: quanto è solida la stima (più stelle, più affidabile). Non è la probabilità di vincere.\n"
         "⚠️ Nessuna giocata è sicura: punta solo ciò che puoi permetterti di perdere."
     )
 
@@ -291,6 +292,12 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         min_odds = None
     stake_pct = db.get_settings().get("stake_pct", 0.5)
     min_line  = f"✅ Quota minima per giocare: *{min_odds:.2f}*\n" if min_odds else ""
+    # Probabilità stimata di vincere (dal valore e dalla quota): con quote alte è bassa e va detto chiaro
+    try:
+        p_win = (1 + float(s["value_pct"]) / 100) / float(s["odds"])
+        prob_line = f"🎲 Probabilità stimata: *{p_win:.1%}* (circa 1 volta su {round(1 / p_win)})\n" if 0.01 < p_win < 0.99 else ""
+    except Exception:
+        prob_line = ""
     book_part = f" su *{book}*" if book else ""
 
     text = (
@@ -300,7 +307,8 @@ def signal_text(s: dict, for_vip: bool = False) -> str:
         f"🎯 Giocata: *{s['pick']}*\n"
         f"💰 Quota: *{s['odds']}*{book_part}\n"
         f"{min_line}"
-        f"📊 Confidenza: *{s['confidence']}%* {stars}\n"
+        f"{prob_line}"
+        f"📊 Affidabilità del segnale: *{s['confidence']}%* {stars}\n"
         f"💡 Value edge: *{vsign}*\n"
         f"📌 Stake (forza del segnale): *{s['stake']}/5* | 💹 Puntata fissa: *{stake_pct}% bankroll* (es. {stake_pct * 10:g} € ogni 1.000 €)\n"
         f"⏰ Inizio: *{s['kickoff']}*\n"
