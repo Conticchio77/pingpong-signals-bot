@@ -98,6 +98,28 @@ def slot_allowed(scans_per_day: float, slot_idx: int, ordinal: int) -> bool:
     return slot_idx < allowed
 
 
+def daily_scan_count(scans_per_day: float, slots: int, ordinal: int) -> int:
+    """Quanti scan eseguire OGGI: parte intera degli scan/giorno sostenibili, più 1 nei giorni in
+    cui la parte frazionaria "scatta" (distribuita regolarmente, es. 2.4 = 2 scan per 3 giorni su 5 e 3 negli altri)."""
+    base = int(scans_per_day)
+    frac = scans_per_day - base
+    n = base + (1 if frac > 1e-9 and int(ordinal * frac) != int((ordinal - 1) * frac) else 0)
+    return max(0, min(slots, n))
+
+
+def slot_runs(n: int, slots: int, idx: int) -> bool:
+    """Con n scan da fare oggi su `slots` orari possibili, quali slot eseguire: SPALMATI sulla giornata
+    (primo e ultimo slot compresi), non i primi n (altrimenti 07:00 e 10:00 e niente di pomeriggio/sera).
+    Es. 6 slot (07,10,13,16,19,22): n=2 → 07 e 22; n=3 → 07, 13/16 e 22; 3 slot (07,13,19): n=2 → 07 e 19."""
+    if n <= 0:
+        return False
+    if n >= slots:
+        return True
+    if n == 1:
+        return idx == 0
+    return idx in {round(k * (slots - 1) / (n - 1)) for k in range(n)}
+
+
 def pingpong_scan_hours(interval_h: int) -> list:
     """Ore (Europe/Rome) in cui gira lo scan ping pong. Con intervallo 12h
     (2 scan/giorno) NON si usa 07+19: lo scan delle 19:00 copriva la notte, quando

@@ -15,7 +15,7 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from scraper import SignalScraper, result_due, pingpong_scan_hours, quota_days_left, plan_budget, slot_allowed
+from scraper import SignalScraper, result_due, pingpong_scan_hours, quota_days_left, plan_budget, slot_allowed, daily_scan_count, slot_runs
 from ai_analyzer import AIAnalyzer
 from database import Database
 
@@ -1981,6 +1981,20 @@ async def _monthly_reset_scan_interval(app: Application):
 # quota piena, torna da solo a tutti gli scan. Si disattiva con la variabile Railway AUTO_QUOTA=0.
 AUTO_QUOTA = os.environ.get("AUTO_QUOTA", "1") != "0"
 
+def _slot_decision(key: str, spd: float, slots: int, idx: int) -> bool:
+    """True se lo slot idx va eseguito. Il numero di scan di OGGI si decide una sola volta al giorno
+    (al primo slot) e si ricorda: così la distribuzione non cambia durante la giornata man mano che
+    i crediti scendono. Gli scan eseguiti sono spalmati su tutti gli slot (vedi slot_runs)."""
+    now = datetime.datetime.now(ROME)
+    today = now.strftime("%Y-%m-%d")
+    if db.get_setting(f"plan_date_{key}") == today:
+        n = int(db.get_setting(f"plan_n_{key}") or 0)
+    else:
+        n = daily_scan_count(spd, slots, now.date().toordinal())
+        db.set_setting(f"plan_date_{key}", today)
+        db.set_setting(f"plan_n_{key}", n)
+    return slot_runs(n, slots, idx)
+
 def _slot_index(hours: list, hour: int) -> int:
     """Indice dello slot (0 = primo della giornata) a cui appartiene l'ora corrente."""
     return max(0, len([h for h in hours if h <= hour]) - 1)
@@ -2022,7 +2036,7 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
     plan = await _tennis_plan()
     if plan is not None:
         idx = _slot_index(plan["hours"], datetime.datetime.now(ROME).hour)
-        if not slot_allowed(plan["scans_per_day"], idx, datetime.datetime.now(ROME).date().toordinal()):
+        if not _slot_decision("tennis", plan["scans_per_day"], plan["slots"], idx):
             note = (f"{plan['remaining']} crediti per {plan['days_left']} giorni: sostenibili "
                     f"{plan['scans_per_day']:.1f} scan al giorno (uno costa ~{plan['cost']:g} crediti)")
             logger.info(f"⏭ Scan tennis saltato dal gestore quota — {note}")
@@ -2253,7 +2267,7 @@ async def run_pingpong_scan(app: Application, is_retry: bool = False):
             plan = None
         if plan and plan["remaining"] is not None:
             now = datetime.datetime.now(ROME)
-            if not slot_allowed(plan["scans_per_day"], _slot_index(hours, now.hour), now.date().toordinal()):
+            if not _slot_decision("pingpong", plan["scans_per_day"], len(hours), _slot_index(hours, now.hour)):
                 note = (f"{plan['remaining']} richieste per {plan['days_left']} giorni: sostenibili "
                         f"{plan['scans_per_day']:.1f} scan al giorno ({plan['books_n']} bookmaker, "
                         f"~{plan['cost']} richieste a scan)")
