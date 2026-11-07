@@ -26,6 +26,8 @@ import statistics
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from scraper import blocked_tournament, is_doubles
+
 logger = logging.getLogger(__name__)
 IT_TZ  = ZoneInfo("Europe/Rome")
 
@@ -62,7 +64,7 @@ def _reliability(sport: str) -> tuple:
     try:
         if sport == "tabletennis":
             return (float(os.environ.get("MAX_EDGE_SHARP_PP", "10")) / 100,
-                    float(os.environ.get("PP_MAX_ODDS", "4.0")))
+                    float(os.environ.get("PP_MAX_ODDS", "2.6")))
         return (float(os.environ.get("MAX_EDGE_SHARP_TENNIS", "15")) / 100, MAX_ODDS)
     except ValueError:
         return (0.10, 4.0) if sport == "tabletennis" else (0.15, MAX_ODDS)
@@ -82,14 +84,38 @@ def _max_sharp_overround(book: str = "") -> float:
     except ValueError:
         return 1.07 if ("betfair" in name or "matchbook" in name) else 1.15
 
-def _totals_min_books() -> int:
+def _pp_min_odds() -> float:
+    """Quota minima ping pong (default 1.60): sui favoriti schiacciati la stima è troppo rumorosa."""
+    try:
+        return float(os.environ.get("PP_MIN_ODDS", "1.60"))
+    except ValueError:
+        return 1.60
+
+def _pp_min_value() -> float:
+    """Edge minimo ping pong in % (default 4): sotto, nelle leghe minori, è rumore dei margini."""
+    try:
+        return float(os.environ.get("PP_MIN_VALUE", "4.0")) / 100
+    except ValueError:
+        return 0.04
+
+def _confirm_min_edge() -> float:
+    """Edge minimo contro la MEDIANA di tutti i book (default 1%): conferma che il prezzo sia l'anomalo
+    e non lo sharp. Se lo sharp è l'unico a discostarsi dagli altri, il valore non è affidabile."""
+    try:
+        return float(os.environ.get("CONFIRM_MIN_EDGE", "1.0")) / 100
+    except ValueError:
+        return 0.01
+
+def _totals_min_books(sport: str = "tabletennis") -> int:
     """Over/Under senza sharp (sbobet non quota i totali del ping pong): si accetta il consenso
     SOLO se la partita è verificata da uno sharp sul mercato vincente (match["verified"]) e
     almeno N bookmaker quotano la stessa linea. Variabile Railway TOTALS_CONSENSUS_MIN_BOOKS."""
     try:
+        if sport == "tennis":
+            return max(3, int(os.environ.get("TOTALS_CONSENSUS_MIN_BOOKS_TENNIS", "5")))
         return max(3, int(os.environ.get("TOTALS_CONSENSUS_MIN_BOOKS", "6")))
     except ValueError:
-        return 6
+        return 5 if sport == "tennis" else 6
 
 # ── Bookmaker PREFERITO (dove l'utente preferisce puntare) ─────────────────────
 # Per ogni segnale si guarda PRIMA il book preferito: se il suo prezzo ha già il
@@ -130,6 +156,16 @@ MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senz
 
 class AIAnalyzer:
 
+    def __init__(self):
+        self.best = None      # (edge, partita, giocata) migliore visto dall'ultimo reset_best()
+
+    def reset_best(self):
+        self.best = None
+
+    def _note_best(self, value: float, match: dict, label: str):
+        if self.best is None or value > self.best[0]:
+            self.best = (value, match.get("name", "?"), label)
+
     async def analyze(self, match: dict, settings: dict = None) -> list[dict]:
         sport = match.get("sport", "tabletennis")
         try:
@@ -151,6 +187,13 @@ class AIAnalyzer:
             logger.info(f"Match scartato (fonte demo, non una partita vera): {match.get('name','?')}")
             return []
 
+        if is_doubles(match.get("player1"), match.get("player2")):
+            logger.info(f"Match scartato (doppio): {match.get('name','?')}")
+            return []
+        if blocked_tournament(match.get("tournament"), "tennis" if sport == "tennis" else "tabletennis"):
+            logger.info(f"Match scartato (torneo escluso: {match.get('tournament')}): {match.get('name','?')}")
+            return []
+
         # Legge limiti da settings (con fallback alle costanti)
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
         same_day_only = bool(settings.get("same_day_only", SAME_DAY_ONLY))
@@ -163,6 +206,10 @@ class AIAnalyzer:
             max_edge_cap = float(settings.get("max_edge_no_sharp", MAX_EDGE_NO_SHARP)) / 100
 
         sharp_edge_cap, max_odds = _reliability(sport)
+        min_odds = _pp_min_odds() if sport == "tabletennis" else MIN_ODDS
+        if sport == "tabletennis":
+            min_value = max(min_value, _pp_min_value())
+        confirm_min = _confirm_min_edge()
 
         # ── Filtro anticipo kickoff ──────────────────────────────────────────
         kickoff_str = match.get("kickoff", "")
@@ -221,6 +268,7 @@ class AIAnalyzer:
             )
             ref_kind = None
         has_sharp = ref_kind == "sharp"
+        verified  = bool(match.get("verified")) or has_sharp   # lo sharp che quota il vincente prova che la partita esiste
         source    = match.get("source", "")
         if ref_kind and not has_sharp and _require_sharp():
             logger.info(
@@ -251,6 +299,10 @@ class AIAnalyzer:
         p2 = match["player2"]
 
         # ── Winner ──────────────────────────────────────────────────────────
+        cons_h, cons_a, n_cons = self._consensus_probs(raw_bm)
+        if ref_kind and sport == "tabletennis" and n_cons < 3:
+            logger.info(f"Winner scartato (solo {n_cons} book con quote: edge non confermabile): {match.get('name','?')}")
+            ref_kind = None
         if ref_kind:
             best_h, best_h_book = self._best_soft_odd(raw_bm, "home", match.get("odds_home"))
             best_a, best_a_book = self._best_soft_odd(raw_bm, "away", match.get("odds_away"))
@@ -258,13 +310,13 @@ class AIAnalyzer:
             pref_h, pref_h_book = self._best_soft_odd(raw_bm, "home", None, pref) if pref else (None, None)
             pref_a, pref_a_book = self._best_soft_odd(raw_bm, "away", None, pref) if pref else (None, None)
 
-            for player, fair, best, book, pbest, pbook in (
-                (p1, fair_home, best_h, best_h_book, pref_h, pref_h_book),
-                (p2, fair_away, best_a, best_a_book, pref_a, pref_a_book),
+            for player, fair, best, book, pbest, pbook, cons in (
+                (p1, fair_home, best_h, best_h_book, pref_h, pref_h_book, cons_h),
+                (p2, fair_away, best_a, best_a_book, pref_a, pref_a_book, cons_a),
             ):
                 # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
                 pref_note = ""
-                if pbest and MIN_ODDS <= pbest <= max_odds and fair * pbest - 1 >= min_value:
+                if pbest and min_odds <= pbest <= max_odds and fair * pbest - 1 >= min_value:
                     best, book = pbest, pbook
                 elif pref and best:
                     pref_note = (f" (su {pbook} {pbest}: nessun valore)" if pbest
@@ -274,13 +326,14 @@ class AIAnalyzer:
                 # si riusciva a capire se la causa fosse "quota fuori range"
                 # (es. 1.15 per un favorito schiacciante, comune nel ping
                 # pong) o "edge sotto soglia". Ora entrambi i casi sono loggati.
-                if not best or not (MIN_ODDS <= best <= max_odds):
+                if not best or not (min_odds <= best <= max_odds):
                     logger.info(
-                        f"Winner scartato (quota {best} fuori range {MIN_ODDS}-{max_odds}): "
+                        f"Winner scartato (quota {best} fuori range {min_odds}-{max_odds}): "
                         f"{match.get('name','?')} — {player}"
                     )
                     continue
                 value = fair * best - 1
+                self._note_best(value, match, f"{player} @ {best}")
                 if value < min_value:
                     logger.info(
                         f"Winner scartato (edge {value:.1%} < min {min_value:.1%}): "
@@ -288,6 +341,12 @@ class AIAnalyzer:
                     )
                     continue
                 if not _edge_ok(value, f"{player} vince"):
+                    continue
+                if cons is not None and cons * best - 1 < confirm_min:
+                    logger.info(
+                        f"Winner scartato (edge {value:.1%} sul riferimento, ma solo {cons * best - 1:.1%} "
+                        f"sulla mediana di {n_cons} book: lo sharp è l'anomalo): {match.get('name','?')} — {player} @ {best}"
+                    )
                     continue
                 signals.append(self._build(
                     match     = match,
@@ -317,15 +376,16 @@ class AIAnalyzer:
             ):
                 # Prima il book preferito: se ha già il valore minimo, il segnale esce lì.
                 pbest = tot.get(f"pref_{side}")
-                if pbest and MIN_ODDS <= pbest <= max_odds and fair * pbest - 1 >= min_value:
+                if pbest and min_odds <= pbest <= max_odds and fair * pbest - 1 >= min_value:
                     best, book = pbest, tot[f"pref_{side}_book"]
-                if not best or not (MIN_ODDS <= best <= max_odds):
+                if not best or not (min_odds <= best <= max_odds):
                     logger.info(
-                        f"Totals scartato (quota {best} fuori range {MIN_ODDS}-{max_odds}): "
+                        f"Totals scartato (quota {best} fuori range {min_odds}-{max_odds}): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                     continue
                 value = fair * best - 1
+                self._note_best(value, match, f"{side} {line} @ {best}")
                 if value >= min_value:
                     cand.append((value, side, fair, best, book))
                 else:
@@ -337,10 +397,10 @@ class AIAnalyzer:
                 value, side, fair, best, book = max(cand)
                 tot_sharp = tot["kind"] == "sharp"
                 if (not tot_sharp and _require_sharp()
-                        and not (match.get("verified") and tot["n_books"] >= _totals_min_books())):
+                        and not (verified and tot["n_books"] >= _totals_min_books(sport))):
                     logger.info(
                         f"Totals scartato (nessun book sharp e consenso troppo debole: "
-                        f"{tot['n_books']} book, partita {'verificata' if match.get('verified') else 'non verificata'}): "
+                        f"{tot['n_books']} book su {_totals_min_books(sport)} richiesti, partita {'verificata' if verified else 'non verificata'}): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                 elif tot_sharp and value > sharp_edge_cap:
@@ -348,7 +408,7 @@ class AIAnalyzer:
                         f"Totals scartato (edge {value:.1%} sopra il tetto {sharp_edge_cap:.0%} anche con sharp): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
-                elif tot_sharp or value <= max_edge_cap:
+                elif tot_sharp or value <= min(max_edge_cap, 0.10):
                     method = "book sharp" if tot_sharp else f"consenso di {tot['n_books']} book (mediana)"
                     signals.append(self._build(
                         match     = match,
@@ -366,7 +426,7 @@ class AIAnalyzer:
                     ))
                 else:
                     logger.info(
-                        f"Edge {value:.1%} sopra il tetto {max_edge_cap:.0%} senza sharp "
+                        f"Edge {value:.1%} sopra il tetto {min(max_edge_cap, 0.10):.0%} su consenso "
                         f"(quota sospetta): {match.get('name','?')} — {side} {line}"
                     )
 
@@ -424,6 +484,19 @@ class AIAnalyzer:
             fh = statistics.median(fairs)
             return round(fh, 4), round(1 - fh, 4), "consensus", len(fairs)
         return None, None, None, len(fairs)
+
+    def _consensus_probs(self, raw_bm: dict) -> tuple:
+        """(fair_home, fair_away, n_book): mediana delle probabilità fair di TUTTI i book con quote valide
+        (almeno 3, altrimenti None). Serve da conferma incrociata del riferimento sharp."""
+        fairs = [
+            self._power_fair(float(o["home"]), float(o["away"]))[0]
+            for o in raw_bm.values()
+            if self._valid_pair(o.get("home"), o.get("away"))
+        ]
+        if len(fairs) < 3:
+            return None, None, len(fairs)
+        fh = statistics.median(fairs)
+        return fh, 1 - fh, len(fairs)
 
     def _totals_reference(self, raw_totals: dict, preferred: list | None = None) -> dict | None:
         """raw_totals = {linea: {book: {"over": x, "under": y}}}. Sceglie la linea

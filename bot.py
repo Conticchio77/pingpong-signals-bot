@@ -221,6 +221,9 @@ def _send_rows(s: dict) -> list:
         [InlineKeyboardButton("🗑 Scarta", callback_data=f"discard_{sid}")],
     ]
 
+# Massimo di segnali nuovi per ogni scan (i migliori per edge): evita raffiche e distribuisce i segnali nella giornata
+MAX_SIGNALS_PER_SCAN = max(1, int(os.environ.get("MAX_SIGNALS_PER_SCAN", "3")))
+
 db       = Database()
 scraper  = SignalScraper(db=db)
 analyzer = AIAnalyzer()
@@ -864,7 +867,8 @@ async def send_settings_tennis(fn):
 
     dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_tennis"], "📤 VIP")
     kb = [
-        [InlineKeyboardButton(f"⏱ Scan: ogni {interval}h", callback_data="pick_interval")],
+        [InlineKeyboardButton(("⏱ Scan: automatico (quota)" if AUTO_SLOTS else f"⏱ Scan: ogni {interval}h"),
+                              callback_data=("auto_info" if AUTO_SLOTS else "pick_interval"))],
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"📉 Cap edge (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
@@ -893,7 +897,8 @@ async def send_settings_pingpong(fn):
 
     dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_pingpong"], "📤 VIP")
     kb = [
-        [InlineKeyboardButton(f"⏱ Scan: ogni {pp_interval}h", callback_data="pick_interval_pp")],
+        [InlineKeyboardButton(("⏱ Scan: automatico (quota)" if AUTO_SLOTS else f"⏱ Scan: ogni {pp_interval}h"),
+                              callback_data=("auto_info" if AUTO_SLOTS else "pick_interval_pp"))],
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_pp_label}", callback_data="pick_confidence_pp")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
@@ -1427,6 +1432,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grp = "free" if data == "toggle_autosend_free" else "vip"   # il vecchio bottone unico = VIP
         db.set_setting(f"auto_send_{grp}", "0" if _auto_send_on(grp) else "1")
         await send_settings(query.edit_message_text)
+
+    elif data == "auto_info":
+        await query.edit_message_text(
+            "⏱ *Scan automatici*\n\n"
+            "Ogni mattina il bot calcola da solo quanti scan fare oggi in base ai crediti/richieste rimaste "
+            "fino al reset della quota, e li distribuisce tra le 07:00 e le 21:00. "
+            "L'intervallo non si imposta più a mano. Il piano del giorno arriva in chat (📅) e il tasto 📡 Quota "
+            "mostra scan al giorno sostenibili.\n\n"
+            f"Tetti: tennis max {TENNIS_MAX_SCANS}/giorno, ping pong max {PP_MAX_SCANS}/giorno, "
+            f"max {MAX_SIGNALS_PER_SCAN} segnali per scan (i migliori per edge).",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")]])
+        )
 
     # ── Scegli intervallo scan (picker visuale) ───────────────────────────────────
     elif data == "pick_interval":
@@ -2043,6 +2061,35 @@ def _auto_slot_decision(key: str, spd: float, span: int, now: datetime.datetime)
         db.set_setting(f"autoplan_done_{key}", ",".join(map(str, sorted(done))))
     return bool(due), hours, created
 
+def _player_busy(sig: dict, used: set) -> bool:
+    """True se un giocatore del segnale è già in un altro segnale ancora aperto (ultime 24h) o appena
+    scelto in questo scan: due segnali sullo stesso giocatore sono correlati e non indipendenti."""
+    names = {n.strip().lower() for n in (sig.get("player1", ""), sig.get("player2", "")) if n}
+    if not names:
+        return False
+    if names & used:
+        return True
+    try:
+        rows = db.conn.execute(
+            "SELECT player1, player2, created_at FROM signals WHERE sport=? AND result IS NULL "
+            "AND status IN ('pending','seen','sent')", (sig.get("sport"),)
+        ).fetchall()
+        limit = datetime.datetime.now(ROME) - datetime.timedelta(hours=24)
+        for r in rows:
+            try:
+                ca = datetime.datetime.fromisoformat(str(r["created_at"]))
+                if ca.tzinfo is None:
+                    ca = ca.replace(tzinfo=datetime.timezone.utc)
+                if ca < limit:
+                    continue
+            except Exception:
+                pass
+            if names & {(r["player1"] or "").strip().lower(), (r["player2"] or "").strip().lower()}:
+                return True
+    except Exception as e:
+        logger.warning(f"Controllo giocatore già in segnale fallito: {e}")
+    return False
+
 def _hours_txt(hours: list) -> str:
     return ", ".join(f"{h:02d}:00" for h in hours) if hours else "nessuno scan oggi (quota)"
 
@@ -2221,24 +2268,26 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
         if not quota_is_the_reason:
             ora = datetime.datetime.now(ROME).hour
             if 7 <= ora <= 23:
-                await app.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        "ℹ️ *Nessuna partita disponibile*\n\n"
-                        "Le API non hanno partite quotate al momento.\n"
-                        "Il prossimo scan automatico riproverà tra poco."
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=PERSISTENT_KB,
+                # al massimo un avviso al giorno per sport: con gli scan spalmati sulla giornata,
+                # a fine programma (es. tennis di sera) "nessuna partita utile" è normale e non va ripetuto
+                await _notify_budget_once(
+                    app, f"nomatch_{fetch_sport}",
+                    "ℹ️ *Nessuna partita utile al momento* ("
+                    + ("🏓" if fetch_sport == "tabletennis" else "🎾")
+                    + ")\nLe API non hanno partite quotate che passino i filtri. "
+                    "Il prossimo scan del piano riproverà."
                 )
         return 0
 
     new_signals = 0
 
+    # Fase 1: analisi di tutte le partite, raccolta dei candidati. Fase 2: si tengono i migliori per edge
+    # (massimo MAX_SIGNALS_PER_SCAN per scan, un solo segnale per giocatore) e si inviano.
+    analyzer.reset_best()
+    cands = []
     for match in matches:
         try:
             signals = await analyzer.analyze(match, settings)
-            signals.sort(key=lambda x: x["value_pct"], reverse=True)
             for sig in signals:
                 # Soglia separata per sport: senza sharp book il ping pong è
                 # tappato a ~70% di confidenza per costruzione (vedi
@@ -2256,6 +2305,22 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                     continue
                 if db.signal_exists(sig["match_key"]):
                     continue
+                cands.append(sig)
+        except Exception as e:
+            logger.error(f"Errore analisi {match.get('name','?')}: {e}")
+
+    cands.sort(key=lambda x: x["value_pct"], reverse=True)
+    used_players: set = set()
+    if True:   # blocco di invio (stesso rientro del vecchio ciclo)
+        try:
+            for sig in cands:
+                if new_signals >= MAX_SIGNALS_PER_SCAN:
+                    logger.info(f"Tetto di {MAX_SIGNALS_PER_SCAN} segnali per scan raggiunto: gli altri candidati riproveranno al prossimo scan")
+                    break
+                if _player_busy(sig, used_players):
+                    logger.info(f"Segnale scartato (giocatore già in un segnale aperto): {sig.get('match','?')} — {sig.get('pick','?')}")
+                    continue
+                used_players |= {n.strip().lower() for n in (sig.get("player1", ""), sig.get("player2", "")) if n}
                 sig_id = db.save_signal(sig)
                 new_signals += 1
 
@@ -2292,7 +2357,7 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                             logger.warning(f"Aggiornamento tasti dopo auto-invio fallito: {e}")
 
         except Exception as e:
-            logger.error(f"Errore analisi {match.get('name','?')}: {e}")
+            logger.error(f"Errore invio segnali: {e}")
 
     logger.info(f"✅ {new_signals} nuovi segnali")
 
@@ -2306,7 +2371,9 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
         try:
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"✅ Scan concluso ({sport_ping_label}): 0 segnali",
+                text=(f"✅ Scan concluso ({sport_ping_label}): 0 segnali"
+                      + (f"\n📉 Miglior edge visto: {analyzer.best[0]:+.1%} — {analyzer.best[1]} ({analyzer.best[2]})"
+                         if analyzer.best else "")),
             )
         except Exception as e:
             logger.debug(f"Impossibile inviare ping scan-vuoto: {e}")

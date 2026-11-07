@@ -108,6 +108,39 @@ def _even_sample(items: list, n: int) -> list:
     return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
 
 
+def _kw(env: str, default: str) -> list:
+    return [k.strip().lower() for k in os.environ.get(env, default).split(",") if k.strip()]
+
+
+def blocked_tournament(name, sport: str) -> bool:
+    """True se il torneo va escluso per affidabilità. Liste modificabili da variabili Railway:
+    TENNIS_BLOCK_TOURNAMENTS (default: itf,utr,exhibition,junior,futures), TENNIS_ALLOW_TOURNAMENTS,
+    PP_BLOCK_TOURNAMENTS, PP_ALLOW_TOURNAMENTS (se una ALLOW non è vuota, passano solo i tornei che la contengono).
+    Confronto per sottostringa sul nome del torneo, senza maiuscole."""
+    n = (name or "").lower()
+    if not n:
+        return False
+    if sport == "tennis":
+        block, allow = _kw("TENNIS_BLOCK_TOURNAMENTS", "itf,utr,exhibition,junior,futures"), _kw("TENNIS_ALLOW_TOURNAMENTS", "")
+    else:
+        block, allow = _kw("PP_BLOCK_TOURNAMENTS", ""), _kw("PP_ALLOW_TOURNAMENTS", "")
+    if any(k in n for k in block):
+        return True
+    return bool(allow) and not any(k in n for k in allow)
+
+
+def is_doubles(*names) -> bool:
+    """Doppio (due giocatori per lato: "A / B")."""
+    return any("/" in (n or "") for n in names)
+
+
+def _fixture_ok(f: dict, sport: str) -> bool:
+    """Fixture OddsPapi accettabile: singolare e torneo non escluso."""
+    if is_doubles(f.get("participant1Name"), f.get("participant2Name")):
+        return False
+    return not blocked_tournament(f.get("tournamentName"), sport)
+
+
 def quota_days_left(now: datetime, reset_dom: int = 1) -> int:
     """Giorni (oggi incluso) fino al prossimo reset, che cade il giorno `reset_dom` del mese."""
     reset_dom = max(1, min(28, int(reset_dom or 1)))
@@ -424,6 +457,8 @@ class SignalScraper:
         # Stato quota, aggiornato ad ogni chiamata reale alle API — usato da bot.py
         # per avvisare l'admin quando i segnali si fermano per quota esaurita.
         self.tennis_quota_ok   = True
+        self._tennis_fb_reason = None     # perché The Odds API non basta (None = tutto ok, semplicemente niente partite utili)
+        self._pp_fix_cache     = None     # (data, istante, fixtures): elenco partite ping pong riusato tra scan vicini
         self.pingpong_quota_ok = True
         self.pingpong_rate_limited = False   # 429 da cooldown (momentaneo), NON quota esaurita
         # FIX: throttle tra chiamate OddsPapi. Nel log del 24/09 quasi TUTTE
@@ -542,9 +577,19 @@ class SignalScraper:
         if remaining is None:        # account non leggibile: nessuna limitazione (fail-open)
             return {"remaining": None, "days_left": days_left, "books_n": n_books, "deep": n_deep,
                     "scans_per_day": float(slots), "cost": cfgs[0][2], "per_day": None}
-        idx, spd, per_day = plan_budget(remaining, days_left, slots, [(str(c[:2]), c[2]) for c in cfgs], reserve)
-        return {"remaining": remaining, "days_left": days_left, "books_n": cfgs[idx][0], "deep": cfgs[idx][1],
-                "scans_per_day": spd, "cost": cfgs[idx][2], "per_day": per_day}
+        # La cache dell'elenco partite fa risparmiare in media mezza richiesta a scan.
+        save = 0.5 if float(os.environ.get("PP_FIXTURES_CACHE_H", "8")) > 0 else 0.0
+        eff = [(c[0], c[1], c[2] - save) for c in cfgs]
+        per_day = max(0.0, float(remaining) - reserve * max(1, days_left)) / max(1, days_left)
+        # Si sceglie la configurazione più ricca (più bookmaker/approfondimento totali) che permette comunque
+        # PP_TARGET_SCANS scan al giorno (default 2, spalmati sulla giornata); altrimenti quella che ne permette di più.
+        target = min(float(slots), float(os.environ.get("PP_TARGET_SCANS", "2")))
+        scored = [(min(float(slots), per_day / c[2]), i) for i, c in enumerate(eff)]
+        ok = [i for spd_i, i in scored if spd_i >= target - 1e-9]
+        idx = ok[0] if ok else max(scored)[1]
+        spd = min(float(slots), per_day / eff[idx][2])
+        return {"remaining": remaining, "days_left": days_left, "books_n": eff[idx][0], "deep": eff[idx][1],
+                "scans_per_day": spd, "cost": round(eff[idx][2], 1), "per_day": per_day}
 
     async def _throttle_oddspapi(self, min_interval: float | None = None):
         """Aspetta il tempo minimo dall'ultima chiamata OddsPapi prima di procedere.
@@ -899,7 +944,13 @@ class SignalScraper:
         # ODDS_API_KEY non è affatto configurata. Così la quota OddsPapi
         # condivisa (250 richieste/mese) resta protetta per il ping pong e
         # viene toccata dal tennis solo quando serve davvero.
-        if want_tennis and not tennis_matches and ODDSPAPI_KEY and not self._tennis_fallback_allowed():
+        fb_needed = (not ODDS_KEY) or bool(self._tennis_fb_reason)
+        if want_tennis and ODDS_KEY and not tennis_matches and not fb_needed:
+            # The Odds API risponde ma non ha partite utili (es. finito il programma del giorno): non è un guasto,
+            # quindi niente fallback. Prima qui si pescavano partite a caso (doppi, tornei minori) e si consumava
+            # la quota OddsPapi condivisa col ping pong.
+            logger.info("Tennis: nessuna partita utile oggi da The Odds API (API ok, crediti ok) — nessun fallback")
+        elif want_tennis and not tennis_matches and ODDSPAPI_KEY and not self._tennis_fallback_allowed():
             logger.info(
                 f"Tennis: nessuna partita da The Odds API; fallback OddsPapi già usato oggi "
                 f"(tetto {TENNIS_FALLBACK_MAX_PER_DAY}/giorno, quota condivisa col ping pong) — salto"
@@ -909,7 +960,7 @@ class SignalScraper:
             if not ODDS_KEY:
                 logger.info("ODDS_API_KEY non impostata — uso OddsPapi come fonte tennis primaria")
             else:
-                logger.warning("The Odds API tennis: nessuna partita (quota esaurita, nessun torneo attivo o lista tornei vecchia) — provo fallback OddsPapi")
+                logger.warning(f"The Odds API tennis: {self._tennis_fb_reason} — provo fallback OddsPapi (solo singolare, tornei principali)")
             tennis_matches = await self._fetch_oddspapi_tennis()
             logger.info(f"OddsPapi Tennis (fallback): {len(tennis_matches)} partite")
         elif want_tennis and not tennis_matches and not ODDS_KEY:
@@ -1002,6 +1053,16 @@ class SignalScraper:
             today     = _now_it().strftime("%Y-%m-%d")
             tomorrow  = (_now_it() + timedelta(days=1)).strftime("%Y-%m-%d")
             try:
+                cache_h = float(os.environ.get("PP_FIXTURES_CACHE_H", "8"))
+                cached = self._pp_fix_cache
+                if cache_h > 0 and cached and cached[0] == today and (time.monotonic() - cached[1]) < cache_h * 3600:
+                    fixtures = cached[2]
+                    logger.info(f"OddsPapi: elenco partite dalla cache ({len(fixtures)} fixture, 0 richieste)")
+                    step = await self._pp_process_fixtures(session, fixtures, winner_market, totals_market, totals_markets_all)
+                    if step[0] == "done":
+                        return step[1]
+                    fixtures = step[1]
+                    raise StopAsyncIteration
                 await self._throttle_oddspapi()
                 async with session.get(
                     f"{ODDSPAPI_BASE}/fixtures",
@@ -1034,70 +1095,15 @@ class SignalScraper:
                     if isinstance(fixtures, dict):
                         fixtures = fixtures.get("data") or fixtures.get("fixtures") or []
                     logger.info(f"OddsPapi: {len(fixtures)} fixture ricevute")
+                    if cache_h > 0:
+                        self._pp_fix_cache = (today, time.monotonic(), fixtures)
+                    step = await self._pp_process_fixtures(session, fixtures, winner_market, totals_market, totals_markets_all)
+                    if step[0] == "done":
+                        return step[1]
+                    fixtures = step[1]
 
-                    # Limita a 4 fixture più vicine nel tempo per evitare rate limit
-                    # (ogni fixture = 1 chiamata API per le quote — piano gratuito 250/mese)
-                    def _sort_key(f):
-                        s = f.get("startDate") or f.get("startTime") or ""
-                        try:
-                            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-                        except Exception:
-                            return datetime.max.replace(tzinfo=IT_TZ)
-                    # FIX: filtra SOLO partite future (kickoff >= adesso). Prima si
-                    # ordinavano le fixture dell'intera giornata (00:00-22:00) e si
-                    # prendevano le prime N per orario — ma il ping pong (Setka Cup,
-                    # Liga Pro, ecc.) gioca 24/7, quindi allo scan delle 07:00 le
-                    # "prime N" erano quasi sempre partite già giocate stanotte tra
-                    # mezzanotte e le 7. Risultato: nessun segnale ping pong è mai
-                    # stato generato. Ora prendiamo le prime N future, qualsiasi ora.
-                    #
-                    # FIX 2: "future" da solo non basta — il ping pong gioca una
-                    # partita ogni 5 minuti H24, quindi le fixture "più vicine nel
-                    # tempo" hanno quasi sempre il kickoff tra pochi minuti.
-                    # L'analyzer scarta comunque tutto sotto min_hours_before (1h di
-                    # default), quindi prima si sprecava la chiamata /odds (quota!)
-                    # su partite che sarebbero state buttate via subito dopo. Ora
-                    # chiediamo fixture che partono tra almeno 75 minuti (1h + un
-                    # margine di sicurezza sul tempo che lo scan impiega) — così le
-                    # quote recuperate hanno davvero una chance di diventare un segnale.
-                    #
-                    # FIX 3: invece delle 3 più vicine (tutte ammassate in mezz'ora),
-                    # le distribuiamo lungo tutta la finestra fino al prossimo scan
-                    # (pingpong_scan_interval ore) — copertura sull'intera giornata
-                    # invece che su un'unica fetta oraria, a parità di richieste.
-                    now = _now_it()
-                    min_start = now + timedelta(minutes=75)
-                    pp_interval_h = 24
-                    if self.db is not None:
-                        try:
-                            pp_interval_h = self.db.get_settings().get("pingpong_scan_interval", 24)
-                        except Exception:
-                            pass
-                    window_end = _pingpong_window_end(now, min_start, pp_interval_h, _planned_hours(self.db, "pingpong"))
-
-                    # Metodo principale: UNA richiesta con le quote di tutte le partite dei
-                    # tornei migliori (vedi _fetch_pp_by_tournaments). Se non va, si ripiega
-                    # sul vecchio metodo per-partita qui sotto.
-                    if os.environ.get("PP_USE_TOURNAMENT_ODDS", "1") == "1":
-                        try:
-                            tm = await self._fetch_pp_by_tournaments(
-                                session, fixtures, winner_market, totals_market,
-                                totals_markets_all, min_start, window_end,
-                            )
-                        except Exception as e:
-                            logger.warning(f"OddsPapi by-tournaments errore: {e}")
-                            tm = None
-                        if tm is not None:
-                            return tm
-                        logger.info("OddsPapi by-tournaments: errore — ripiego sul metodo per-partita")
-
-                    n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
-                    fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, n_fixtures), _sort_key, n_fixtures, min_start, window_end)
-                    logger.info(
-                        f"OddsPapi: {len(fixtures)} fixture distribuite tra "
-                        f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} "
-                        f"({n_fixtures}/scan in base a pingpong_scan_interval={pp_interval_h}h, evita rate limit)"
-                    )
+            except StopAsyncIteration:
+                pass
             except Exception as e:
                 logger.error(f"OddsPapi fixtures errore: {e}")
                 return []
@@ -1112,6 +1118,74 @@ class SignalScraper:
                     matches.append(parsed)
 
         return matches
+
+    async def _pp_process_fixtures(self, session, fixtures, winner_market, totals_market, totals_markets_all):
+        """Sceglie la finestra e le partite ping pong da analizzare. Ritorna ("done", matches) se ha già
+        scaricato le quote per tornei, altrimenti ("fixtures", lista) per il vecchio metodo per-partita."""
+        # Limita a 4 fixture più vicine nel tempo per evitare rate limit
+        # (ogni fixture = 1 chiamata API per le quote — piano gratuito 250/mese)
+        def _sort_key(f):
+            s = f.get("startDate") or f.get("startTime") or ""
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return datetime.max.replace(tzinfo=IT_TZ)
+        # FIX: filtra SOLO partite future (kickoff >= adesso). Prima si
+        # ordinavano le fixture dell'intera giornata (00:00-22:00) e si
+        # prendevano le prime N per orario — ma il ping pong (Setka Cup,
+        # Liga Pro, ecc.) gioca 24/7, quindi allo scan delle 07:00 le
+        # "prime N" erano quasi sempre partite già giocate stanotte tra
+        # mezzanotte e le 7. Risultato: nessun segnale ping pong è mai
+        # stato generato. Ora prendiamo le prime N future, qualsiasi ora.
+        #
+        # FIX 2: "future" da solo non basta — il ping pong gioca una
+        # partita ogni 5 minuti H24, quindi le fixture "più vicine nel
+        # tempo" hanno quasi sempre il kickoff tra pochi minuti.
+        # L'analyzer scarta comunque tutto sotto min_hours_before (1h di
+        # default), quindi prima si sprecava la chiamata /odds (quota!)
+        # su partite che sarebbero state buttate via subito dopo. Ora
+        # chiediamo fixture che partono tra almeno 75 minuti (1h + un
+        # margine di sicurezza sul tempo che lo scan impiega) — così le
+        # quote recuperate hanno davvero una chance di diventare un segnale.
+        #
+        # FIX 3: invece delle 3 più vicine (tutte ammassate in mezz'ora),
+        # le distribuiamo lungo tutta la finestra fino al prossimo scan
+        # (pingpong_scan_interval ore) — copertura sull'intera giornata
+        # invece che su un'unica fetta oraria, a parità di richieste.
+        now = _now_it()
+        min_start = now + timedelta(minutes=75)
+        pp_interval_h = 24
+        if self.db is not None:
+            try:
+                pp_interval_h = self.db.get_settings().get("pingpong_scan_interval", 24)
+            except Exception:
+                pass
+        window_end = _pingpong_window_end(now, min_start, pp_interval_h, _planned_hours(self.db, "pingpong"))
+
+        # Metodo principale: UNA richiesta con le quote di tutte le partite dei
+        # tornei migliori (vedi _fetch_pp_by_tournaments). Se non va, si ripiega
+        # sul vecchio metodo per-partita qui sotto.
+        if os.environ.get("PP_USE_TOURNAMENT_ODDS", "1") == "1":
+            try:
+                tm = await self._fetch_pp_by_tournaments(
+                    session, fixtures, winner_market, totals_market,
+                    totals_markets_all, min_start, window_end,
+                )
+            except Exception as e:
+                logger.warning(f"OddsPapi by-tournaments errore: {e}")
+                tm = None
+            if tm is not None:
+                return ("done", tm)
+            logger.info("OddsPapi by-tournaments: errore — ripiego sul metodo per-partita")
+
+        n_fixtures = _pingpong_fixtures_per_scan(pp_interval_h)
+        fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, n_fixtures), _sort_key, n_fixtures, min_start, window_end)
+        logger.info(
+            f"OddsPapi: {len(fixtures)} fixture distribuite tra "
+            f"{min_start.strftime('%H:%M')} e {window_end.strftime('%H:%M')} "
+            f"({n_fixtures}/scan in base a pingpong_scan_interval={pp_interval_h}h, evita rate limit)"
+        )
+        return ("fixtures", fixtures)
 
     async def _fetch_pp_by_tournaments(
         self, session: aiohttp.ClientSession, fixtures: list, winner_market: dict,
@@ -1151,7 +1225,7 @@ class SignalScraper:
         by_t: dict = {}
         for f in fixtures:
             tid, st = f.get("tournamentId"), _start(f)
-            if tid is None or st is None or _fixture_coverage_score(f) < 3:
+            if tid is None or st is None or _fixture_coverage_score(f) < 3 or not _fixture_ok(f, "tabletennis"):
                 continue
             if min_start <= st <= window_end:
                 by_t.setdefault(tid, []).append(f)
@@ -1163,6 +1237,8 @@ class SignalScraper:
         top = sorted(by_t.items(), key=lambda kv: len(kv[1]), reverse=True)[:n_t]
         tids = [str(k) for k, _ in top]
         n_cand = sum(len(v) for _, v in top)
+        t_names = {str(k): (v[0].get("tournamentName") or "?") for k, v in top}
+        logger.info(f"OddsPapi by-tournaments: tornei scelti → {t_names}")
 
         books = [b.strip() for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()]
         books = books[:max(1, int(os.environ.get("PP_MAX_BOOK_REQUESTS", "3")))]
@@ -1694,6 +1770,9 @@ class SignalScraper:
                         except Exception:
                             pass
                     window_end = now + timedelta(hours=tennis_interval_h)
+                    n_all = len(fixtures)
+                    fixtures = [f for f in fixtures if _fixture_ok(f, "tennis")]
+                    logger.info(f"OddsPapi tennis: {len(fixtures)}/{n_all} fixture dopo il filtro singolare e tornei principali")
                     fixtures = _spread_pick_fixtures(_prefer_covered(fixtures, 3), _sort_key, 3, min_start, window_end)
                     logger.info(
                         f"OddsPapi tennis: {len(fixtures)} fixture distribuite tra "
@@ -1793,11 +1872,13 @@ class SignalScraper:
         l'over (totals), quindi il costo resta 2 crediti per torneo attivo.
         """
         matches = []
+        self._tennis_fb_reason = None
 
         async with aiohttp.ClientSession() as session:
             tennis_keys = await self._get_active_tennis_sport_keys(session)
             if not tennis_keys:
                 logger.info("Odds tennis: nessun torneo attivo al momento — salto la chiamata /odds/")
+                self._tennis_fb_reason = "nessun torneo attivo (o lista tornei non leggibile)"
                 return []
 
             min_hours = 1.0
@@ -1852,10 +1933,14 @@ class SignalScraper:
                             logger.warning(
                                 f"The Odds API ({sport_key}) status {resp.status}: {txt[:120]}"
                             )
-                            if resp.status == 401:
+                            if resp.status in (401, 429):
                                 self.tennis_quota_ok = False
+                                self._tennis_fb_reason = "crediti esauriti"
+                            else:
+                                self._tennis_fb_reason = f"errore API {resp.status}"
                 except Exception as e:
                     logger.error(f"The Odds API tennis errore ({sport_key}): {e}")
+                    self._tennis_fb_reason = "errore di rete"
 
         # Dedup interni per nome partita
         seen, unique = set(), []
