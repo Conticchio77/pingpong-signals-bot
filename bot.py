@@ -15,7 +15,8 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from scraper import SignalScraper, result_due, pingpong_scan_hours, quota_days_left, plan_budget, slot_allowed, daily_scan_count, slot_runs
+from scraper import (SignalScraper, result_due, pingpong_scan_hours, quota_days_left, plan_budget, slot_allowed,
+                     daily_scan_count, slot_runs, AUTO_SLOTS, TENNIS_MAX_SCANS, PP_MAX_SCANS, spread_hours)
 from ai_analyzer import AIAnalyzer
 from database import Database
 
@@ -648,7 +649,7 @@ async def send_quota(fn):
             lines = []
             tp = await _tennis_plan()
             if tp:
-                lines.append(f"🎾 {tp['scans_per_day']:.1f} scan al giorno su {tp['slots']} impostati "
+                lines.append(f"🎾 {tp['scans_per_day']:.1f} scan al giorno ({'max ' if AUTO_SLOTS else 'su '}{tp['slots']}{'' if AUTO_SLOTS else ' impostati'}) "
                              f"(~{tp['cost']:g} crediti a scan, {tp['days_left']} giorni al reset)")
             hrs = pingpong_scan_hours(int(db.get_settings()["pingpong_scan_interval"]))
             # /v4/account di OddsPapi ha un cooldown di 1 s: si riusa la lettura già fatta qui sopra
@@ -659,7 +660,7 @@ async def send_quota(fn):
                 pp = await scraper.plan_pingpong(len(hrs), remaining=int(live_p["limit"] - live_p["count"]))
             if pp and pp["remaining"] is not None:
                 extra = " + totali" if pp["deep"] else ""
-                lines.append(f"🏓 {pp['scans_per_day']:.1f} scan al giorno su {len(hrs)} impostati, "
+                lines.append(f"🏓 {pp['scans_per_day']:.1f} scan al giorno ({'max ' + str(PP_MAX_SCANS) if AUTO_SLOTS else 'su ' + str(len(hrs)) + ' impostati'}), "
                              f"{pp['books_n']} bookmaker{extra} (~{pp['cost']} richieste a scan, {pp['days_left']} giorni al reset)")
             if lines:
                 plan_text = "\n\n🤖 *Gestione automatica*\n" + "\n".join(lines)
@@ -1825,6 +1826,9 @@ def _daytime_hours(interval: int, start: int = 7, end: int = 22) -> str:
     di "interval" ore — es. interval=3 → "7,10,13,16,19,22". Usata sia per il
     tennis che per il ping pong: entrambi partono alle 07:00 e non superano le
     22:00, ognuno col proprio intervallo impostato dal pannello."""
+    if AUTO_SLOTS:
+        # tutti gli orari 07-21: il piano giornaliero (_auto_slot_decision) sceglie quali girano
+        return ",".join(str(x) for x in range(7, 22))
     if interval <= 0:
         interval = 24
     hours = []
@@ -2010,6 +2014,38 @@ async def _notify_budget_once(app: Application, key: str, text: str):
     except Exception as e:
         logger.warning(f"Avviso gestore quota non inviato: {e}")
 
+# ── PIANO GIORNALIERO AUTOMATICO (AUTO_SLOTS) ───────────────────────────────────
+# Il cron scatta ogni ora 07-21; qui si decide se QUELL'ora ha uno scan. Il piano di oggi (quanti scan e a
+# che ora) si calcola una volta sola, al primo scatto, dai crediti rimasti; gli scan sono equispaziati
+# sulla giornata. Uno slot perso (bot spento/redeploy) viene recuperato al primo scatto/avvio successivo.
+def _auto_plan_today(key: str):
+    today = datetime.datetime.now(ROME).strftime("%Y-%m-%d")
+    if db.get_setting(f"autoplan_date_{key}") != today:
+        return None
+    raw = db.get_setting(f"autoplan_hours_{key}") or ""
+    return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+
+def _auto_slot_decision(key: str, spd: float, span: int, now: datetime.datetime):
+    """(da_eseguire, ore_pianificate, piano_appena_creato)."""
+    hours = _auto_plan_today(key)
+    created = False
+    if hours is None:
+        n = daily_scan_count(spd, 99, now.date().toordinal())
+        hours = spread_hours(n, 7, span)
+        db.set_setting(f"autoplan_date_{key}", now.strftime("%Y-%m-%d"))
+        db.set_setting(f"autoplan_hours_{key}", ",".join(map(str, hours)))
+        db.set_setting(f"autoplan_done_{key}", "")
+        created = True
+    done = {int(x) for x in (db.get_setting(f"autoplan_done_{key}") or "").split(",") if x.strip().isdigit()}
+    due = [h for h in hours if h <= now.hour and h not in done]
+    if due:
+        done.update(due)
+        db.set_setting(f"autoplan_done_{key}", ",".join(map(str, sorted(done))))
+    return bool(due), hours, created
+
+def _hours_txt(hours: list) -> str:
+    return ", ".join(f"{h:02d}:00" for h in hours) if hours else "nessuno scan oggi (quota)"
+
 async def _tennis_plan() -> dict | None:
     """Piano tennis dai crediti rimasti (lettura gratuita di The Odds API)."""
     live = await _live_oddsapi_quota()
@@ -2018,6 +2054,8 @@ async def _tennis_plan() -> dict | None:
     used, rem = live
     interval = int(db.get_settings()["scan_interval"])
     hours = [int(h) for h in _daytime_hours(interval).split(",")]
+    if AUTO_SLOTS:
+        hours = hours[:TENNIS_MAX_SCANS]      # conta solo come tetto agli scan/giorno
     now = datetime.datetime.now(ROME)
     try:
         cost = float(db.get_setting("tennis_scan_cost") or 4)
@@ -2033,6 +2071,31 @@ async def run_signal_scan(app: Application, manual: bool = False, sport_override
     gestore quota; manuali e ping pong no (il ping pong ha il suo gestore in run_pingpong_scan)."""
     if not AUTO_QUOTA or manual or sport_override:
         return await _run_signal_scan_impl(app, manual, sport_override)
+    if AUTO_SLOTS:
+        now = datetime.datetime.now(ROME)
+        plan, spd = None, 0.0
+        if _auto_plan_today("tennis") is None:
+            plan = await _tennis_plan()
+            spd = plan["scans_per_day"] if plan else 3.0     # crediti non leggibili: ritmo prudente
+        due, planned, created = _auto_slot_decision("tennis", spd, 14, now)
+        if created:
+            extra = (f"\n{plan['remaining']} crediti per {plan['days_left']} giorni, ~{plan['cost']:g} a scan"
+                     if plan else "")
+            logger.info(f"📅 Piano tennis di oggi: {_hours_txt(planned)}")
+            await _notify_budget_once(app, "tennis", f"📅 *Piano tennis di oggi*: {_hours_txt(planned)}{extra}")
+        if not due:
+            return 0
+        before = await _live_oddsapi_quota()
+        res = await _run_signal_scan_impl(app, manual, sport_override)
+        try:
+            after = await _live_oddsapi_quota()
+            if before and after and before[0] is not None and after[0] is not None:
+                cost = after[0] - before[0]
+                if 1 <= cost <= 20:
+                    db.set_setting("tennis_scan_cost", cost)
+        except Exception:
+            pass
+        return res
     plan = await _tennis_plan()
     if plan is not None:
         idx = _slot_index(plan["hours"], datetime.datetime.now(ROME).hour)
@@ -2258,7 +2321,27 @@ async def run_pingpong_scan(app: Application, is_retry: bool = False):
     """Scan ping pong con gestore quota: lo scan programmato viene saltato se le richieste OddsPapi
     rimaste non bastano per il numero di scan impostato (nessun controllo sui retry e sugli scan manuali)."""
     hours = pingpong_scan_hours(int(db.get_settings()["pingpong_scan_interval"]))
-    scraper.pp_slots = len(hours)
+    scraper.pp_slots = PP_MAX_SCANS if AUTO_SLOTS else len(hours)
+    if AUTO_SLOTS and not is_retry:
+        now = datetime.datetime.now(ROME)
+        plan, spd = None, 0.0
+        if _auto_plan_today("pingpong") is None:
+            try:
+                plan = await scraper.plan_pingpong(PP_MAX_SCANS)
+            except Exception as e:
+                logger.warning(f"Gestore quota ping pong: piano non calcolabile ({e})")
+            ok_plan = bool(plan and plan["remaining"] is not None)
+            spd = plan["scans_per_day"] if ok_plan else 1.5   # richieste non leggibili: ritmo prudente
+        due, planned, created = _auto_slot_decision("pingpong", spd, 15, now)
+        if created:
+            extra = (f"\n{plan['remaining']} richieste per {plan['days_left']} giorni: {plan['books_n']} bookmaker, "
+                     f"~{plan['cost']} richieste a scan" if plan and plan["remaining"] is not None else "")
+            logger.info(f"📅 Piano ping pong di oggi: {_hours_txt(planned)}")
+            await _notify_budget_once(app, "pingpong", f"📅 *Piano ping pong di oggi*: {_hours_txt(planned)}{extra}")
+        if not due:
+            return
+        await _run_pingpong_scan_impl(app, is_retry)
+        return
     if AUTO_QUOTA and not is_retry:
         try:
             plan = await scraper.plan_pingpong(len(hours))
@@ -2474,7 +2557,7 @@ async def _results_job(app: Application, sport: str):
     Ping pong con gestore quota: l'ULTIMO controllo della giornata (22:00) gira sempre; gli
     altri (es. 14:00) solo se la quota basta per tutti gli scan impostati: gli scan hanno
     la precedenza. Così non serve cambiare PP_RESULT_HOURS a mano a fine/inizio mese."""
-    if AUTO_QUOTA and sport == "tabletennis":
+    if AUTO_QUOTA and not AUTO_SLOTS and sport == "tabletennis":
         hours = _pp_result_hours()
         if datetime.datetime.now(ROME).hour != hours[-1]:
             try:

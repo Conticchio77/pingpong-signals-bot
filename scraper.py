@@ -60,6 +60,54 @@ def _iso_to_it(iso: str) -> str:
 # bot, ogni giorno, calcola da solo quanti scan e quanti bookmaker può permettersi con le
 # richieste/crediti rimasti fino al prossimo reset, saltando gli scan che non sono sostenibili.
 # ─────────────────────────────────────────────────────────────────────────────────
+# ── SCAN AUTOMATICI SPALMATI SULLA GIORNATA ───────────────────────────────────────
+# AUTO_SLOTS=1 (default): niente più orari fissi/intervalli dal pannello. Il bot decide da solo, ogni
+# mattina, QUANTI scan fare oggi in base a crediti/richieste rimaste fino al reset, e li distribuisce
+# in modo uniforme dalle 07 alle 21 (vedi spread_hours). AUTO_SLOTS=0 torna al comportamento vecchio.
+# Richiede AUTO_QUOTA attivo (altrimenti gli scan orari brucerebbero la quota).
+AUTO_SLOTS       = (os.environ.get("AUTO_SLOTS", "1") != "0") and (os.environ.get("AUTO_QUOTA", "1") != "0")
+TENNIS_MAX_SCANS = max(1, int(os.environ.get("TENNIS_MAX_SCANS", "6")))   # tetto scan/giorno tennis
+PP_MAX_SCANS     = max(1, int(os.environ.get("PP_MAX_SCANS", "5")))       # tetto scan/giorno ping pong
+AUTO_FIRST_HOUR  = 7
+AUTO_LAST_HOUR   = 21
+
+
+def spread_hours(n: int, first: int = AUTO_FIRST_HOUR, span: int = 15) -> list:
+    """Ore degli n scan di oggi, equispaziate a partire da `first` su `span` ore (senza scan alla fine).
+    span=15 (ping pong): n=1 → 07 | n=2 → 07,14 | n=3 → 07,12,17 | n=5 → 07,10,13,16,19.
+    span=14 (tennis):    n=3 → 07,12,16 | n=6 → 07,09,12,14,16,19."""
+    hrs = []
+    for k in range(max(0, int(n))):
+        h = int(round(first + k * span / n))
+        h = min(max(h, first), AUTO_LAST_HOUR)
+        if h not in hrs:
+            hrs.append(h)
+    return hrs
+
+
+def _planned_hours(db, key: str):
+    """Ore di scan pianificate OGGI per `key` ("pingpong"/"tennis"), scritte da bot.py. None = nessun piano."""
+    if db is None:
+        return None
+    try:
+        if db.get_setting(f"autoplan_date_{key}") != _now_it().strftime("%Y-%m-%d"):
+            return None
+        raw = db.get_setting(f"autoplan_hours_{key}") or ""
+        return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    except Exception:
+        return None
+
+
+def _even_sample(items: list, n: int) -> list:
+    """n elementi equispaziati (per posizione) da una lista già ordinata per orario.
+    Sostituisce il vecchio items[:n], che teneva solo le partite PIÙ VICINE nel tempo."""
+    if n <= 0 or len(items) <= n:
+        return list(items)
+    if n == 1:
+        return [items[0]]
+    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
+
+
 def quota_days_left(now: datetime, reset_dom: int = 1) -> int:
     """Giorni (oggi incluso) fino al prossimo reset, che cade il giorno `reset_dom` del mese."""
     reset_dom = max(1, min(28, int(reset_dom or 1)))
@@ -125,6 +173,9 @@ def pingpong_scan_hours(interval_h: int) -> list:
     (2 scan/giorno) NON si usa 07+19: lo scan delle 19:00 copriva la notte, quando
     si dorme. Si usano invece 07:00 e 14:00, così le partite scelte cadono
     tra le 08:15 e le 22:00. Altri intervalli: 07..22 ogni N ore come prima."""
+    if AUTO_SLOTS:
+        # tutti gli orari possibili: quali girano davvero lo decide il piano giornaliero (bot.py)
+        return list(range(AUTO_FIRST_HOUR, AUTO_LAST_HOUR + 1))
     if interval_h == 12:
         return [7, 14]
     if interval_h <= 0:
@@ -143,11 +194,15 @@ def pingpong_scan_hours(interval_h: int) -> list:
     return hours
 
 
-def _pingpong_window_end(now: datetime, min_start: datetime, interval_h: int) -> datetime:
+def _pingpong_window_end(now: datetime, min_start: datetime, interval_h: int, planned=None) -> datetime:
     """Fine della finestra di scelta: il prossimo scan utile (almeno 30 min dopo
-    min_start), altrimenti le 22:00 — mai oltre, così non si pescano partite notturne."""
+    min_start), altrimenti le 22:00 — mai oltre, così non si pescano partite notturne.
+    AUTO_SLOTS: si guardano solo gli scan PIANIFICATI oggi (non tutti gli orari possibili): se uno slot
+    viene saltato dal gestore quota la sua fascia oraria viene coperta dallo scan precedente.
+    Senza piano (es. scan manuale) la finestra arriva alle 22:00."""
     day_end = now.replace(hour=22, minute=0, second=0, microsecond=0)
-    for h in pingpong_scan_hours(interval_h):
+    hours = sorted(planned or []) if AUTO_SLOTS else pingpong_scan_hours(interval_h)
+    for h in hours:
         t = now.replace(hour=h, minute=0, second=0, microsecond=0)
         if t > now and t >= min_start + timedelta(minutes=30):
             return min(t, day_end)
@@ -458,6 +513,8 @@ class SignalScraper:
         n_deep = max(0, int(os.environ.get("PP_TOTALS_DEEP", "2")))
         reserve = float(os.environ.get("PP_RESULTS_PER_DAY", "2"))   # richieste/giorno tenute per i risultati
         slots = max(1, int(slots))
+        if AUTO_SLOTS:
+            slots = min(slots, PP_MAX_SCANS)
         if remaining is None:        # se il chiamante l'ha già letto (es. tasto Quota) non si rilegge /account
             own = session is None
             sess = session or aiohttp.ClientSession()
@@ -472,7 +529,16 @@ class SignalScraper:
             cfgs.append((n_books, n_deep, 1 + n_books + n_deep))
         if n_books >= 3:
             cfgs.append((n_books, 0, 1 + n_books))
-        cfgs.append((min(n_books, 2), 0, 1 + min(n_books, 2)))
+        if AUTO_SLOTS:
+            # Mai sotto PP_MIN_BOOKS bookmaker (default 3 = sharp + 2 soft): con UN solo soft book il
+            # prezzo migliore è quasi sempre sotto il fair dello sharp (log 3-5/11: 220 valutazioni,
+            # edge massimo +0.3%). Se la quota non basta si fanno MENO scan, non scan inutili.
+            min_books = max(1, min(n_books, int(os.environ.get("PP_MIN_BOOKS", "3"))))
+            for b in range(n_books - 1 if n_books >= 3 else n_books, min_books - 1, -1):
+                if not any(c[0] == b and c[1] == 0 for c in cfgs):
+                    cfgs.append((b, 0, 1 + b))
+        else:
+            cfgs.append((min(n_books, 2), 0, 1 + min(n_books, 2)))
         if remaining is None:        # account non leggibile: nessuna limitazione (fail-open)
             return {"remaining": None, "days_left": days_left, "books_n": n_books, "deep": n_deep,
                     "scans_per_day": float(slots), "cost": cfgs[0][2], "per_day": None}
@@ -1007,7 +1073,7 @@ class SignalScraper:
                             pp_interval_h = self.db.get_settings().get("pingpong_scan_interval", 24)
                         except Exception:
                             pass
-                    window_end = _pingpong_window_end(now, min_start, pp_interval_h)
+                    window_end = _pingpong_window_end(now, min_start, pp_interval_h, _planned_hours(self.db, "pingpong"))
 
                     # Metodo principale: UNA richiesta con le quote di tutte le partite dei
                     # tornei migliori (vedi _fetch_pp_by_tournaments). Se non va, si ripiega
@@ -1224,7 +1290,10 @@ class SignalScraper:
                 in_window.append((st, merged))
         in_window.sort(key=lambda x: x[0])
         cap = max(1, int(os.environ.get("PP_MAX_FIXTURES", "40")))
-        in_window = in_window[:cap]
+        # FIX: prima in_window[:cap] teneva le `cap` partite PIÙ VICINE nel tempo (con 80-100 partite in
+        # finestra = solo le prime 2-3 ore). Le quote sono già scaricate (il costo in richieste non cambia):
+        # si analizzano `cap` partite equispaziate su TUTTA la finestra.
+        in_window = _even_sample(in_window, cap)
 
         matches, pairs = [], []
         for _, merged in in_window:
