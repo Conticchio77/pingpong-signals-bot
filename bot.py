@@ -797,6 +797,7 @@ async def send_stats(fn):
 
     kb = [
         [InlineKeyboardButton("📈 Grafico bilancio", callback_data="show_balance_chart")],
+        [InlineKeyboardButton("📉 Valutazioni (7 giorni)", callback_data="eval_summary")],
         [InlineKeyboardButton("🧪 Test stats (solo a me)", callback_data="test_monthly_now")],
         [InlineKeyboardButton(
             f"⏰ Stats fine mese → gruppi (auto): {'🟢 ATTIVO' if _monthly_auto_on() else '🔴 SPENTO'}",
@@ -826,6 +827,31 @@ async def send_stats(fn):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+
+def _eval_summary_text(days: int = 7) -> str:
+    """Riepilogo del registro valutazioni (testo semplice, senza Markdown: ci sono nomi di giocatori)."""
+    summ = db.get_evaluation_summary(days)
+    lines = [f"📉 Valutazioni ultimi {days} giorni", "━" * 22,
+             "Giocate valutate con edge ≥ -3% (le più lontane non si registrano).", ""]
+    for sport, label in (("tennis", "🎾 Tennis"), ("tabletennis", "🏓 Ping Pong")):
+        d = summ.get(sport) or {}
+        if not d.get("n"):
+            lines += [f"{label}: nessuna valutazione registrata", ""]
+            continue
+        lines += [
+            f"{label}: {d['n']} valutate → {d['signals']} segnali",
+            f"   edge < 0%: {d['lt0']} | 0–2%: {d['b0_2']} | 2–4%: {d['b2_4']} | ≥ 4%: {d['ge4']}",
+        ]
+        for r in d["near"]:
+            try:
+                dt = datetime.datetime.fromisoformat(str(r["ts"])).replace(tzinfo=datetime.timezone.utc).astimezone(ROME)
+                when = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                when = "?"
+            lines.append(f"   • {r['edge']:+.1%} {r['match'][:34]} ({r['label']}) [{when}]")
+        lines.append("")
+    lines.append("Lettura: tante giocate a 2–4% con poche ≥ 4% = soglia forse alta; quasi tutte < 0% = mercato allineato, non c'è nulla da trovare.")
+    return "\n".join(lines)
 
 def _conf_label(conf: int) -> str:
     conf_desc = {55: "Bassa (55%)", 60: "Media (60%)", 65: "Media-Alta (65%)",
@@ -1684,6 +1710,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await send_settings_pingpong(query.edit_message_text)
 
+    elif data == "eval_summary":
+        await query.edit_message_text(
+            _eval_summary_text(7),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Aggiorna", callback_data="eval_summary")],
+                                               [InlineKeyboardButton("🔙 Statistiche", callback_data="admin_stats")]])
+        )
+
     elif data == "test_monthly_now":
         await send_monthly_stats(context.application, test=True)
 
@@ -2283,8 +2316,11 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
 
     # Fase 1: analisi di tutte le partite, raccolta dei candidati. Fase 2: si tengono i migliori per edge
     # (massimo MAX_SIGNALS_PER_SCAN per scan, un solo segnale per giocatore) e si inviano.
-    analyzer.reset_best()
+    scan_sports = {m.get("sport") for m in matches if m.get("sport")}
+    for _sp in scan_sports:
+        analyzer.reset_best(_sp)
     cands = []
+    sent_keys: set = set()      # (partita, tipo) dei segnali davvero creati: per il registro valutazioni
     for match in matches:
         try:
             signals = await analyzer.analyze(match, settings)
@@ -2297,6 +2333,12 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                     settings["min_confidence_pp"] if sig.get("sport") == "tabletennis"
                     else settings["min_confidence"]
                 )
+                # I segnali su CONSENSO (over/under ping pong: sbobet non quota i totali) hanno per costruzione la
+                # confidenza abbassata di 6 punti (vedi _confidence): con soglia 60 passerebbero solo edge del 6-10%.
+                # Hanno già filtri propri più severi (partita verificata dallo sharp, >=6 book, edge 4-10%), quindi
+                # per loro la soglia è CONSENSUS_MIN_CONF (default 50).
+                if sig.get("ref_kind") == "consensus":
+                    min_conf = min(min_conf, int(os.environ.get("CONSENSUS_MIN_CONF", "50")))
                 if sig["confidence"] < min_conf:
                     logger.info(
                         f"Segnale scartato (confidenza {sig['confidence']}% < min {min_conf}%): "
@@ -2323,6 +2365,7 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                 used_players |= {n.strip().lower() for n in (sig.get("player1", ""), sig.get("player2", "")) if n}
                 sig_id = db.save_signal(sig)
                 new_signals += 1
+                sent_keys.add((sig.get("match"), sig.get("signal_type")))
 
                 sport_label = sig.get("sport_label", "🏓 Ping Pong")
                 kb = _send_rows({"id": sig_id, "status": "pending"}) + [[
@@ -2361,6 +2404,18 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
 
     logger.info(f"✅ {new_signals} nuovi segnali")
 
+    # Registro valutazioni (vedi database.save_evaluations): serve al tasto "📉 Valutazioni" nelle statistiche.
+    try:
+        rows = []
+        for _sp in scan_sports:
+            rows += analyzer.pop_evals(_sp)
+        for r in rows:
+            r["signaled"] = (r["match"], r["market"]) in sent_keys
+        rows.sort(key=lambda r: r["edge"], reverse=True)
+        db.save_evaluations(rows[:120])
+    except Exception as e:
+        logger.warning(f"Registro valutazioni non salvato: {e}")
+
     # Ping leggero solo per gli scan AUTOMATICI (cron) a 0 segnali: prima
     # restavano silenziosi se non trovavano nulla, e non c'era modo di
     # distinguere "il bot non gira più" da "ha girato, nessun segnale
@@ -2368,12 +2423,13 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
     # già il risultato in chat.
     if not manual and new_signals == 0:
         sport_ping_label = "🏓 Ping Pong" if sport_override == "tabletennis" else "🎾 Tennis"
+        _best = analyzer.best_for("tabletennis" if sport_override == "tabletennis" else "tennis")
         try:
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(f"✅ Scan concluso ({sport_ping_label}): 0 segnali"
-                      + (f"\n📉 Miglior edge visto: {analyzer.best[0]:+.1%} — {analyzer.best[1]} ({analyzer.best[2]})"
-                         if analyzer.best else "")),
+                      + (f"\n📉 Miglior edge visto: {_best[0]:+.1%} — {_best[1]} ({_best[2]})"
+                         if _best else "")),
             )
         except Exception as e:
             logger.debug(f"Impossibile inviare ping scan-vuoto: {e}")

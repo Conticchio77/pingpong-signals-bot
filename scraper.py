@@ -457,6 +457,7 @@ class SignalScraper:
         # Stato quota, aggiornato ad ogni chiamata reale alle API — usato da bot.py
         # per avvisare l'admin quando i segnali si fermano per quota esaurita.
         self.tennis_quota_ok   = True
+        self._tennis_list_error = None    # errore nella lettura di /sports (None = lista letta bene)
         self._tennis_fb_reason = None     # perché The Odds API non basta (None = tutto ok, semplicemente niente partite utili)
         self._pp_fix_cache     = None     # (data, istante, fixtures): elenco partite ping pong riusato tra scan vicini
         self.pingpong_quota_ok = True
@@ -562,6 +563,9 @@ class SignalScraper:
         cfgs = []
         if n_books >= 3 and n_deep > 0:
             cfgs.append((n_books, n_deep, 1 + n_books + n_deep))
+            # variante con UN solo approfondimento: meglio un over/under in meno che niente over/under
+            for d in range(n_deep - 1, 0, -1):
+                cfgs.append((n_books, d, 1 + n_books + d))
         if n_books >= 3:
             cfgs.append((n_books, 0, 1 + n_books))
         if AUTO_SLOTS:
@@ -582,8 +586,11 @@ class SignalScraper:
         eff = [(c[0], c[1], c[2] - save) for c in cfgs]
         per_day = max(0.0, float(remaining) - reserve * max(1, days_left)) / max(1, days_left)
         # Si sceglie la configurazione più ricca (più bookmaker/approfondimento totali) che permette comunque
-        # PP_TARGET_SCANS scan al giorno (default 2, spalmati sulla giornata); altrimenti quella che ne permette di più.
-        target = min(float(slots), float(os.environ.get("PP_TARGET_SCANS", "2")))
+        # PP_TARGET_SCANS scan al giorno (default 1: con ~150 richieste per ~3 settimane la quota non basta per 2 scan
+        # CON approfondimento dei totali, e senza approfondimento l'over/under ping pong non esce mai: i book che
+        # quotano i totali sono troppo pochi nei 3 scaricati). Se nessuna configurazione arriva al target si sceglie
+        # quella che permette più scan.
+        target = min(float(slots), float(os.environ.get("PP_TARGET_SCANS", "1")))
         scored = [(min(float(slots), per_day / c[2]), i) for i, c in enumerate(eff)]
         ok = [i for spd_i, i in scored if spd_i >= target - 1e-9]
         idx = ok[0] if ok else max(scored)[1]
@@ -956,21 +963,30 @@ class SignalScraper:
                 f"(tetto {TENNIS_FALLBACK_MAX_PER_DAY}/giorno, quota condivisa col ping pong) — salto"
             )
         elif want_tennis and not tennis_matches and ODDSPAPI_KEY:
-            self._tennis_fallback_register()
             if not ODDS_KEY:
                 logger.info("ODDS_API_KEY non impostata — uso OddsPapi come fonte tennis primaria")
             else:
                 logger.warning(f"The Odds API tennis: {self._tennis_fb_reason} — provo fallback OddsPapi (solo singolare, tornei principali)")
             tennis_matches = await self._fetch_oddspapi_tennis()
+            if not tennis_matches and getattr(self, "_tennis_fb_rate_limited", False):
+                logger.info("OddsPapi tennis: rate limit momentaneo — riprovo tra 4 secondi")
+                await asyncio.sleep(4)
+                tennis_matches = await self._fetch_oddspapi_tennis()
+            if tennis_matches:
+                self._tennis_fallback_register()      # il tetto giornaliero si consuma solo se il fallback ha dato partite
             logger.info(f"OddsPapi Tennis (fallback): {len(tennis_matches)} partite")
         elif want_tennis and not tennis_matches and not ODDS_KEY:
             logger.warning("Nessuna API tennis configurata (ODDS_API_KEY/ODDSPAPI_KEY) — tennis saltato")
 
         results.extend(tennis_matches)
 
-        # Fallback demo se nessuna API ha restituito nulla
+        # Dati demo SOLO se non c'è nessuna chiave API. Con le chiavi presenti, "nessuna partita" è un risultato
+        # normale (pausa del circuito, fine programma) e non va travestito da demo.
         if not results:
-            logger.warning("Nessuna API configurata — uso fallback misto")
+            if ODDS_KEY or ODDSPAPI_KEY:
+                logger.info("Nessuna partita utile dalle API in questo scan")
+                return []
+            logger.warning("Nessuna chiave API configurata — uso partite demo (non generano segnali)")
             results = self.get_fallback_matches()
 
         return self._sort_dedup(results)
@@ -1392,11 +1408,26 @@ class SignalScraper:
         n_deep = plan["deep"]
         deep_done, deep_note = 0, ""
         if n_deep and pairs:
-            for merged, m in pairs:
+            # Si approfondiscono le partite con più book GIÀ sulla stessa linea (più probabile che il consenso
+            # allargato regga), a parità la più vicina nel tempo; non tutte ammassate nella stessa ora.
+            def _cov(pair):
+                rt = pair[1].get("raw_totals") or {}
+                return max((len(b) for b in rt.values()), default=0)
+            ranked = sorted(pairs, key=lambda pr: -_cov(pr))
+            chosen, used_h = [], set()
+            for pr in ranked:
+                if len(chosen) >= n_deep:
+                    break
+                if not pr[1].get("raw_totals") or not pr[1].get("verified"):
+                    continue
+                hkey = str(pr[1].get("kickoff", ""))[:8]      # "dd/mm HH" → ora di inizio
+                if hkey in used_h and len(ranked) > n_deep:
+                    continue
+                used_h.add(hkey)
+                chosen.append(pr)
+            for merged, m in chosen:
                 if deep_done >= n_deep:
                     break
-                if not m.get("raw_totals") or not m.get("verified"):
-                    continue
                 full = await self._parse_oddspapi_fixture(
                     session, merged, winner_market, totals_market,
                     totals_markets_all=totals_markets_all, quiet=True,
@@ -1696,6 +1727,7 @@ class SignalScraper:
         limitata a 3 fixture per scan (invece di 4) per lasciare più margine
         alla quota condivisa 250/mese, dato che si attiva solo quando serve."""
         matches = []
+        self._tennis_fb_rate_limited = False
         async with aiohttp.ClientSession() as session:
             sport_id = await self._get_tennis_oddspapi_sport_id(session)
             if sport_id is None:
@@ -1732,7 +1764,10 @@ class SignalScraper:
                         txt = await r.text()
                         logger.warning(f"OddsPapi fixtures tennis status {r.status}: {txt[:120]}")
                         if r.status == 429:
-                            self.pingpong_quota_ok = False
+                            if "rate limit" in txt.lower() or "RATE_LIMITED" in txt:
+                                self._tennis_fb_rate_limited = True      # cooldown momentaneo: la quota è ok
+                            else:
+                                self.pingpong_quota_ok = False
                         return []
                     fixtures = await r.json()
                     if isinstance(fixtures, dict):
@@ -1877,8 +1912,17 @@ class SignalScraper:
         async with aiohttp.ClientSession() as session:
             tennis_keys = await self._get_active_tennis_sport_keys(session)
             if not tennis_keys:
-                logger.info("Odds tennis: nessun torneo attivo al momento — salto la chiamata /odds/")
-                self._tennis_fb_reason = "nessun torneo attivo (o lista tornei non leggibile)"
+                if self._tennis_list_error:
+                    logger.info(f"Odds tennis: {self._tennis_list_error} — salto la chiamata /odds/")
+                    self._tennis_fb_reason = self._tennis_list_error
+                elif os.environ.get("TENNIS_FALLBACK_NO_TOURNAMENT", "0") == "1":
+                    self._tennis_fb_reason = "nessun torneo attivo"
+                    logger.info("Odds tennis: nessun torneo attivo al momento — salto la chiamata /odds/")
+                else:
+                    # Pausa del circuito (es. tra Paris Masters e ATP Finals): la lista è letta bene e non ci sono
+                    # tornei ATP/WTA principali. Il fallback OddsPapi pescherebbe solo tornei minori e costerebbe
+                    # ~4 richieste della quota condivisa col ping pong: meglio niente. TENNIS_FALLBACK_NO_TOURNAMENT=1 per riattivarlo.
+                    logger.info("Odds tennis: nessun torneo ATP/WTA attivo (pausa del circuito) — niente chiamate, niente fallback")
                 return []
 
             min_hours = 1.0
@@ -2055,7 +2099,9 @@ class SignalScraper:
             ) as r:
                 if r.status != 200:
                     logger.warning(f"The Odds API /sports status {r.status}")
+                    self._tennis_list_error = f"errore API {r.status} sulla lista tornei"
                     return []
+                self._tennis_list_error = None
                 all_sports = await r.json()
                 keys = [
                     s["key"] for s in all_sports
@@ -2067,6 +2113,7 @@ class SignalScraper:
                 return keys
         except Exception as e:
             logger.error(f"The Odds API /sports errore: {e}")
+            self._tennis_list_error = "errore di rete sulla lista tornei"
             return []
 
     async def fetch_scores(self, sport: str = "both") -> list[dict]:

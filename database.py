@@ -51,6 +51,18 @@ class Database:
                 value TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS evaluations (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        TEXT,
+                sport     TEXT,
+                match     TEXT,
+                market    TEXT,
+                label     TEXT,
+                odds      REAL,
+                edge      REAL,
+                signaled  INTEGER DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS balance_history (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 sig_id     INTEGER,
@@ -486,3 +498,43 @@ class Database:
         cur = self.conn.execute("SELECT changes()")
         self.conn.commit()
         return cur.fetchone()[0]
+
+    # ── Registro valutazioni ───────────────────────────────────────────────────
+    # Ogni giocata valutata dall'analizzatore con edge >= -3% (le altre sono rumore) viene registrata,
+    # col flag "signaled" se è diventata un segnale. Serve a capire dopo qualche giorno quante giocate
+    # mancano per poco (soglie da ritoccare) e quante sono lontane (mercato allineato: niente da fare).
+    def save_evaluations(self, rows: list, keep_days: int = 30) -> int:
+        if rows:
+            now = datetime.utcnow().isoformat()
+            self.conn.executemany(
+                "INSERT INTO evaluations (ts, sport, match, market, label, odds, edge, signaled) VALUES (?,?,?,?,?,?,?,?)",
+                [(now, r.get("sport"), r.get("match"), r.get("market"), r.get("label"),
+                  r.get("odds"), r.get("edge"), 1 if r.get("signaled") else 0) for r in rows],
+            )
+        cutoff = (datetime.utcnow() - __import__("datetime").timedelta(days=keep_days)).isoformat()
+        self.conn.execute("DELETE FROM evaluations WHERE ts < ?", (cutoff,))
+        self.conn.commit()
+        return len(rows)
+
+    def get_evaluation_summary(self, days: int = 7) -> dict:
+        cutoff = (datetime.utcnow() - __import__("datetime").timedelta(days=days)).isoformat()
+        out = {}
+        for sport in ("tennis", "tabletennis"):
+            rows = self.conn.execute(
+                "SELECT edge, signaled FROM evaluations WHERE sport=? AND ts >= ?", (sport, cutoff)
+            ).fetchall()
+            edges = [r["edge"] for r in rows if r["edge"] is not None]
+            near = self.conn.execute(
+                "SELECT ts, match, label, edge FROM evaluations WHERE sport=? AND ts >= ? AND signaled=0 "
+                "ORDER BY edge DESC LIMIT 5", (sport, cutoff)
+            ).fetchall()
+            out[sport] = {
+                "n": len(edges),
+                "signals": sum(1 for r in rows if r["signaled"]),
+                "lt0": sum(1 for e in edges if e < 0),
+                "b0_2": sum(1 for e in edges if 0 <= e < 0.02),
+                "b2_4": sum(1 for e in edges if 0.02 <= e < 0.04),
+                "ge4": sum(1 for e in edges if e >= 0.04),
+                "near": [dict(r) for r in near],
+            }
+        return out

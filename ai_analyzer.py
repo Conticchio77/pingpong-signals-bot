@@ -157,14 +157,34 @@ MIN_REF_BOOKS        = 3      # book minimi per un riferimento di consenso (senz
 class AIAnalyzer:
 
     def __init__(self):
-        self.best = None      # (edge, partita, giocata) migliore visto dall'ultimo reset_best()
+        self.best_by = {}     # sport -> (edge, partita, giocata): migliore visto dall'ultimo reset_best(sport)
+        self.evals = []       # giocate valutate (edge >= -3%), svuotate da pop_evals(sport) a fine scan
 
-    def reset_best(self):
-        self.best = None
+    def reset_best(self, sport: str | None = None):
+        """Azzera il "miglior edge visto". Per sport, così due scan in parallelo (tennis e ping pong) non si pestano."""
+        if sport is None:
+            self.best_by.clear()
+        else:
+            self.best_by.pop(sport, None)
 
-    def _note_best(self, value: float, match: dict, label: str):
-        if self.best is None or value > self.best[0]:
-            self.best = (value, match.get("name", "?"), label)
+    def best_for(self, sport: str):
+        return self.best_by.get(sport)
+
+    def pop_evals(self, sport: str) -> list:
+        mine = [e for e in self.evals if e.get("sport") == sport]
+        self.evals = [e for e in self.evals if e.get("sport") != sport]
+        return mine
+
+    def _note_best(self, value: float, match: dict, label: str, market: str = "winner", odds: float | None = None):
+        sp = match.get("sport", "tabletennis")
+        cur = self.best_by.get(sp)
+        if cur is None or value > cur[0]:
+            self.best_by[sp] = (value, match.get("name", "?"), label)
+        if value >= -0.03:
+            self.evals.append({"sport": sp, "match": match.get("name", "?"), "market": market,
+                               "label": label, "odds": odds, "edge": round(value, 4)})
+            if len(self.evals) > 800:
+                self.evals = self.evals[-800:]
 
     async def analyze(self, match: dict, settings: dict = None) -> list[dict]:
         sport = match.get("sport", "tabletennis")
@@ -333,7 +353,7 @@ class AIAnalyzer:
                     )
                     continue
                 value = fair * best - 1
-                self._note_best(value, match, f"{player} @ {best}")
+                self._note_best(value, match, f"{player} @ {best}", "winner", best)
                 if value < min_value:
                     logger.info(
                         f"Winner scartato (edge {value:.1%} < min {min_value:.1%}): "
@@ -358,6 +378,7 @@ class AIAnalyzer:
                     confidence= self._confidence(value, ref_kind, source),
                     reasoning = self._reasoning_winner(player, fair, best, book, ref_kind, n_ref),
                     book_note = f"Quota trovata su: {book or 'media mercato'}{pref_note}",
+                    ref_kind  = ref_kind,
                 ))
 
         # ── Over/Under ───────────────────────────────────────────────────────
@@ -385,7 +406,7 @@ class AIAnalyzer:
                     )
                     continue
                 value = fair * best - 1
-                self._note_best(value, match, f"{side} {line} @ {best}")
+                self._note_best(value, match, f"{side} {line} @ {best}", side, best)
                 if value >= min_value:
                     cand.append((value, side, fair, best, book))
                 else:
@@ -423,6 +444,7 @@ class AIAnalyzer:
                             f"({method}) vs quota {best} (value +{value*100:.1f}%)"
                         ),
                         book_note = f"Linea: {line} {unit} | quota su: {book}",
+                        ref_kind  = tot["kind"],
                     ))
                 else:
                     logger.info(
@@ -696,6 +718,7 @@ class AIAnalyzer:
         confidence: int,
         reasoning:  str = "",
         book_note:  str = "",
+        ref_kind:   str | None = None,
     ) -> dict:
         now     = datetime.now(IT_TZ)
         # match_key: usa event_id se disponibile (stabile tra scan), altrimenti nome+data.
@@ -731,4 +754,5 @@ class AIAnalyzer:
             "sport":       match.get("sport", "tabletennis"),
             "sport_label": match.get("sport_label", "🏓 Ping Pong"),
             "created_at":  now.isoformat(),
+            "ref_kind":    ref_kind,      # "sharp" | "consensus" (non salvato nel DB: serve solo al filtro di confidenza)
         }
