@@ -477,6 +477,7 @@ def admin_panel_text() -> str:
             )
     sport_breakdown = ("\n" + "\n".join(sport_lines) + "\n") if sport_lines else ""
 
+    scan_label = "automatico (quota)" if AUTO_SLOTS else f"ogni {s['scan_interval']}h"
     return (
         f"🏓🎾 *Signals Bot — Admin Panel*\n"
         f"{'━' * 26}\n"
@@ -486,7 +487,7 @@ def admin_panel_text() -> str:
         f"✅ Vinti: *{stats['won']}* | ❌ Persi: *{stats['lost']}* | 🏆 Win%: *{stats['winrate']}%*\n"
         f"{sport_breakdown}"
         f"🔄 Ultimo scan: *{stats['last_scan']}*\n\n"
-        f"⚙️ Scan ogni *{s['scan_interval']}h* | "
+        f"⚙️ Scan: *{scan_label}* | "
         f"Confidenza min: 🎾*{s['min_confidence']}%* 🏓*{s['min_confidence_pp']}%* | "
         f"Auto: VIP *{'✅' if _auto_send_on('vip') else '❌'}* FREE *{'✅' if _auto_send_on('free') else '❌'}* | "
         f"Sport: *{sf_label}*"
@@ -2002,8 +2003,10 @@ async def post_init(app: Application):
 
     _scheduler.start()
     logger.info(
-        f"⏰ Scheduler avviato — scan tennis 07-22h ogni {hours}h | "
-        f"ping pong 07-22h ogni {pp_hours}h | risultati ogni 60min"
+        ("⏰ Scheduler avviato — scan automatici 07-21h (piano giornaliero in base alla quota) | risultati ogni 60min"
+         if AUTO_SLOTS else
+         f"⏰ Scheduler avviato — scan tennis 07-22h ogni {hours}h | "
+         f"ping pong 07-22h ogni {pp_hours}h | risultati ogni 60min")
     )
 
 # Valore a cui torna scan_interval il 1° di ogni mese (vedi _monthly_reset_scan_interval)
