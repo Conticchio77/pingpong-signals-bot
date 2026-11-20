@@ -2324,6 +2324,7 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
         analyzer.reset_best(_sp)
     cands = []
     sent_keys: set = set()      # (partita, tipo) dei segnali davvero creati: per il registro valutazioni
+    discard_reasons: dict = {}  # (partita, tipo) -> motivo di scarto dopo l'analisi: per il registro valutazioni
     for match in matches:
         try:
             signals = await analyzer.analyze(match, settings)
@@ -2343,12 +2344,14 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                 if sig.get("ref_kind") == "consensus":
                     min_conf = min(min_conf, int(os.environ.get("CONSENSUS_MIN_CONF", "50")))
                 if sig["confidence"] < min_conf:
+                    discard_reasons[(sig.get("match"), sig.get("signal_type"))] = f"confidenza {sig['confidence']}% < min {min_conf}%"
                     logger.info(
                         f"Segnale scartato (confidenza {sig['confidence']}% < min {min_conf}%): "
                         f"{sig.get('match','?')} — {sig.get('pick','?')}"
                     )
                     continue
                 if db.signal_exists(sig["match_key"]):
+                    discard_reasons[(sig.get("match"), sig.get("signal_type"))] = "segnale già inviato"
                     continue
                 cands.append(sig)
         except Exception as e:
@@ -2363,6 +2366,7 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                     logger.info(f"Tetto di {MAX_SIGNALS_PER_SCAN} segnali per scan raggiunto: gli altri candidati riproveranno al prossimo scan")
                     break
                 if _player_busy(sig, used_players):
+                    discard_reasons[(sig.get("match"), sig.get("signal_type"))] = "giocatore già in un segnale aperto"
                     logger.info(f"Segnale scartato (giocatore già in un segnale aperto): {sig.get('match','?')} — {sig.get('pick','?')}")
                     continue
                 used_players |= {n.strip().lower() for n in (sig.get("player1", ""), sig.get("player2", "")) if n}
@@ -2412,8 +2416,15 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
         rows = []
         for _sp in scan_sports:
             rows += analyzer.pop_evals(_sp)
+        cand_keys = {(c.get("match"), c.get("signal_type")) for c in cands}
         for r in rows:
-            r["signaled"] = (r["match"], r["market"]) in sent_keys
+            _k = (r["match"], r["market"])
+            r["signaled"] = _k in sent_keys
+            if not r["signaled"]:
+                # il motivo dello scarto finisce nel testo della giocata (nessuna modifica al database)
+                _why = discard_reasons.get(_k) or ("tetto segnali per scan raggiunto" if _k in cand_keys else None)
+                if _why:
+                    r["label"] = f"{r['label']} ⛔ {_why}"
         rows.sort(key=lambda r: r["edge"], reverse=True)
         db.save_evaluations(rows[:120])
     except Exception as e:

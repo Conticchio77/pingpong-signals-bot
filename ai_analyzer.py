@@ -180,11 +180,21 @@ class AIAnalyzer:
         cur = self.best_by.get(sp)
         if cur is None or value > cur[0]:
             self.best_by[sp] = (value, match.get("name", "?"), label)
+        ev = None
         if value >= -0.03:
-            self.evals.append({"sport": sp, "match": match.get("name", "?"), "market": market,
-                               "label": label, "odds": odds, "edge": round(value, 4)})
+            ev = {"sport": sp, "match": match.get("name", "?"), "market": market,
+                  "label": label, "odds": odds, "edge": round(value, 4)}
+            self.evals.append(ev)
             if len(self.evals) > 800:
                 self.evals = self.evals[-800:]
+        return ev
+
+    @staticmethod
+    def _why(ev, reason: str):
+        """Aggiunge al registro valutazioni il MOTIVO per cui la giocata non è diventata un segnale
+        (finisce nel testo dopo la giocata, nel riepilogo "Valutazioni ultimi 7 giorni")."""
+        if ev is not None:
+            ev["label"] = f"{ev['label']} ⛔ {reason}"
 
     async def analyze(self, match: dict, settings: dict = None) -> list[dict]:
         sport = match.get("sport", "tabletennis")
@@ -297,7 +307,7 @@ class AIAnalyzer:
             )
             ref_kind = None
 
-        def _edge_ok(value: float, label: str) -> bool:
+        def _edge_ok(value: float, label: str, ev=None) -> bool:
             # Senza sharp un edge sopra il tetto è quasi sempre una quota
             # vecchia/anomala di un singolo book: meglio scartarlo che mostrarlo
             # "tagliato" al tetto come se fosse un segnale buono.
@@ -306,12 +316,14 @@ class AIAnalyzer:
                     f"Edge {value:.1%} sopra il tetto {max_edge_cap:.0%} senza sharp "
                     f"(quota sospetta): {match.get('name','?')} — {label}"
                 )
+                self._why(ev, f"edge sopra tetto {max_edge_cap:.0%} (no sharp)")
                 return False
             if has_sharp and value > sharp_edge_cap:
                 logger.info(
                     f"Edge {value:.1%} sopra il tetto {sharp_edge_cap:.0%} anche con sharp "
                     f"(probabile quota ferma/sbagliata di un solo book): {match.get('name','?')} — {label}"
                 )
+                self._why(ev, f"edge sopra tetto {sharp_edge_cap:.0%} (quota sospetta)")
                 return False
             return True
 
@@ -353,20 +365,22 @@ class AIAnalyzer:
                     )
                     continue
                 value = fair * best - 1
-                self._note_best(value, match, f"{player} @ {best}", "winner", best)
+                ev = self._note_best(value, match, f"{player} @ {best}", "winner", best)
                 if value < min_value:
+                    self._why(ev, f"sotto soglia {min_value:.1%}")
                     logger.info(
                         f"Winner scartato (edge {value:.1%} < min {min_value:.1%}): "
                         f"{match.get('name','?')} — {player} @ {best}"
                     )
                     continue
-                if not _edge_ok(value, f"{player} vince"):
+                if not _edge_ok(value, f"{player} vince", ev):
                     continue
                 if cons is not None and cons * best - 1 < confirm_min:
                     logger.info(
                         f"Winner scartato (edge {value:.1%} sul riferimento, ma solo {cons * best - 1:.1%} "
                         f"sulla mediana di {n_cons} book: lo sharp è l'anomalo): {match.get('name','?')} — {player} @ {best}"
                     )
+                    self._why(ev, "non confermato dalla mediana dei book")
                     continue
                 signals.append(self._build(
                     match     = match,
@@ -391,6 +405,7 @@ class AIAnalyzer:
             # ping pong: linee piccole (3.5, 4.5) = set totali; linee come 74.5 = punti totali
             unit = ("set" if line <= 6.5 else "punti") if sport == "tabletennis" else "games"
             cand = []
+            evs_by_side = {}
             for side, fair, best, book in (
                 ("over",  tot["fair_over"],  tot["best_over"],  tot["over_book"]),
                 ("under", tot["fair_under"], tot["best_under"], tot["under_book"]),
@@ -406,10 +421,11 @@ class AIAnalyzer:
                     )
                     continue
                 value = fair * best - 1
-                self._note_best(value, match, f"{side} {line} @ {best}", side, best)
+                evs_by_side[side] = self._note_best(value, match, f"{side} {line} @ {best}", side, best)
                 if value >= min_value:
                     cand.append((value, side, fair, best, book))
                 else:
+                    self._why(evs_by_side.get(side), f"sotto soglia {min_value:.1%}")
                     logger.info(
                         f"Totals scartato (edge {value:.1%} < min {min_value:.1%}): "
                         f"{match.get('name','?')} — {side} {line} @ {best}"
@@ -419,12 +435,14 @@ class AIAnalyzer:
                 tot_sharp = tot["kind"] == "sharp"
                 if (not tot_sharp and _require_sharp()
                         and not (verified and tot["n_books"] >= _totals_min_books(sport))):
+                    self._why(evs_by_side.get(side), "totals: consenso troppo debole (no sharp)")
                     logger.info(
                         f"Totals scartato (nessun book sharp e consenso troppo debole: "
                         f"{tot['n_books']} book su {_totals_min_books(sport)} richiesti, partita {'verificata' if verified else 'non verificata'}): "
                         f"{match.get('name','?')} — {side} {line}"
                     )
                 elif tot_sharp and value > sharp_edge_cap:
+                    self._why(evs_by_side.get(side), f"edge sopra tetto {sharp_edge_cap:.0%}")
                     logger.info(
                         f"Totals scartato (edge {value:.1%} sopra il tetto {sharp_edge_cap:.0%} anche con sharp): "
                         f"{match.get('name','?')} — {side} {line}"
@@ -447,6 +465,7 @@ class AIAnalyzer:
                         ref_kind  = tot["kind"],
                     ))
                 else:
+                    self._why(evs_by_side.get(side), f"edge sopra tetto {min(max_edge_cap, 0.10):.0%} (consenso)")
                     logger.info(
                         f"Edge {value:.1%} sopra il tetto {min(max_edge_cap, 0.10):.0%} su consenso "
                         f"(quota sospetta): {match.get('name','?')} — {side} {line}"
