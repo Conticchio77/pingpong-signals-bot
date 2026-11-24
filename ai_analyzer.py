@@ -228,7 +228,9 @@ class AIAnalyzer:
         min_hours    = float(settings.get("min_hours_before", MIN_HOURS_BEFORE))
         same_day_only = bool(settings.get("same_day_only", SAME_DAY_ONLY))
         max_hours_ahead = float(settings.get("max_hours_ahead", MAX_HOURS_AHEAD))
-        min_value    = float(settings.get("min_value_pct", MIN_VALUE_PCT)) / 100
+        # Soglia value per sport (impostata dal bot; con auto-adattamento è già la soglia "effettiva")
+        _vkey = "min_value_eff_pp" if sport == "tabletennis" else "min_value_eff_tennis"
+        min_value    = float(settings.get(_vkey, settings.get("min_value_pct", MIN_VALUE_PCT))) / 100
         # Cap edge senza Pinnacle: più basso per ping pong (de-vig meno affidabile senza sharp)
         if sport == "tabletennis":
             max_edge_cap = 15.0 / 100   # ping pong: max 15% (OddsPapi non ha mai Pinnacle)
@@ -237,9 +239,8 @@ class AIAnalyzer:
 
         sharp_edge_cap, max_odds = _reliability(sport)
         min_odds = _pp_min_odds() if sport == "tabletennis" else MIN_ODDS
-        if sport == "tabletennis":
-            min_value = max(min_value, _pp_min_value())
-        confirm_min = _confirm_min_edge()
+        _ckey = "confirm_min_eff_pp" if sport == "tabletennis" else "confirm_min_eff_tennis"
+        confirm_min = float(settings[_ckey]) / 100 if _ckey in settings else _confirm_min_edge()
 
         # ── Filtro anticipo kickoff ──────────────────────────────────────────
         kickoff_str = match.get("kickoff", "")

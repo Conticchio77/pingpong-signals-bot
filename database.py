@@ -322,8 +322,54 @@ class Database:
             "min_hours_before": float(raw.get("min_hours_before", 1.0)),
             "max_edge_no_sharp":float(raw.get("max_edge_no_sharp", 20.0)),
             "min_value_pct":    float(raw.get("min_value_pct", 3.0)),
+            **self._value_settings(raw),
             "pingpong_scan_interval": int(raw.get("pingpong_scan_interval", 24)),
         }
+
+    @staticmethod
+    def _value_settings(raw: dict) -> dict:
+        """Soglia di value minimo SEPARATA per sport (impostata dal bot), con auto-adattamento opzionale.
+        base = valore scelto da te; adj = quanto l'auto-adattamento l'ha abbassato (0 se spento);
+        eff = soglia realmente usata dall'analyzer = base - adj, mai sotto il pavimento."""
+        try:
+            pp_default = float(os.environ.get("PP_MIN_VALUE", "4.0"))
+        except ValueError:
+            pp_default = 4.0
+        floors = {"tennis": float(os.environ.get("VALUE_FLOOR_TENNIS", "2.0")),
+                  "pp":     float(os.environ.get("VALUE_FLOOR_PP", "2.5"))}
+        out = {}
+        for short, base_default in (("tennis", float(raw.get("min_value_pct", 3.0))), ("pp", pp_default)):
+            base = float(raw.get(f"min_value_pct_{short}", base_default))
+            auto = raw.get(f"auto_value_{short}", "0") == "1"
+            adj  = float(raw.get(f"value_adj_{short}", 0) or 0) if auto else 0.0
+            floor = min(floors[short], base)
+            out[f"min_value_pct_{short}"] = base
+            out[f"auto_value_{short}"]    = auto
+            out[f"value_adj_{short}"]     = adj
+            out[f"min_value_eff_{short}"] = round(max(base - adj, floor), 2)
+            out[f"value_floor_{short}"]   = floor
+            # Filtro mediana (conferma contro la mediana di tutti i book), per sport
+            try:
+                c_default = float(os.environ.get("CONFIRM_MIN_EDGE", "1.0"))
+            except ValueError:
+                c_default = 1.0
+            c_base  = float(raw.get(f"confirm_min_pct_{short}", c_default))
+            c_auto  = raw.get(f"auto_confirm_{short}", "0") == "1"
+            c_adj   = float(raw.get(f"confirm_adj_{short}", 0) or 0) if c_auto else 0.0
+            c_floor = min(float(os.environ.get("CONFIRM_FLOOR", "0.5")), c_base)
+            out[f"confirm_min_pct_{short}"] = c_base
+            out[f"auto_confirm_{short}"]    = c_auto
+            out[f"confirm_adj_{short}"]     = c_adj
+            out[f"confirm_min_eff_{short}"] = round(max(c_base - c_adj, c_floor), 2)
+            out[f"confirm_floor_{short}"]   = c_floor
+        return out
+
+    def count_signals_since(self, sport: str, since_iso: str) -> int:
+        """Segnali creati per uno sport dopo since_iso (created_at è ISO, confrontabile come testo)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE sport=? AND created_at>=?", (sport, since_iso)
+        ).fetchone()
+        return int(row[0] or 0)
 
     def get_setting(self, key: str, default=None):
         """Legge una singola chiave arbitraria dalla tabella settings (non solo quelle note)."""

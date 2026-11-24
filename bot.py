@@ -885,6 +885,19 @@ async def send_settings(fn):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+def _value_btn_label(s: dict, short: str) -> str:
+    """Etichetta del bottone 'Value minimo' (short = "tennis" | "pp"): mostra anche la soglia ridotta dall'auto."""
+    base, eff = s[f"min_value_pct_{short}"], s[f"min_value_eff_{short}"]
+    auto = " 🤖" if s[f"auto_value_{short}"] else ""
+    now = f" (ora {eff:.1f}%)" if abs(eff - base) > 0.01 else ""
+    return f"💎 Value minimo segnale: {base:.1f}%{now}{auto}"
+
+def _confirm_btn_label(s: dict, short: str) -> str:
+    base, eff = s[f"confirm_min_pct_{short}"], s[f"confirm_min_eff_{short}"]
+    auto = " 🤖" if s[f"auto_confirm_{short}"] else ""
+    now = f" (ora {eff:g}%)" if abs(eff - base) > 0.01 else ""
+    return f"🧪 Filtro mediana: {base:g}%{now}{auto}"
+
 async def send_settings_tennis(fn):
     s = db.get_settings()
     conf_label = _conf_label(s['min_confidence'])
@@ -899,7 +912,8 @@ async def send_settings_tennis(fn):
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_label}", callback_data="pick_confidence")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
         [InlineKeyboardButton(f"📉 Cap edge (no Pinnacle): {s.get('max_edge_no_sharp', 20.0):.0f}%", callback_data="pick_max_edge")],
-        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton(_value_btn_label(s, "tennis"), callback_data="pick_value_tennis")],
+        [InlineKeyboardButton(_confirm_btn_label(s, "tennis"), callback_data="pick_confirm_tennis")],
         [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_tennis")],
         [InlineKeyboardButton(f"🏁 Risultati vinto/perso: {_DEST_NAMES.get(_dest_setting('result', 'tennis'), '📤 VIP')}", callback_data="pick_resdest_tennis")],
         [InlineKeyboardButton(f"📅 Stats di fine mese: {_DEST_NAMES.get(_dest_setting('stats', 'tennis'), '📤 VIP')}", callback_data="pick_statsdest_tennis")],
@@ -928,7 +942,8 @@ async def send_settings_pingpong(fn):
                               callback_data=("auto_info" if AUTO_SLOTS else "pick_interval_pp"))],
         [InlineKeyboardButton(f"🎯 Confidenza minima: {conf_pp_label}", callback_data="pick_confidence_pp")],
         [InlineKeyboardButton(f"⏰ Anticipo kickoff: {s.get('min_hours_before', 1.0):.0f}h min", callback_data="pick_hours_before")],
-        [InlineKeyboardButton(f"💎 Value minimo segnale: {s.get('min_value_pct', 3.0):.1f}%", callback_data="pick_value_pct")],
+        [InlineKeyboardButton(_value_btn_label(s, "pp"), callback_data="pick_value_pp")],
+        [InlineKeyboardButton(_confirm_btn_label(s, "pp"), callback_data="pick_confirm_pp")],
         [InlineKeyboardButton(f"📨 Destinazione invii: {dest_label}", callback_data="pick_dest_pingpong")],
         [InlineKeyboardButton(f"🏁 Risultati vinto/perso: {_DEST_NAMES.get(_dest_setting('result', 'pingpong'), '📤 VIP')}", callback_data="pick_resdest_pingpong")],
         [InlineKeyboardButton(f"📅 Stats di fine mese: {_DEST_NAMES.get(_dest_setting('stats', 'pingpong'), '📤 VIP')}", callback_data="pick_statsdest_pingpong")],
@@ -1805,32 +1820,140 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_settings(query.edit_message_text)
 
     # ── Value minimo segnale ─────────────────────────────────────────────────
-    elif data == "pick_value_pct":
-        current = db.get_settings().get("min_value_pct", 3.0)
-        opts = [
-            (2.0, "2% — permissivo (più segnali)"),
-            (3.0, "3% — bilanciato ✓"),
-            (4.0, "4% — selettivo"),
-            (5.0, "5% — molto selettivo (pochi segnali)"),
-        ]
+    elif data in ("pick_value_pct", "pick_value_tennis", "pick_value_pp") or data.startswith("toggle_valueauto_"):
+        if data.startswith("toggle_valueauto_"):
+            short = data.rsplit("_", 1)[1]
+            db.set_setting(f"auto_value_{short}", "0" if db.get_settings()[f"auto_value_{short}"] else "1")
+            if not db.get_settings()[f"auto_value_{short}"]:
+                db.set_setting(f"value_adj_{short}", 0)        # spento: torna al valore scelto da te
+        else:
+            short = "pp" if data == "pick_value_pp" else "tennis"
+        s = db.get_settings()
+        current, eff, auto = s[f"min_value_pct_{short}"], s[f"min_value_eff_{short}"], s[f"auto_value_{short}"]
+        opts = [(1.5, "1.5% — molto permissivo (rumore alto)"), (2.0, "2% — permissivo"), (2.5, "2.5%"),
+                (3.0, "3% — bilanciato"), (3.5, "3.5%"), (4.0, "4% — selettivo"), (5.0, "5% — molto selettivo")]
         kb = []
         for val, label in opts:
             prefix = "✅ " if abs(float(val) - float(current)) < 0.01 else ""
-            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_valuepct_{val}")])
-        kb.append([InlineKeyboardButton("🔙 Impostazioni", callback_data="admin_settings")])
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_valuepct_{short}_{val}")])
+        kb.append([InlineKeyboardButton(f"🤖 Auto-adattamento: {_onoff(auto)}", callback_data=f"toggle_valueauto_{short}")])
+        kb.append([InlineKeyboardButton("🔙 Indietro", callback_data="settings_pingpong" if short == "pp" else "settings_tennis")])
+        sport_name = "Ping Pong" if short == "pp" else "Tennis"
+        floor = min(float(os.environ.get("VALUE_FLOOR_PP" if short == "pp" else "VALUE_FLOOR_TENNIS", "2.5" if short == "pp" else "2.0")), current)
         await query.edit_message_text(
-            "💎 *Value minimo per generare un segnale*\n\n"
-            "Edge minimo tra quota fair (de-vig) e quota disponibile.\n"
-            "Più basso = più segnali ma mediamente meno marcati.\n"
-            "Più alto = pochi segnali ma solo i più netti.",
+            f"💎 *Value minimo — {sport_name}*\n\n"
+            "Edge minimo tra quota fair e quota disponibile per generare un segnale.\n"
+            "Più basso = più segnali ma più rumore. Più alto = pochi segnali, più netti.\n\n"
+            f"Scelto: *{current:.1f}%* | In uso ora: *{eff:.1f}%*\n\n"
+            "🤖 *Auto-adattamento* (ogni sera alle 22:15): se in 3 giorni non esce nessun segnale di questo sport "
+            f"abbassa la soglia di 0.5 punti, fino a un minimo di *{floor:.1f}%*; se ne escono almeno 3 la rialza "
+            "di 0.5 verso il valore scelto (prima rialza il filtro mediana, se anche quello è stato abbassato). "
+            "Ti avvisa a ogni cambio. Il valore scelto da te non viene mai superato.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
     elif data.startswith("set_valuepct_"):
-        val = float(data.replace("set_valuepct_", ""))
-        db.set_setting("min_value_pct", val)
-        await send_settings(query.edit_message_text)
+        parts = data.split("_")           # set_valuepct_<tennis|pp>_<val>  (vecchio formato: set_valuepct_<val> = tennis)
+        short, val = (parts[2], float(parts[3])) if len(parts) == 4 else ("tennis", float(parts[2]))
+        db.set_setting(f"min_value_pct_{short}", val)
+        db.set_setting(f"value_adj_{short}", 0)          # nuova scelta = riparte da zero
+        if short == "pp":
+            await send_settings_pingpong(query.edit_message_text)
+        else:
+            await send_settings_tennis(query.edit_message_text)
+
+
+    # ── Filtro mediana (conferma contro la mediana dei book), per sport ─────────
+    elif data in ("pick_confirm_tennis", "pick_confirm_pp") or data.startswith("toggle_confirmauto_"):
+        if data.startswith("toggle_confirmauto_"):
+            short = data.rsplit("_", 1)[1]
+            db.set_setting(f"auto_confirm_{short}", "0" if db.get_settings()[f"auto_confirm_{short}"] else "1")
+            if not db.get_settings()[f"auto_confirm_{short}"]:
+                db.set_setting(f"confirm_adj_{short}", 0)
+        else:
+            short = data.rsplit("_", 1)[1]
+        s = db.get_settings()
+        current, eff, auto = s[f"confirm_min_pct_{short}"], s[f"confirm_min_eff_{short}"], s[f"auto_confirm_{short}"]
+        opts = [(0.5, "0.5% — molto permissivo"), (0.75, "0.75%"), (1.0, "1% — standard"),
+                (1.5, "1.5% — severo"), (2.0, "2% — molto severo")]
+        kb = []
+        for val, label in opts:
+            prefix = "✅ " if abs(float(val) - float(current)) < 0.01 else ""
+            kb.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"set_confirm_{short}_{val}")])
+        kb.append([InlineKeyboardButton(f"🤖 Auto-adattamento: {_onoff(auto)}", callback_data=f"toggle_confirmauto_{short}")])
+        kb.append([InlineKeyboardButton("🔙 Indietro", callback_data="settings_pingpong" if short == "pp" else "settings_tennis")])
+        sport_name = "Ping Pong" if short == "pp" else "Tennis"
+        await query.edit_message_text(
+            f"🧪 *Filtro mediana — {sport_name}*\n\n"
+            "Una giocata che supera il value minimo viene scartata se, contro la *mediana di tutti i book*, "
+            "ha meno di questo edge. Serve a evitare i casi in cui è lo sharp a essere in ritardo "
+            "(prezzo fermo, libro vuoto) e non la quota soft a essere sbagliata.\n"
+            "Più basso = più segnali ma meno protezione. Sotto 0.5% non protegge più.\n\n"
+            f"Scelto: *{current:g}%* | In uso ora: *{eff:g}%*\n\n"
+            "🤖 *Auto-adattamento*: agisce solo dopo il value minimo. Se in 3 giorni non esce nessun segnale e "
+            "il value minimo di questo sport è già al pavimento (o il suo auto è spento), abbassa il filtro di "
+            f"0.25 punti fino a *{s[f'confirm_floor_{short}']:g}%*. Con almeno 3 segnali lo rialza per primo, "
+            "verso il valore scelto. Ti avvisa a ogni cambio.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif data.startswith("set_confirm_"):
+        _, _, short, val = data.split("_")
+        db.set_setting(f"confirm_min_pct_{short}", float(val))
+        db.set_setting(f"confirm_adj_{short}", 0)
+        if short == "pp":
+            await send_settings_pingpong(query.edit_message_text)
+        else:
+            await send_settings_tennis(query.edit_message_text)
+
+
+async def _value_adapt_job(app: Application):
+    """Auto-adattamento serale (22:15), per sport e solo se acceso dal bot. UNA sola leva per sera, così si
+    capisce cosa ha prodotto i segnali. Nessun segnale in 3 giorni: prima si abbassa il value minimo
+    (0.5), poi, a pavimento raggiunto o auto-value spento, il filtro mediana (0.25). Almeno 3 segnali:
+    si rialza prima il filtro mediana, poi il value minimo."""
+    now = datetime.datetime.now(ROME)
+    since = (now - datetime.timedelta(days=3)).isoformat()
+    for short, sport, label in (("tennis", "tennis", "🎾 Tennis"), ("pp", "tabletennis", "🏓 Ping Pong")):
+        s = db.get_settings()
+        v_auto, c_auto = s[f"auto_value_{short}"], s[f"auto_confirm_{short}"]
+        if not (v_auto or c_auto):
+            continue
+        v_base, v_adj = s[f"min_value_pct_{short}"], s[f"value_adj_{short}"]
+        c_base, c_adj = s[f"confirm_min_pct_{short}"], s[f"confirm_adj_{short}"]
+        v_max = max(0.0, v_base - s[f"value_floor_{short}"])
+        c_max = max(0.0, c_base - s[f"confirm_floor_{short}"])
+        n = db.count_signals_since(sport, since)
+        msg = None
+        if n == 0:
+            if v_auto and v_adj < v_max - 1e-9:
+                v_adj2 = min(v_adj + 0.5, v_max)
+                db.set_setting(f"value_adj_{short}", v_adj2)
+                msg = f"value minimo da {v_base - v_adj:.1f}% a *{v_base - v_adj2:.1f}%*"
+            elif c_auto and c_adj < c_max - 1e-9:
+                c_adj2 = min(c_adj + 0.25, c_max)
+                db.set_setting(f"confirm_adj_{short}", c_adj2)
+                msg = f"filtro mediana da {c_base - c_adj:g}% a *{c_base - c_adj2:g}%*"
+        elif n >= 3:
+            if c_auto and c_adj > 1e-9:
+                c_adj2 = max(c_adj - 0.25, 0.0)
+                db.set_setting(f"confirm_adj_{short}", c_adj2)
+                msg = f"filtro mediana da {c_base - c_adj:g}% a *{c_base - c_adj2:g}%*"
+            elif v_auto and v_adj > 1e-9:
+                v_adj2 = max(v_adj - 0.5, 0.0)
+                db.set_setting(f"value_adj_{short}", v_adj2)
+                msg = f"value minimo da {v_base - v_adj:.1f}% a *{v_base - v_adj2:.1f}%*"
+        if not msg:
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID, parse_mode="Markdown",
+                text=f"🤖 *Auto-adattamento {label}*: {n} segnali negli ultimi 3 giorni → {msg}.",
+            )
+        except Exception as e:
+            logger.warning(f"Avviso auto-adattamento non inviato: {e}")
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
@@ -1999,6 +2122,14 @@ async def post_init(app: Application):
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,
+    )
+
+    # Auto-adattamento soglia value (attivo solo se acceso dal bot, per sport)
+    _scheduler.add_job(
+        lambda: _schedule_coro(lambda: _value_adapt_job(app)),
+        trigger=CronTrigger(hour=22, minute=15, timezone=ROME),
+        id="value_adapt",
+        replace_existing=True,
     )
 
     _scheduler.start()
