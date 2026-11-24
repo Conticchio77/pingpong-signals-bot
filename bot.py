@@ -176,7 +176,7 @@ async def send_signal_to_groups(bot, sig: dict, text: str, dest: str | None = No
     cui il messaggio è arrivato davvero (vuoto = invio fallito ovunque)."""
     if dest is None:
         dest = _dest_setting("send", _sport_short(sig.get("sport", "tabletennis")))
-    gids = {"free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(dest, [VIP_GROUP_ID])
+    gids = {"none": [], "free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(dest, [VIP_GROUP_ID])
     sent = []
     for gid in gids:
         try:
@@ -905,7 +905,7 @@ async def send_settings_tennis(fn):
     scan_day   = len(range(7, 23, interval))   # ore di scan: 7, 7+h, ... fino a 22 incluso
     credits_mo = scan_day * 4 * 31             # ~4 crediti per scan con 2 tornei attivi
 
-    dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_tennis"], "📤 VIP")
+    dest_label = _DEST_NAMES.get(s["send_dest_tennis"], "📤 VIP")
     kb = [
         [InlineKeyboardButton(("⏱ Scan: automatico (quota)" if AUTO_SLOTS else f"⏱ Scan: ogni {interval}h"),
                               callback_data=("auto_info" if AUTO_SLOTS else "pick_interval"))],
@@ -936,7 +936,7 @@ async def send_settings_pingpong(fn):
     _n_books      = len([b for b in os.environ.get("PP_BOOKMAKERS", "sbobet,bwin").split(",") if b.strip()])
     pp_calls_mo   = pp_scan_day * (1 + _n_books) * 31   # 1 elenco + 1 richiesta per bookmaker
 
-    dest_label = {"vip": "📤 VIP", "free": "🆓 Free", "both": "📤🆓 Entrambi"}.get(s["send_dest_pingpong"], "📤 VIP")
+    dest_label = _DEST_NAMES.get(s["send_dest_pingpong"], "📤 VIP")
     kb = [
         [InlineKeyboardButton(("⏱ Scan: automatico (quota)" if AUTO_SLOTS else f"⏱ Scan: ogni {pp_interval}h"),
                               callback_data=("auto_info" if AUTO_SLOTS else "pick_interval_pp"))],
@@ -1250,9 +1250,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not s:
             await query.edit_message_text("❌ Segnale non trovato.")
             return
+        eff_dest = dest or _dest_setting("send", _sport_short(s.get("sport", "tabletennis")))
+        if eff_dest == "none":
+            await query.edit_message_text(
+                f"🚫 Destinazione invii su NESSUNO: non inviato a nessun gruppo.\n\n{vip_signal_text(s)}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(_send_rows(s) + [[InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
+                                                                    InlineKeyboardButton("🔙 Home", callback_data="admin_home")]]),
+            )
+            return
         sent = await send_signal_to_groups(context.application.bot, s, vip_signal_text(s), dest=dest)
         wanted = {"vip": [VIP_GROUP_ID], "free": [FREE_GROUP_ID], "both": [VIP_GROUP_ID, FREE_GROUP_ID]}.get(
-            dest or _dest_setting("send", _sport_short(s.get("sport", "tabletennis"))), [VIP_GROUP_ID])
+            eff_dest, [VIP_GROUP_ID])
         failed = [g for g in wanted if g not in sent]
         kb = [[InlineKeyboardButton("🗑 Cancella", callback_data=f"delask_{sig_id}")],
               [InlineKeyboardButton("📋 Lista", callback_data="admin_list"),
@@ -1672,7 +1681,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_key = "send_dest_tennis" if data == "pick_dest_tennis" else "send_dest_pingpong"
         back_cb   = "settings_tennis" if data == "pick_dest_tennis" else "settings_pingpong"
         current = db.get_settings()[sport_key]
-        opts = [("vip", "📤 Solo VIP"), ("free", "🆓 Solo Free"), ("both", "📤🆓 Entrambi")]
+        opts = [("vip", "📤 Solo VIP"), ("free", "🆓 Solo Free"), ("both", "📤🆓 Entrambi"), ("none", "🚫 Nessuno (solo prove)")]
         kb = []
         for val, label in opts:
             prefix = "✅ " if val == current else ""
@@ -1681,7 +1690,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_name = "Tennis" if data == "pick_dest_tennis" else "Ping Pong"
         await query.edit_message_text(
             f"📨 *Destinazione invii — {sport_name}*\n\n"
-            "Dove inviare i segnali per questo sport.\n"
+            "Dove inviare i segnali per questo sport. Con *Nessuno* l'auto-invio è bloccato e i segnali "
+            "arrivano solo a te (i tasti manuali VIP/FREE/ENTRAMBI sul segnale inviano comunque).\n"
             "(Risultati e statistiche mensili hanno la loro scelta nelle impostazioni dello sport.)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
@@ -2523,7 +2533,7 @@ async def _run_signal_scan_impl(app: Application, manual: bool = False, sport_ov
                 # Auto-invio distinto: solo i gruppi con auto ON che sono anche
                 # nella destinazione scelta per quello sport; gli altri restano manuali.
                 dest = _dest_setting("send", _sport_short(sig.get("sport", "tabletennis")))
-                eligible = {"free": ["free"], "both": ["vip", "free"]}.get(dest, ["vip"])
+                eligible = {"none": [], "free": ["free"], "both": ["vip", "free"]}.get(dest, ["vip"])
                 auto_groups = [g for g in eligible if _auto_send_on(g)]
                 if auto_groups:
                     auto_dest = "both" if len(auto_groups) == 2 else auto_groups[0]
